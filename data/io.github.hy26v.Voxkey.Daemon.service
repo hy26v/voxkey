@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=io.github.hy26v.Voxkey.Daemon
+Exec=/usr/bin/voxkey
+SystemdService=voxkey.service

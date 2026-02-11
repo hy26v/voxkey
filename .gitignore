@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Rust
+target/
+
+# IDE
+.idea/
+.vscode/
+
+# Test artifacts
+tests/output/
+
+# Config
+*.restore_token
+
+
+# RPM build output
+rpmbuild/
+
+# Local tools
+whisper.cpp/
+
+# Private repo
+.git-private/
+CLAUDE.md
+docs/
+.claude/
+.env
+.env.*

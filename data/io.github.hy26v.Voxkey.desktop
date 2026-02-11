@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Voxkey
+Comment=Voice dictation settings
+Exec=voxkey-settings
+Icon=io.github.hy26v.Voxkey
+Terminal=false
+Type=Application
+Categories=Settings;Utility;Accessibility;
+Keywords=voice;dictation;speech;transcription;whisper;

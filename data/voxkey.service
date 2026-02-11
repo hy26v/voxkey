@@ -1,0 +1,13 @@
+[Unit]
+Description=Voxkey voice dictation daemon
+Documentation=https://github.com/hy26v/voxkey
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/voxkey
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

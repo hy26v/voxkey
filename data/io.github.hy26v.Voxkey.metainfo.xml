@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.hy26v.Voxkey</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>Voxkey</name>
+  <summary>Voice dictation for Wayland</summary>
+  <description>
+    <p>
+      Press a shortcut, speak, and text appears at your cursor.
+      Voxkey uses XDG Desktop Portal interfaces for global shortcuts
+      and keyboard injection — no X11, no clipboard hacks, no virtual
+      keyboard tools.
+    </p>
+    <ul>
+      <li>Toggle dictation with a global keyboard shortcut</li>
+      <li>Text injection directly at the cursor in any focused application</li>
+      <li>Local transcription via whisper.cpp, or cloud via Mistral</li>
+      <li>Real-time streaming transcription via Mistral Realtime</li>
+      <li>Settings GUI for live configuration</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.hy26v.Voxkey.desktop</launchable>
+  <icon type="stock">io.github.hy26v.Voxkey</icon>
+
+  <url type="homepage">https://github.com/hy26v/voxkey</url>
+  <url type="bugtracker">https://github.com/hy26v/voxkey/issues</url>
+
+  <categories>
+    <category>Settings</category>
+    <category>Utility</category>
+    <category>Accessibility</category>
+  </categories>
+
+  <developer id="io.github.hy26v">
+    <name>Daniel</name>
+  </developer>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.1.0" date="2026-02-11">
+      <description>
+        <p>Initial release.</p>
+      </description>
+    </release>
+  </releases>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+</component>
