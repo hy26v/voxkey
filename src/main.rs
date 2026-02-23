@@ -12,6 +12,8 @@ mod registry;
 mod shortcuts;
 mod state;
 mod streaming;
+mod model_download;
+mod models;
 mod transcriber;
 
 use std::sync::Arc;

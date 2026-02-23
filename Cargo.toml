@@ -3,7 +3,7 @@ members = ["voxkey-ipc", "voxkey-settings"]
 
 [package]
 name = "voxkey"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Wayland voice dictation daemon"
@@ -21,10 +21,11 @@ xkbcommon = "0.9"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", features = ["multipart", "json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["multipart", "json", "rustls-tls", "stream"], default-features = false }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 base64 = "0.22"
 http = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+sherpa-rs = { version = "0.6", features = ["download-binaries"] }
 tempfile = "3"

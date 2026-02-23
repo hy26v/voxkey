@@ -1,9 +1,13 @@
 // ABOUTME: D-Bus interface exposing daemon state and configuration to the settings GUI.
 // ABOUTME: Registered on the session bus so the GUI can read properties and call methods.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::watch;
+
 use crate::config::Config;
+use crate::model_download::DownloadStatus;
 use crate::shortcuts;
 use crate::state::State;
 
@@ -21,6 +25,7 @@ struct SharedStateInner {
     portal_connected: bool,
     last_transcript: String,
     last_error: String,
+    download_watchers: HashMap<String, watch::Receiver<DownloadStatus>>,
 }
 
 impl SharedState {
@@ -32,6 +37,7 @@ impl SharedState {
                 portal_connected: false,
                 last_transcript: String::new(),
                 last_error: String::new(),
+                download_watchers: HashMap::new(),
             })),
             restart_signal: Arc::new(tokio::sync::Notify::new()),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
@@ -92,6 +98,17 @@ impl SharedState {
 
     pub async fn shutdown_requested(&self) {
         self.shutdown_signal.notified().await;
+    }
+
+    pub fn start_model_download(&self, model_name: String) -> watch::Receiver<DownloadStatus> {
+        let rx = crate::model_download::start_download(model_name.clone());
+        self.inner.lock().unwrap().download_watchers.insert(model_name, rx.clone());
+        rx
+    }
+
+    pub fn model_download_status(&self, model_name: &str) -> Option<DownloadStatus> {
+        let inner = self.inner.lock().unwrap();
+        inner.download_watchers.get(model_name).map(|rx| rx.borrow().clone())
     }
 }
 
@@ -321,6 +338,72 @@ impl DaemonInterface {
         Ok(())
     }
 
+    async fn download_model(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        model_name: &str,
+    ) -> zbus::fdo::Result<()> {
+        let model_name = model_name.to_string();
+        let mut rx = self.shared.start_model_download(model_name.clone());
+        let connection = connection.clone();
+        let shared = self.shared.clone();
+
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let status = rx.borrow().clone();
+                match &status {
+                    DownloadStatus::InProgress(pct) => {
+                        if let Ok(iface_ref) = connection
+                            .object_server()
+                            .interface::<_, DaemonInterface>(voxkey_ipc::OBJECT_PATH)
+                            .await
+                        {
+                            let _ = DaemonInterface::download_progress(
+                                iface_ref.signal_emitter(),
+                                &model_name,
+                                *pct,
+                            ).await;
+                        }
+                    }
+                    DownloadStatus::Complete => {
+                        tracing::info!("Model download complete: {model_name}");
+                        break;
+                    }
+                    DownloadStatus::Failed(msg) => {
+                        tracing::error!("Model download failed: {msg}");
+                        shared.set_last_error(format!("Download failed: {msg}"));
+                        DaemonInterface::notify_last_error(&connection).await;
+                        break;
+                    }
+                }
+            }
+            shared.inner.lock().unwrap().download_watchers.remove(&model_name);
+        });
+
+        Ok(())
+    }
+
+    async fn delete_model(&self, model_name: &str) -> zbus::fdo::Result<()> {
+        crate::model_download::delete_model(model_name).map_err(|e| {
+            zbus::fdo::Error::Failed(format!("Failed to delete model: {e}"))
+        })
+    }
+
+    fn model_status(&self, model_name: &str) -> zbus::fdo::Result<String> {
+        if let Some(status) = self.shared.model_download_status(model_name) {
+            return Ok(match status {
+                DownloadStatus::InProgress(_) => "downloading".to_string(),
+                DownloadStatus::Complete => "available".to_string(),
+                DownloadStatus::Failed(_) => "not_downloaded".to_string(),
+            });
+        }
+        if crate::models::is_model_available(model_name) {
+            Ok("available".to_string())
+        } else {
+            Ok("not_downloaded".to_string())
+        }
+    }
+
     #[zbus(signal)]
     async fn transcription_complete(
         ctxt: &zbus::object_server::SignalEmitter<'_>,
@@ -331,5 +414,12 @@ impl DaemonInterface {
     async fn error_occurred(
         ctxt: &zbus::object_server::SignalEmitter<'_>,
         message: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn download_progress(
+        ctxt: &zbus::object_server::SignalEmitter<'_>,
+        model_name: &str,
+        percent: u8,
     ) -> zbus::Result<()>;
 }

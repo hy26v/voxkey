@@ -23,6 +23,10 @@ pub enum Transcriber {
         api_key: String,
         model: String,
     },
+    Parakeet {
+        model_name: String,
+        execution_provider: voxkey_ipc::ExecutionProviderChoice,
+    },
 }
 
 impl Transcriber {
@@ -47,6 +51,10 @@ impl Transcriber {
                 api_key: config.mistral_realtime.api_key.clone(),
                 model: config.mistral_realtime.model.clone(),
             },
+            TranscriberProvider::Parakeet => Self::Parakeet {
+                model_name: config.parakeet.model.clone(),
+                execution_provider: config.parakeet.execution_provider,
+            },
         }
     }
 
@@ -68,6 +76,9 @@ impl Transcriber {
             } => transcribe_mistral(client, api_key, model, endpoint, audio_path).await,
             Self::MistralRealtime { .. } => {
                 unreachable!("streaming transcriber uses run_streaming_session, not transcribe()")
+            }
+            Self::Parakeet { model_name, execution_provider } => {
+                transcribe_parakeet(model_name, *execution_provider, audio_path).await
             }
         };
 
@@ -174,6 +185,81 @@ async fn transcribe_mistral(
     Ok(transcript)
 }
 
+async fn transcribe_parakeet(
+    model_name: &str,
+    execution_provider: voxkey_ipc::ExecutionProviderChoice,
+    audio_path: &Path,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let model_dir = crate::models::model_dir(model_name);
+    if !crate::models::is_model_available(model_name) {
+        return Err(format!(
+            "Parakeet model '{}' not found at {}. Download it from the Settings app.",
+            model_name, model_dir.display()
+        ).into());
+    }
+
+    tracing::info!(
+        "Parakeet transcription: model={model_name}, provider={execution_provider:?}, path={}",
+        audio_path.display()
+    );
+
+    let model_dir_str = model_dir.to_string_lossy().to_string();
+    let ep = execution_provider;
+
+    // ONNX inference is CPU-bound; run in a blocking thread to avoid starving the tokio runtime.
+    let audio_path = audio_path.to_path_buf();
+    let transcript = tokio::task::spawn_blocking(move || -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let mut reader = hound::WavReader::open(&audio_path)?;
+        let spec = reader.spec();
+        tracing::info!(
+            "WAV: {}Hz, {} channels, {} bits, {:?}",
+            spec.sample_rate, spec.channels, spec.bits_per_sample, spec.sample_format
+        );
+        let samples: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Int => {
+                let max_val = (1 << (spec.bits_per_sample - 1)) as f32;
+                reader.samples::<i32>()
+                    .map(|s| s.map(|v| v as f32 / max_val))
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            hound::SampleFormat::Float => {
+                reader.samples::<f32>()
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        };
+
+        let provider = match ep {
+            voxkey_ipc::ExecutionProviderChoice::Cuda => Some("cuda".to_string()),
+            voxkey_ipc::ExecutionProviderChoice::Cpu => Some("cpu".to_string()),
+            voxkey_ipc::ExecutionProviderChoice::Auto => None,
+        };
+
+        let config = sherpa_rs::transducer::TransducerConfig {
+            encoder: format!("{model_dir_str}/encoder.int8.onnx"),
+            decoder: format!("{model_dir_str}/decoder.int8.onnx"),
+            joiner: format!("{model_dir_str}/joiner.int8.onnx"),
+            tokens: format!("{model_dir_str}/tokens.txt"),
+            model_type: "nemo_transducer".to_string(),
+            num_threads: 4,
+            sample_rate: spec.sample_rate as i32,
+            feature_dim: 80,
+            provider,
+            ..Default::default()
+        };
+
+        tracing::info!("Creating Parakeet recognizer ({} samples)", samples.len());
+        let mut recognizer = sherpa_rs::transducer::TransducerRecognizer::new(config)?;
+        tracing::info!("Recognizer created, starting transcription");
+        let text = recognizer.transcribe(spec.sample_rate, &samples);
+        tracing::info!("Parakeet raw result: {:?}", text);
+
+        Ok(text.trim().to_string())
+    }).await??;
+
+    tracing::info!("Parakeet transcription complete ({} chars)", transcript.len());
+    Ok(transcript)
+}
+
 #[cfg(test)]
 fn parse_mistral_response(
     json: &str,
@@ -185,7 +271,7 @@ fn parse_mistral_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voxkey_ipc::{MistralConfig, MistralRealtimeConfig, WhisperCppConfig};
+    use voxkey_ipc::{MistralConfig, MistralRealtimeConfig, ParakeetConfig, WhisperCppConfig};
 
     #[test]
     fn from_config_creates_whisper_cpp_variant() {
@@ -197,6 +283,7 @@ mod tests {
             },
             mistral: MistralConfig::default(),
             mistral_realtime: MistralRealtimeConfig::default(),
+            parakeet: ParakeetConfig::default(),
         };
         let t = Transcriber::from_config(&config);
         match t {
@@ -219,6 +306,7 @@ mod tests {
                 endpoint: String::new(),
             },
             mistral_realtime: MistralRealtimeConfig::default(),
+            parakeet: ParakeetConfig::default(),
         };
         let t = Transcriber::from_config(&config);
         match t {
@@ -243,6 +331,7 @@ mod tests {
                 model: "voxtral-mini-transcribe-realtime-2602".to_string(),
                 endpoint: String::new(),
             },
+            parakeet: ParakeetConfig::default(),
         };
         let t = Transcriber::from_config(&config);
         match t {
@@ -278,6 +367,22 @@ mod tests {
             endpoint: String::new(),
         };
         assert!(!mistral.is_streaming());
+    }
+
+    #[test]
+    fn from_config_creates_parakeet_variant() {
+        let config = TranscriberConfig {
+            provider: TranscriberProvider::Parakeet,
+            whisper_cpp: WhisperCppConfig::default(),
+            mistral: MistralConfig::default(),
+            mistral_realtime: MistralRealtimeConfig::default(),
+            parakeet: voxkey_ipc::ParakeetConfig {
+                model: "parakeet-tdt-0.6b-v3".to_string(),
+                execution_provider: voxkey_ipc::ExecutionProviderChoice::Cpu,
+            },
+        };
+        let t = Transcriber::from_config(&config);
+        assert!(!t.is_streaming());
     }
 
     #[test]

@@ -110,7 +110,9 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         .title("Transcription Engine")
         .build();
 
-    let provider_model = gtk4::StringList::new(&["whisper.cpp", "Mistral", "Mistral Realtime"]);
+    let provider_model = gtk4::StringList::new(&[
+        "whisper.cpp", "Mistral", "Mistral Realtime", "Parakeet v2", "Parakeet v3",
+    ]);
     let provider_row = adw::ComboRow::builder()
         .title("Provider")
         .model(&provider_model)
@@ -148,10 +150,42 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     transcription_group.add(&model_row);
     transcription_group.add(&endpoint_row);
 
-    // Initially hide Mistral rows (default is whisper.cpp)
+    // Parakeet sub-rows
+    let execution_provider_model = gtk4::StringList::new(&["Auto", "CPU", "CUDA"]);
+    let execution_provider_row = adw::ComboRow::builder()
+        .title("Execution Provider")
+        .model(&execution_provider_model)
+        .build();
+
+    let model_status_row = adw::ActionRow::builder()
+        .title("Model Status")
+        .subtitle("Unknown")
+        .build();
+
+    let download_button = gtk4::Button::with_label("Download");
+    download_button.set_valign(gtk4::Align::Center);
+    model_status_row.add_suffix(&download_button);
+
+    let open_folder_button = gtk4::Button::from_icon_name("folder-open-symbolic");
+    open_folder_button.set_valign(gtk4::Align::Center);
+    open_folder_button.add_css_class("flat");
+    model_status_row.add_suffix(&open_folder_button);
+
+    let delete_model_button = gtk4::Button::from_icon_name("user-trash-symbolic");
+    delete_model_button.set_valign(gtk4::Align::Center);
+    delete_model_button.add_css_class("flat");
+    delete_model_button.add_css_class("error");
+    model_status_row.add_suffix(&delete_model_button);
+
+    transcription_group.add(&execution_provider_row);
+    transcription_group.add(&model_status_row);
+
+    // Initially hide non-whisper.cpp rows (default provider)
     api_key_row.set_visible(false);
     model_row.set_visible(false);
     endpoint_row.set_visible(false);
+    execution_provider_row.set_visible(false);
+    model_status_row.set_visible(false);
 
     groups_box.append(&transcription_group);
 
@@ -248,6 +282,8 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     wire_transcriber_actions(
         &provider_row, &command_row, &args_row,
         &api_key_row, &model_row, &endpoint_row,
+        &execution_provider_row, &model_status_row,
+        &download_button, &delete_model_button, &open_folder_button,
         &transcriber_state, &updating_widgets, &handle,
     );
     wire_advanced_actions(&reload_row, &clear_token_row, &handle, &toast_overlay);
@@ -284,10 +320,13 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     let api_key_row_update = api_key_row.clone();
     let model_row_update = model_row.clone();
     let endpoint_row_update = endpoint_row.clone();
+    let execution_provider_row_update = execution_provider_row.clone();
+    let model_status_row_update = model_status_row.clone();
     let transcriber_state_update = transcriber_state.clone();
     let updating_widgets_poll = updating_widgets.clone();
     let banner = banner.clone();
     let toast_overlay_poll = toast_overlay.clone();
+    let handle_poll = handle.clone();
 
     glib::timeout_add_local(Duration::from_millis(50), move || {
         while let Ok(update) = update_rx.try_recv() {
@@ -318,11 +357,19 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                         &api_key_row_update,
                         &model_row_update,
                         &endpoint_row_update,
+                        &execution_provider_row_update,
+                        &model_status_row_update,
                         &transcriber_state_update,
                         &updating_widgets_poll,
                     );
                     if !last_error.is_empty() {
                         toast_overlay_poll.add_toast(adw::Toast::new(&last_error));
+                    }
+                    // Query model status if Parakeet is active
+                    if let Ok(tc) = serde_json::from_str::<voxkey_ipc::TranscriberConfig>(&transcriber_config) {
+                        if tc.provider == voxkey_ipc::TranscriberProvider::Parakeet {
+                            handle_poll.send(DaemonCommand::ModelStatus(tc.parakeet.model.clone()));
+                        }
                     }
                 }
                 DaemonUpdate::Disconnected => {
@@ -360,12 +407,30 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                             &api_key_row_update,
                             &model_row_update,
                             &endpoint_row_update,
+                            &execution_provider_row_update,
+                            &model_status_row_update,
                             &transcriber_state_update,
                             &updating_widgets_poll,
                         );
                     }
                     _ => {}
                 },
+                DaemonUpdate::DownloadProgress { model_name, percent } => {
+                    model_status_row_update.set_subtitle(
+                        &format!("Downloading {model_name}... {percent}%"),
+                    );
+                    if percent >= 100 {
+                        model_status_row_update.set_subtitle("Available");
+                    }
+                }
+                DaemonUpdate::ModelStatusResult { status, .. } => {
+                    let label = match status.as_str() {
+                        "available" => "Available",
+                        "downloading" => "Downloading...",
+                        _ => "Not downloaded",
+                    };
+                    model_status_row_update.set_subtitle(label);
+                }
             }
         }
         glib::ControlFlow::Continue
@@ -556,6 +621,8 @@ fn apply_transcriber_config_to_widgets(
     api_key_row: &adw::PasswordEntryRow,
     model_row: &adw::EntryRow,
     endpoint_row: &adw::EntryRow,
+    execution_provider_row: &adw::ComboRow,
+    model_status_row: &adw::ActionRow,
     state: &Rc<RefCell<voxkey_ipc::TranscriberConfig>>,
     updating_widgets: &Rc<Cell<bool>>,
 ) {
@@ -574,6 +641,9 @@ fn apply_transcriber_config_to_widgets(
         voxkey_ipc::TranscriberProvider::WhisperCpp => 0u32,
         voxkey_ipc::TranscriberProvider::Mistral => 1,
         voxkey_ipc::TranscriberProvider::MistralRealtime => 2,
+        voxkey_ipc::TranscriberProvider::Parakeet => {
+            if tc.parakeet.model == "parakeet-tdt-0.6b-v2" { 3 } else { 4 }
+        }
     };
     provider_row.set_selected(provider_idx);
 
@@ -583,32 +653,44 @@ fn apply_transcriber_config_to_widgets(
     set_entry_text_without_apply(command_row, &tc.whisper_cpp.command);
     set_entry_text_without_apply(args_row, &tc.whisper_cpp.args.join(" "));
 
-    // Show API key, model, and endpoint from the active provider
-    let (active_api_key, active_model, active_endpoint, default_model, default_endpoint) = match tc.provider {
-        voxkey_ipc::TranscriberProvider::WhisperCpp => {
-            (&tc.mistral.api_key, &tc.mistral.model, &tc.mistral.endpoint,
-             voxkey_ipc::MistralConfig::DEFAULT_MODEL, voxkey_ipc::MistralConfig::DEFAULT_ENDPOINT)
-        }
-        voxkey_ipc::TranscriberProvider::Mistral => {
-            (&tc.mistral.api_key, &tc.mistral.model, &tc.mistral.endpoint,
-             voxkey_ipc::MistralConfig::DEFAULT_MODEL, voxkey_ipc::MistralConfig::DEFAULT_ENDPOINT)
-        }
-        voxkey_ipc::TranscriberProvider::MistralRealtime => {
-            (&tc.mistral_realtime.api_key, &tc.mistral_realtime.model, &tc.mistral_realtime.endpoint,
-             voxkey_ipc::MistralRealtimeConfig::DEFAULT_MODEL, voxkey_ipc::MistralRealtimeConfig::DEFAULT_ENDPOINT)
-        }
-    };
-    set_password_entry_text_without_apply(api_key_row, active_api_key);
-    set_entry_with_default(model_row, active_model, default_model);
-    set_entry_with_default(endpoint_row, active_endpoint, default_endpoint);
+    // Show API key, model, and endpoint from the active Mistral provider
+    let is_whisper = tc.provider == voxkey_ipc::TranscriberProvider::WhisperCpp;
+    let is_parakeet = tc.provider == voxkey_ipc::TranscriberProvider::Parakeet;
+    let is_mistral_api = !is_whisper && !is_parakeet;
+
+    if is_mistral_api {
+        let (active_api_key, active_model, active_endpoint, default_model, default_endpoint) = match tc.provider {
+            voxkey_ipc::TranscriberProvider::MistralRealtime => {
+                (&tc.mistral_realtime.api_key, &tc.mistral_realtime.model, &tc.mistral_realtime.endpoint,
+                 voxkey_ipc::MistralRealtimeConfig::DEFAULT_MODEL, voxkey_ipc::MistralRealtimeConfig::DEFAULT_ENDPOINT)
+            }
+            _ => {
+                (&tc.mistral.api_key, &tc.mistral.model, &tc.mistral.endpoint,
+                 voxkey_ipc::MistralConfig::DEFAULT_MODEL, voxkey_ipc::MistralConfig::DEFAULT_ENDPOINT)
+            }
+        };
+        set_password_entry_text_without_apply(api_key_row, active_api_key);
+        set_entry_with_default(model_row, active_model, default_model);
+        set_entry_with_default(endpoint_row, active_endpoint, default_endpoint);
+    }
+
+    if is_parakeet {
+        let ep_idx = match tc.parakeet.execution_provider {
+            voxkey_ipc::ExecutionProviderChoice::Auto => 0u32,
+            voxkey_ipc::ExecutionProviderChoice::Cpu => 1,
+            voxkey_ipc::ExecutionProviderChoice::Cuda => 2,
+        };
+        execution_provider_row.set_selected(ep_idx);
+    }
 
     // Toggle visibility
-    let is_whisper = tc.provider == voxkey_ipc::TranscriberProvider::WhisperCpp;
     command_row.set_visible(is_whisper);
     args_row.set_visible(is_whisper);
-    api_key_row.set_visible(!is_whisper);
-    model_row.set_visible(!is_whisper);
-    endpoint_row.set_visible(!is_whisper);
+    api_key_row.set_visible(is_mistral_api);
+    model_row.set_visible(is_mistral_api);
+    endpoint_row.set_visible(is_mistral_api);
+    execution_provider_row.set_visible(is_parakeet);
+    model_status_row.set_visible(is_parakeet);
 
     updating_widgets.set(false);
 }
@@ -628,6 +710,11 @@ fn wire_transcriber_actions(
     api_key_row: &adw::PasswordEntryRow,
     model_row: &adw::EntryRow,
     endpoint_row: &adw::EntryRow,
+    execution_provider_row: &adw::ComboRow,
+    model_status_row: &adw::ActionRow,
+    download_button: &gtk4::Button,
+    delete_model_button: &gtk4::Button,
+    open_folder_button: &gtk4::Button,
     state: &Rc<RefCell<voxkey_ipc::TranscriberConfig>>,
     updating_widgets: &Rc<Cell<bool>>,
     handle: &DaemonHandle,
@@ -639,6 +726,8 @@ fn wire_transcriber_actions(
         let api_key_row = api_key_row.clone();
         let model_row = model_row.clone();
         let endpoint_row = endpoint_row.clone();
+        let execution_provider_row = execution_provider_row.clone();
+        let model_status_row = model_status_row.clone();
         let state = state.clone();
         let updating_widgets = updating_widgets.clone();
         let handle = handle.clone();
@@ -646,23 +735,40 @@ fn wire_transcriber_actions(
             if updating_widgets.get() {
                 return;
             }
-            let provider = match row.selected() {
-                0 => voxkey_ipc::TranscriberProvider::WhisperCpp,
-                2 => voxkey_ipc::TranscriberProvider::MistralRealtime,
-                _ => voxkey_ipc::TranscriberProvider::Mistral,
-            };
+            let selected = row.selected();
+            let is_parakeet = selected == 3 || selected == 4;
+
+            if is_parakeet {
+                let model_name = if selected == 3 {
+                    "parakeet-tdt-0.6b-v2"
+                } else {
+                    "parakeet-tdt-0.6b-v3"
+                };
+                state.borrow_mut().provider = voxkey_ipc::TranscriberProvider::Parakeet;
+                state.borrow_mut().parakeet.model = model_name.to_string();
+            } else {
+                let provider = match selected {
+                    0 => voxkey_ipc::TranscriberProvider::WhisperCpp,
+                    2 => voxkey_ipc::TranscriberProvider::MistralRealtime,
+                    _ => voxkey_ipc::TranscriberProvider::Mistral,
+                };
+                state.borrow_mut().provider = provider;
+            }
+
+            let provider = state.borrow().provider.clone();
             let is_whisper = provider == voxkey_ipc::TranscriberProvider::WhisperCpp;
-            let is_realtime = provider == voxkey_ipc::TranscriberProvider::MistralRealtime;
+            let is_mistral_api = !is_whisper && !is_parakeet;
+
             command_row.set_visible(is_whisper);
             args_row.set_visible(is_whisper);
-            api_key_row.set_visible(!is_whisper);
-            model_row.set_visible(!is_whisper);
-            endpoint_row.set_visible(!is_whisper);
+            api_key_row.set_visible(is_mistral_api);
+            model_row.set_visible(is_mistral_api);
+            endpoint_row.set_visible(is_mistral_api);
+            execution_provider_row.set_visible(is_parakeet);
+            model_status_row.set_visible(is_parakeet);
 
-            state.borrow_mut().provider = provider;
-
-            // Show fields from the active provider config
-            {
+            if is_mistral_api {
+                let is_realtime = provider == voxkey_ipc::TranscriberProvider::MistralRealtime;
                 let st = state.borrow();
                 let (key, model, endpoint, default_model, default_endpoint) = if is_realtime {
                     (&st.mistral_realtime.api_key, &st.mistral_realtime.model, &st.mistral_realtime.endpoint,
@@ -674,6 +780,11 @@ fn wire_transcriber_actions(
                 set_password_entry_text_without_apply(&api_key_row, key);
                 set_entry_with_default(&model_row, model, default_model);
                 set_entry_with_default(&endpoint_row, endpoint, default_endpoint);
+            }
+
+            if is_parakeet {
+                let model_name = state.borrow().parakeet.model.clone();
+                handle.send(DaemonCommand::ModelStatus(model_name));
             }
 
             send_transcriber_config(&state, &handle);
@@ -763,6 +874,55 @@ fn wire_transcriber_actions(
             }
             drop(st);
             send_transcriber_config(&state, &handle);
+        });
+    }
+
+    // Execution provider combo (Parakeet)
+    {
+        let state = state.clone();
+        let handle = handle.clone();
+        let updating_widgets = updating_widgets.clone();
+        execution_provider_row.connect_selected_notify(move |row| {
+            if updating_widgets.get() {
+                return;
+            }
+            let ep = match row.selected() {
+                1 => voxkey_ipc::ExecutionProviderChoice::Cpu,
+                2 => voxkey_ipc::ExecutionProviderChoice::Cuda,
+                _ => voxkey_ipc::ExecutionProviderChoice::Auto,
+            };
+            state.borrow_mut().parakeet.execution_provider = ep;
+            send_transcriber_config(&state, &handle);
+        });
+    }
+
+    // Download button
+    {
+        let state = state.clone();
+        let handle = handle.clone();
+        download_button.connect_clicked(move |_| {
+            let model_name = state.borrow().parakeet.model.clone();
+            handle.send(DaemonCommand::DownloadModel(model_name));
+        });
+    }
+
+    // Open folder button
+    {
+        let handle = handle.clone();
+        open_folder_button.connect_clicked(move |_| {
+            handle.send(DaemonCommand::OpenModelsDir);
+        });
+    }
+
+    // Delete button
+    {
+        let state = state.clone();
+        let handle = handle.clone();
+        let model_status_row = model_status_row.clone();
+        delete_model_button.connect_clicked(move |_| {
+            let model_name = state.borrow().parakeet.model.clone();
+            handle.send(DaemonCommand::DeleteModel(model_name));
+            model_status_row.set_subtitle("Not downloaded");
         });
     }
 }

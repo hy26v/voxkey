@@ -24,6 +24,14 @@ pub enum DaemonUpdate {
         name: String,
         value: String,
     },
+    DownloadProgress {
+        model_name: String,
+        percent: u8,
+    },
+    ModelStatusResult {
+        model_name: String,
+        status: String,
+    },
 }
 
 /// Handle for sending commands to the daemon from the GTK thread.
@@ -36,6 +44,10 @@ pub struct DaemonHandle {
 pub enum DaemonCommand {
     SetShortcut(String),
     SetTranscriberConfig(String),
+    DownloadModel(String),
+    DeleteModel(String),
+    ModelStatus(String),
+    OpenModelsDir,
     ReloadConfig,
     ClearRestoreToken,
     QuitDaemon { ack: mpsc::Sender<()> },
@@ -46,6 +58,10 @@ impl std::fmt::Debug for DaemonCommand {
         match self {
             Self::SetShortcut(s) => f.debug_tuple("SetShortcut").field(s).finish(),
             Self::SetTranscriberConfig(s) => f.debug_tuple("SetTranscriberConfig").field(s).finish(),
+            Self::DownloadModel(s) => f.debug_tuple("DownloadModel").field(s).finish(),
+            Self::DeleteModel(s) => f.debug_tuple("DeleteModel").field(s).finish(),
+            Self::ModelStatus(s) => f.debug_tuple("ModelStatus").field(s).finish(),
+            Self::OpenModelsDir => write!(f, "OpenModelsDir"),
             Self::ReloadConfig => write!(f, "ReloadConfig"),
             Self::ClearRestoreToken => write!(f, "ClearRestoreToken"),
             Self::QuitDaemon { .. } => write!(f, "QuitDaemon"),
@@ -138,6 +154,7 @@ async fn try_connect(
     let mut shortcut_stream = proxy.receive_shortcut_trigger_changed().await;
     let mut transcriber_stream = proxy.receive_transcriber_config_changed().await;
     let mut error_stream = proxy.receive_last_error_changed().await;
+    let mut download_stream = proxy.receive_download_progress().await?;
 
     // Poll for commands periodically
     let mut cmd_interval = tokio::time::interval(std::time::Duration::from_millis(50));
@@ -189,11 +206,19 @@ async fn try_connect(
                     });
                 }
             }
+            Some(signal) = download_stream.next() => {
+                if let Ok(args) = signal.args() {
+                    let _ = update_tx.send(DaemonUpdate::DownloadProgress {
+                        model_name: args.model_name.to_string(),
+                        percent: args.percent,
+                    });
+                }
+            }
             _ = cmd_interval.tick() => {
                 // Drain all pending commands
                 let rx = cmd_rx.lock().unwrap();
                 while let Ok(cmd) = rx.try_recv() {
-                    if let Err(e) = handle_command(&proxy, cmd).await {
+                    if let Err(e) = handle_command(&proxy, update_tx, cmd).await {
                         tracing::error!("D-Bus command failed: {e}");
                     }
                 }
@@ -204,6 +229,7 @@ async fn try_connect(
 
 async fn handle_command(
     proxy: &DaemonProxy<'_>,
+    update_tx: &mpsc::Sender<DaemonUpdate>,
     cmd: DaemonCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
@@ -212,6 +238,31 @@ async fn handle_command(
         }
         DaemonCommand::SetTranscriberConfig(config_json) => {
             proxy.set_transcriber_config(&config_json).await?;
+        }
+        DaemonCommand::DownloadModel(name) => {
+            proxy.download_model(&name).await?;
+        }
+        DaemonCommand::DeleteModel(name) => {
+            proxy.delete_model(&name).await?;
+        }
+        DaemonCommand::ModelStatus(name) => {
+            let status = proxy.model_status(&name).await?;
+            let _ = update_tx.send(DaemonUpdate::ModelStatusResult {
+                model_name: name,
+                status,
+            });
+        }
+        DaemonCommand::OpenModelsDir => {
+            let data_dir = std::env::var("XDG_DATA_HOME")
+                .unwrap_or_else(|_| {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+                    format!("{home}/.local/share")
+                });
+            let models_dir = format!("{data_dir}/voxkey/models");
+            let _ = std::fs::create_dir_all(&models_dir);
+            let _ = tokio::process::Command::new("xdg-open")
+                .arg(&models_dir)
+                .spawn();
         }
         DaemonCommand::ReloadConfig => {
             proxy.reload_config().await?;

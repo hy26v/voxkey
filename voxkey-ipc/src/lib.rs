@@ -59,6 +59,7 @@ pub enum TranscriberProvider {
     WhisperCpp,
     Mistral,
     MistralRealtime,
+    Parakeet,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -83,6 +84,31 @@ pub struct MistralRealtimeConfig {
     pub endpoint: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutionProviderChoice {
+    #[default]
+    Auto,
+    Cpu,
+    Cuda,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParakeetConfig {
+    pub model: String,
+    #[serde(default)]
+    pub execution_provider: ExecutionProviderChoice,
+}
+
+impl Default for ParakeetConfig {
+    fn default() -> Self {
+        Self {
+            model: "parakeet-tdt-0.6b-v3".to_string(),
+            execution_provider: ExecutionProviderChoice::Auto,
+        }
+    }
+}
+
 impl MistralConfig {
     pub const DEFAULT_MODEL: &str = "voxtral-mini-2602";
     pub const DEFAULT_ENDPOINT: &str = "https://api.mistral.ai/v1/audio/transcriptions";
@@ -105,6 +131,8 @@ pub struct TranscriberConfig {
     pub mistral: MistralConfig,
     #[serde(default)]
     pub mistral_realtime: MistralRealtimeConfig,
+    #[serde(default)]
+    pub parakeet: ParakeetConfig,
 }
 
 impl Default for WhisperCppConfig {
@@ -143,6 +171,7 @@ impl Default for TranscriberConfig {
             whisper_cpp: WhisperCppConfig::default(),
             mistral: MistralConfig::default(),
             mistral_realtime: MistralRealtimeConfig::default(),
+            parakeet: ParakeetConfig::default(),
         }
     }
 }
@@ -207,6 +236,16 @@ pub trait Daemon {
     /// Shut down the daemon process.
     fn quit(&self) -> zbus::Result<()>;
 
+    /// Start downloading a Parakeet model by name.
+    fn download_model(&self, model_name: &str) -> zbus::Result<()>;
+
+    /// Delete a downloaded Parakeet model.
+    fn delete_model(&self, model_name: &str) -> zbus::Result<()>;
+
+    /// Check if a Parakeet model is available locally.
+    /// Returns "available", "downloading", or "not_downloaded".
+    fn model_status(&self, model_name: &str) -> zbus::Result<String>;
+
     /// Emitted when a transcription completes.
     #[zbus(signal)]
     fn transcription_complete(text: &str) -> zbus::Result<()>;
@@ -214,6 +253,10 @@ pub trait Daemon {
     /// Emitted on recoverable errors.
     #[zbus(signal)]
     fn error_occurred(message: &str) -> zbus::Result<()>;
+
+    /// Emitted during model download with progress percentage.
+    #[zbus(signal)]
+    fn download_progress(model_name: &str, percent: u8) -> zbus::Result<()>;
 }
 
 #[cfg(test)]
@@ -241,6 +284,7 @@ mod tests {
                 endpoint: String::new(),
             },
             mistral_realtime: MistralRealtimeConfig::default(),
+            parakeet: ParakeetConfig::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: TranscriberConfig = serde_json::from_str(&json).unwrap();
@@ -257,6 +301,7 @@ mod tests {
             },
             mistral: MistralConfig::default(),
             mistral_realtime: MistralRealtimeConfig::default(),
+            parakeet: ParakeetConfig::default(),
         };
         let toml_str = toml::to_string(&config).unwrap();
         let parsed: TranscriberConfig = toml::from_str(&toml_str).unwrap();
@@ -291,6 +336,7 @@ mod tests {
                 model: "voxtral-mini-transcribe-realtime-2602".to_string(),
                 endpoint: String::new(),
             },
+            parakeet: ParakeetConfig::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: TranscriberConfig = serde_json::from_str(&json).unwrap();
@@ -308,6 +354,7 @@ mod tests {
                 model: "voxtral-mini-transcribe-realtime-2602".to_string(),
                 endpoint: String::new(),
             },
+            parakeet: ParakeetConfig::default(),
         };
         let toml_str = toml::to_string(&config).unwrap();
         let parsed: TranscriberConfig = toml::from_str(&toml_str).unwrap();
@@ -327,5 +374,64 @@ mod tests {
         let parsed: TranscriberConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.mistral_realtime.model, "voxtral-mini-transcribe-realtime-2602");
         assert!(parsed.mistral_realtime.api_key.is_empty());
+    }
+
+    #[test]
+    fn parakeet_config_default_values() {
+        let config = ParakeetConfig::default();
+        assert_eq!(config.model, "parakeet-tdt-0.6b-v3");
+        assert_eq!(config.execution_provider, ExecutionProviderChoice::Auto);
+    }
+
+    #[test]
+    fn provider_serializes_parakeet_as_kebab_case() {
+        let json = serde_json::to_string(&TranscriberProvider::Parakeet).unwrap();
+        assert_eq!(json, "\"parakeet\"");
+    }
+
+    #[test]
+    fn execution_provider_choice_serializes_as_kebab_case() {
+        assert_eq!(serde_json::to_string(&ExecutionProviderChoice::Auto).unwrap(), "\"auto\"");
+        assert_eq!(serde_json::to_string(&ExecutionProviderChoice::Cpu).unwrap(), "\"cpu\"");
+        assert_eq!(serde_json::to_string(&ExecutionProviderChoice::Cuda).unwrap(), "\"cuda\"");
+    }
+
+    #[test]
+    fn transcriber_config_json_round_trip_parakeet() {
+        let config = TranscriberConfig {
+            provider: TranscriberProvider::Parakeet,
+            whisper_cpp: WhisperCppConfig::default(),
+            mistral: MistralConfig::default(),
+            mistral_realtime: MistralRealtimeConfig::default(),
+            parakeet: ParakeetConfig {
+                model: "parakeet-tdt-0.6b-v2".to_string(),
+                execution_provider: ExecutionProviderChoice::Cuda,
+            },
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: TranscriberConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn transcriber_config_toml_round_trip_parakeet() {
+        let config = TranscriberConfig {
+            provider: TranscriberProvider::Parakeet,
+            whisper_cpp: WhisperCppConfig::default(),
+            mistral: MistralConfig::default(),
+            mistral_realtime: MistralRealtimeConfig::default(),
+            parakeet: ParakeetConfig::default(),
+        };
+        let toml_str = toml::to_string(&config).unwrap();
+        let parsed: TranscriberConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn existing_config_without_parakeet_gets_defaults() {
+        let json = r#"{"provider":"whisper-cpp","whisper_cpp":{"command":"whisper-cpp","args":[]},"mistral":{"api_key":"","model":"voxtral-mini-2602"},"mistral_realtime":{"api_key":"","model":"voxtral-mini-transcribe-realtime-2602"}}"#;
+        let parsed: TranscriberConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.parakeet.model, "parakeet-tdt-0.6b-v3");
+        assert_eq!(parsed.parakeet.execution_provider, ExecutionProviderChoice::Auto);
     }
 }

@@ -1,5 +1,5 @@
 Name:           voxkey
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Wayland voice dictation daemon
 License:        MIT
@@ -17,6 +17,12 @@ Press a key, speak, and your words appear as typed text in any Wayland
 application. Uses XDG Desktop Portal interfaces for global shortcuts
 and keyboard injection.
 
+# sherpa-onnx shared libraries are bundled in /usr/lib64/voxkey/ and loaded
+# via RPATH. Filter them out of RPM's auto-generated requires/provides so
+# dnf doesn't expect a system package to supply them.
+%global __requires_exclude ^lib(onnxruntime|sherpa-onnx-c-api)\\.so
+%global __provides_exclude ^lib(onnxruntime|sherpa-onnx-c-api)\\.so
+
 # Disable debug package generation and build steps — binaries are pre-built
 %global debug_package %{nil}
 %define _build_name_fmt %%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.rpm
@@ -26,6 +32,9 @@ rm -rf %{buildroot}
 
 install -Dm755 %{_sourcedir}/voxkey %{buildroot}%{_bindir}/voxkey
 install -Dm755 %{_sourcedir}/voxkey-settings %{buildroot}%{_bindir}/voxkey-settings
+
+install -Dm755 %{_sourcedir}/libonnxruntime.so %{buildroot}%{_libdir}/voxkey/libonnxruntime.so
+install -Dm755 %{_sourcedir}/libsherpa-onnx-c-api.so %{buildroot}%{_libdir}/voxkey/libsherpa-onnx-c-api.so
 
 install -Dm644 %{_sourcedir}/voxkey.service \
     %{buildroot}%{_userunitdir}/voxkey.service
@@ -65,6 +74,8 @@ killall voxkey 2>/dev/null || true
 %files
 %{_bindir}/voxkey
 %{_bindir}/voxkey-settings
+%{_libdir}/voxkey/libonnxruntime.so
+%{_libdir}/voxkey/libsherpa-onnx-c-api.so
 %{_userunitdir}/voxkey.service
 %{_userpresetdir}/90-voxkey.preset
 %{_datadir}/dbus-1/services/io.github.hy26v.Voxkey.Daemon.service

@@ -14,7 +14,7 @@ jobs:
       - name: Install build dependencies
         run: |
           dnf install -y \
-            rust cargo gcc \
+            rust cargo gcc gcc-c++ clang-libs \
             alsa-lib-devel libxkbcommon-devel \
             gtk4-devel libadwaita-devel \
             rpm-build ImageMagick git
@@ -25,7 +25,9 @@ jobs:
           submodules: false
 
       - name: Build release binaries
-        run: cargo build --release --workspace
+        run: |
+          export RUSTFLAGS="-C link-arg=-Wl,-rpath,/usr/lib64/voxkey"
+          cargo build --release --workspace
 
       - name: Extract version from tag
         id: version
@@ -36,6 +38,8 @@ jobs:
           mkdir -p rpmbuild/SOURCES
           cp target/release/voxkey rpmbuild/SOURCES/
           cp target/release/voxkey-settings rpmbuild/SOURCES/
+          cp target/release/deps/libonnxruntime.so rpmbuild/SOURCES/
+          cp target/release/deps/libsherpa-onnx-c-api.so rpmbuild/SOURCES/
           cp data/voxkey.service rpmbuild/SOURCES/
           cp data/io.github.hy26v.Voxkey.Daemon.service rpmbuild/SOURCES/
           cp data/io.github.hy26v.Voxkey.desktop rpmbuild/SOURCES/
@@ -67,6 +71,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Extract commit message for release notes
+        id: notes
+        run: echo "body<<EOF" >> "$GITHUB_OUTPUT" && git log -1 --format='%b' >> "$GITHUB_OUTPUT" && echo "EOF" >> "$GITHUB_OUTPUT"
+
       - name: Download RPM artifact
         uses: actions/download-artifact@v4
         with:
@@ -77,4 +90,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: rpms/**/*.rpm
-          generate_release_notes: true
+          body: ${{ steps.notes.outputs.body }}
