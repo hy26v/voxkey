@@ -167,7 +167,11 @@ pub struct RecordingHandle {
 
 impl RecordingHandle {
     /// Stop recording and finalize the WAV file. Returns the path to the WAV file.
-    pub fn stop(mut self) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    /// Captures a short tail of audio before stopping to avoid cutting off the last words.
+    pub async fn stop(mut self) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+        // Keep capturing briefly so in-flight audio buffers are flushed to the WAV
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
         self.recording.store(false, Ordering::Relaxed);
 
         // Drop the stream to stop capturing

@@ -3,6 +3,7 @@
 
 use ashpd::desktop::remote_desktop::{DeviceType, KeyState, RemoteDesktop};
 use ashpd::desktop::{PersistMode, Session};
+use futures_util::Stream;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -87,5 +88,10 @@ impl DesktopController {
     /// The restore token received from Start, if any.
     pub fn restore_token(&self) -> Option<&str> {
         self.restore_token.as_deref()
+    }
+
+    /// Stream that fires when the portal closes this session (e.g. screen lock).
+    pub async fn receive_closed(&self) -> Result<impl Stream<Item = ()>, DynError> {
+        Ok(self.session.receive_closed().await?)
     }
 }

@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use xkbcommon::xkb;
 use xkbcommon::xkb::keysyms;
 
+use crate::dbus::SharedState;
 use crate::desktop::DesktopController;
 
 /// Keysym constants for special control characters.
@@ -25,6 +26,7 @@ impl Injector {
     pub fn new(
         desktop: std::sync::Arc<DesktopController>,
         state_tx: mpsc::Sender<crate::state::Event>,
+        shared: SharedState,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<String>(32);
 
@@ -38,6 +40,7 @@ impl Injector {
                     }
                     Err(e) => {
                         tracing::error!("Injection failed: {e}");
+                        shared.set_pending_injection(Some(text));
                         let _ = state_tx.send(crate::state::Event::Error).await;
                     }
                 }

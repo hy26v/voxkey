@@ -25,6 +25,7 @@ struct SharedStateInner {
     portal_connected: bool,
     last_transcript: String,
     last_error: String,
+    pending_injection: Option<String>,
     download_watchers: HashMap<String, watch::Receiver<DownloadStatus>>,
 }
 
@@ -37,6 +38,7 @@ impl SharedState {
                 portal_connected: false,
                 last_transcript: String::new(),
                 last_error: String::new(),
+                pending_injection: None,
                 download_watchers: HashMap::new(),
             })),
             restart_signal: Arc::new(tokio::sync::Notify::new()),
@@ -62,6 +64,14 @@ impl SharedState {
 
     pub fn set_last_error(&self, text: String) {
         self.inner.lock().unwrap().last_error = text;
+    }
+
+    pub fn set_pending_injection(&self, text: Option<String>) {
+        self.inner.lock().unwrap().pending_injection = text;
+    }
+
+    pub fn take_pending_injection(&self) -> Option<String> {
+        self.inner.lock().unwrap().pending_injection.take()
     }
 
     pub fn config(&self) -> Config {

@@ -72,6 +72,11 @@ impl ShortcutController {
     ) -> Result<impl Stream<Item = Deactivated> + '_, DynError> {
         Ok(self.proxy.receive_deactivated().await?)
     }
+
+    /// Stream that fires when the portal closes this session (e.g. screen lock).
+    pub async fn receive_closed(&self) -> Result<impl Stream<Item = ()> + '_, DynError> {
+        Ok(self.session.receive_closed().await?)
+    }
 }
 
 /// Format a shortcut config as a GVariant text value for GNOME's dconf schema.

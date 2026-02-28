@@ -165,11 +165,23 @@ async fn run_session(config: &Config, connection: zbus::Connection, shared: &Sha
     let (state_tx, mut state_rx) = mpsc::channel::<Event>(32);
 
     // Injector with its own background task
-    let injector = Injector::new(desktop.clone(), state_tx.clone());
+    let injector = Injector::new(desktop.clone(), state_tx.clone(), shared.clone());
+
+    // Retry any injection that failed due to a dead session (e.g. after screen lock recovery)
+    if let Some(pending_text) = shared.take_pending_injection() {
+        tracing::info!("Retrying injection of text from previous session");
+        if let Err(e) = injector.enqueue(pending_text).await {
+            tracing::error!("Failed to re-enqueue pending injection: {e}");
+        }
+    }
 
     // Signal streams
     let mut activated = shortcuts.activated_stream().await?;
     let mut deactivated = shortcuts.deactivated_stream().await?;
+
+    // Session closure streams - fire when the portal invalidates a session (e.g. screen lock)
+    let mut shortcuts_closed = shortcuts.receive_closed().await?;
+    let mut desktop_closed = desktop.receive_closed().await?;
 
     shared.set_portal_connected(true);
     DaemonInterface::notify_portal_connected(&connection).await;
@@ -306,6 +318,7 @@ async fn run_session(config: &Config, connection: zbus::Connection, shared: &Sha
 
             // State machine events from injector or streaming session
             Some(event) = state_rx.recv() => {
+                let is_error = matches!(event, Event::Error);
                 if let Some(new_state) = current_state.transition(&event) {
                     if new_state == State::Idle && streaming_handle.is_some() {
                         streaming_handle = None;
@@ -313,6 +326,19 @@ async fn run_session(config: &Config, connection: zbus::Connection, shared: &Sha
                     current_state = new_state;
                     update_state(current_state, shared, &connection).await;
                 }
+                if is_error {
+                    return Err("Portal session error during injection".into());
+                }
+            }
+
+            // Portal closed a session (e.g. screen lock, compositor restart)
+            Some(()) = shortcuts_closed.next() => {
+                tracing::warn!("GlobalShortcuts session closed by portal");
+                return Err("GlobalShortcuts session closed by portal".into());
+            }
+            Some(()) = desktop_closed.next() => {
+                tracing::warn!("RemoteDesktop session closed by portal");
+                return Err("RemoteDesktop session closed by portal".into());
             }
 
             // Session restart requested (e.g. shortcut changed via GUI)
@@ -345,7 +371,7 @@ async fn stop_recording(
     update_state(*current_state, shared, connection).await;
 
     if let Some(handle) = recording_handle.take() {
-        match handle.stop() {
+        match handle.stop().await {
             Ok(audio_path) => {
                 match transcriber.transcribe(&audio_path).await {
                     Ok(transcript) => {
