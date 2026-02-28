@@ -2887,7 +2887,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voxkey"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ashpd",
  "base64",
@@ -2912,7 +2912,7 @@ dependencies = [
 
 [[package]]
 name = "voxkey-ipc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2922,7 +2922,7 @@ dependencies = [
 
 [[package]]
 name = "voxkey-settings"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "futures-util",
  "gtk4",

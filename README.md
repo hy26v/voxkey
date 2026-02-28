@@ -10,23 +10,26 @@
 
 Voice dictation for Wayland. Press a shortcut, speak, and text appears at your cursor.
 
-Voxkey is a daemon that uses XDG Desktop Portal interfaces for global shortcuts and keyboard injection — no X11, no clipboard hacks, no virtual keyboard tools.
+Voxkey is a daemon that uses XDG Desktop Portal interfaces for global shortcuts and keyboard injection - no X11, no clipboard hacks, no virtual keyboard tools.
+
+> **Note:** Voxkey is developed and tested on Fedora running GNOME on Wayland. It may work on other distributions and compositors that support the required portal interfaces, but this is untested.
 
 ## Features
 
 - **Toggle dictation** with a global keyboard shortcut (default: `Super+Space`)
 - **Text injection** directly at the cursor in any focused application
 - **Multiple transcription backends:**
-  - [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — local, offline
-  - [Mistral](https://docs.mistral.ai/) — cloud batch API
-  - [Mistral Realtime](https://docs.mistral.ai/) — cloud streaming via WebSocket (text appears as you speak)
+  - [NVIDIA Parakeet](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/parakeet-tdt-0.6b) - local, offline, runs entirely on your machine
+  - [whisper.cpp](https://github.com/ggerganov/whisper.cpp) - local, offline
+  - [Mistral](https://docs.mistral.ai/) - cloud batch API
+  - [Mistral Realtime](https://docs.mistral.ai/) - cloud streaming via WebSocket (text appears as you speak)
 - **Settings GUI** (GTK4 + libadwaita) for live configuration
-- **Session persistence** — portal permissions survive reboots
+- **Session persistence** - portal permissions survive reboots
 - **Automatic recovery** on portal errors
 
 ## Requirements
 
-- **Wayland compositor** with XDG Desktop Portal support (GNOME, KDE Plasma, etc.)
+- **Fedora** with **GNOME on Wayland** (other distributions and compositors are untested)
 - Portal backends providing:
   - `org.freedesktop.portal.GlobalShortcuts` (v1+)
   - `org.freedesktop.portal.RemoteDesktop` (v2+) with keyboard device support
@@ -69,14 +72,17 @@ cargo install --path voxkey-settings
 
 ## Configuration
 
-Configuration lives at `~/.config/voxkey/config.toml`. All fields are optional — sensible defaults are used when omitted.
+Configuration lives at `~/.config/voxkey/config.toml`. All fields are optional - sensible defaults are used when omitted.
 
 ```toml
 [shortcut]
 trigger = "<Super>space"
 
 [transcriber]
-provider = "whisper-cpp"  # or "mistral" or "mistral-realtime"
+provider = "parakeet"  # or "whisper-cpp", "mistral", "mistral-realtime"
+
+[transcriber.parakeet]
+# model = "parakeet-tdt-0.6b-v2"  # download from the Settings app
 
 [transcriber.whisper_cpp]
 command = "whisper-cpp"

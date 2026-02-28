@@ -20,7 +20,7 @@ files in order:
 - Add a variant to the `Transcriber` enum holding the runtime fields it needs
 - Handle the new provider in `from_config()`
 - If this is a streaming/realtime provider, update `is_streaming()`
-- Write the transcription function — for batch providers, accept a WAV path and return text;
+- Write the transcription function - for batch providers, accept a WAV path and return text;
   for streaming providers, see `src/streaming.rs` for the WebSocket pattern
 - Add a match arm in `transcribe()`
 
@@ -48,7 +48,7 @@ files in order:
 
 ## General Guidelines
 
-- Keep changes focused — one feature or fix per PR
+- Keep changes focused - one feature or fix per PR
 - Follow the existing code style
 - Add tests for new functionality
 - Update the README Configuration section if you add new config fields
