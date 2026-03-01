@@ -27,6 +27,9 @@ rpmbuild/
 # Local tools
 whisper.cpp/
 
+# Local scripts
+scripts/
+
 # Private repo
 .git-private/
 CLAUDE.md

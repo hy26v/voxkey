@@ -79,6 +79,32 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     dictation_group.add(&shortcut_row);
     groups_box.append(&dictation_group);
 
+    // -- Text Insertion group --
+    let insertion_group = adw::PreferencesGroup::builder()
+        .title("Text Insertion")
+        .build();
+
+    let typing_delay_adjustment = gtk4::Adjustment::new(
+        5.0,   // default value
+        0.0,   // lower
+        50.0,  // upper
+        1.0,   // step increment
+        5.0,   // page increment
+        0.0,   // page size
+    );
+    let typing_delay_row = adw::SpinRow::builder()
+        .title("Typing Delay")
+        .subtitle("Milliseconds between keystrokes")
+        .adjustment(&typing_delay_adjustment)
+        .build();
+
+    insertion_group.add(&typing_delay_row);
+    groups_box.append(&insertion_group);
+
+    // Shared injection config state
+    let injection_state = Rc::new(RefCell::new(voxkey_ipc::InjectionConfig::default()));
+    let updating_injection_widgets = Rc::new(Cell::new(false));
+
     // -- Transcript group --
     let transcript_group = adw::PreferencesGroup::builder()
         .title("Last Transcript")
@@ -287,6 +313,10 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         &transcriber_state, &updating_widgets, &handle,
     );
     wire_advanced_actions(&reload_row, &clear_token_row, &handle, &toast_overlay);
+    wire_injection_actions(
+        &typing_delay_row,
+        &injection_state, &updating_injection_widgets, &handle,
+    );
 
     // -- Wire quit button --
     let handle_for_quit = handle.clone();
@@ -324,6 +354,9 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     let model_status_row_update = model_status_row.clone();
     let transcriber_state_update = transcriber_state.clone();
     let updating_widgets_poll = updating_widgets.clone();
+    let typing_delay_row_update = typing_delay_row.clone();
+    let injection_state_update = injection_state.clone();
+    let updating_injection_widgets_poll = updating_injection_widgets.clone();
     let banner = banner.clone();
     let toast_overlay_poll = toast_overlay.clone();
     let handle_poll = handle.clone();
@@ -335,6 +368,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                     state,
                     shortcut_trigger,
                     transcriber_config,
+                    injection_config,
                     portal_connected,
                     last_transcript,
                     last_error,
@@ -370,6 +404,12 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                         if tc.provider == voxkey_ipc::TranscriberProvider::Parakeet {
                             handle_poll.send(DaemonCommand::ModelStatus(tc.parakeet.model.clone()));
                         }
+                        apply_injection_config_to_widgets(
+                            &injection_config,
+                            &typing_delay_row_update,
+                            &injection_state_update,
+                            &updating_injection_widgets_poll,
+                        );
                     }
                 }
                 DaemonUpdate::Disconnected => {
@@ -411,6 +451,14 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                             &model_status_row_update,
                             &transcriber_state_update,
                             &updating_widgets_poll,
+                        );
+                    }
+                    "injection_config" => {
+                        apply_injection_config_to_widgets(
+                            &value,
+                            &typing_delay_row_update,
+                            &injection_state_update,
+                            &updating_injection_widgets_poll,
                         );
                     }
                     _ => {}
@@ -925,6 +973,49 @@ fn wire_transcriber_actions(
             model_status_row.set_subtitle("Not downloaded");
         });
     }
+}
+
+/// Parse injection config JSON and update the typing delay widget.
+fn apply_injection_config_to_widgets(
+    config_json: &str,
+    typing_delay_row: &adw::SpinRow,
+    state: &Rc<RefCell<voxkey_ipc::InjectionConfig>>,
+    updating_widgets: &Rc<Cell<bool>>,
+) {
+    let Ok(ic) = serde_json::from_str::<voxkey_ipc::InjectionConfig>(config_json) else {
+        return;
+    };
+
+    updating_widgets.set(true);
+    *state.borrow_mut() = ic.clone();
+    typing_delay_row.set_value(ic.typing_delay_ms as f64);
+    updating_widgets.set(false);
+}
+
+/// Build the current InjectionConfig from shared state and send it to the daemon.
+fn send_injection_config(state: &Rc<RefCell<voxkey_ipc::InjectionConfig>>, handle: &DaemonHandle) {
+    let config = state.borrow().clone();
+    if let Ok(json) = serde_json::to_string(&config) {
+        handle.send(DaemonCommand::SetInjectionConfig(json));
+    }
+}
+
+fn wire_injection_actions(
+    typing_delay_row: &adw::SpinRow,
+    state: &Rc<RefCell<voxkey_ipc::InjectionConfig>>,
+    updating_widgets: &Rc<Cell<bool>>,
+    handle: &DaemonHandle,
+) {
+    let state = state.clone();
+    let updating_widgets = updating_widgets.clone();
+    let handle = handle.clone();
+    typing_delay_row.connect_value_notify(move |row| {
+        if updating_widgets.get() {
+            return;
+        }
+        state.borrow_mut().typing_delay_ms = row.value() as u32;
+        send_injection_config(&state, &handle);
+    });
 }
 
 fn wire_advanced_actions(

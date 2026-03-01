@@ -1,5 +1,5 @@
 Name:           voxkey
-Version:        0.4.0
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        Wayland voice dictation daemon
 License:        MIT
@@ -11,7 +11,7 @@ Requires:       alsa-lib
 Requires:       libxkbcommon
 Requires:       gtk4
 Requires:       libadwaita
-Requires:       wl-clipboard
+
 
 %description
 Press a key, speak, and your words appear as typed text in any Wayland

@@ -14,6 +14,7 @@ pub enum DaemonUpdate {
         state: String,
         shortcut_trigger: String,
         transcriber_config: String,
+        injection_config: String,
         portal_connected: bool,
         last_transcript: String,
         last_error: String,
@@ -44,6 +45,7 @@ pub struct DaemonHandle {
 pub enum DaemonCommand {
     SetShortcut(String),
     SetTranscriberConfig(String),
+    SetInjectionConfig(String),
     DownloadModel(String),
     DeleteModel(String),
     ModelStatus(String),
@@ -58,6 +60,7 @@ impl std::fmt::Debug for DaemonCommand {
         match self {
             Self::SetShortcut(s) => f.debug_tuple("SetShortcut").field(s).finish(),
             Self::SetTranscriberConfig(s) => f.debug_tuple("SetTranscriberConfig").field(s).finish(),
+            Self::SetInjectionConfig(s) => f.debug_tuple("SetInjectionConfig").field(s).finish(),
             Self::DownloadModel(s) => f.debug_tuple("DownloadModel").field(s).finish(),
             Self::DeleteModel(s) => f.debug_tuple("DeleteModel").field(s).finish(),
             Self::ModelStatus(s) => f.debug_tuple("ModelStatus").field(s).finish(),
@@ -134,6 +137,7 @@ async fn try_connect(
     let state = proxy.state().await?;
     let shortcut_trigger = proxy.shortcut_trigger().await?;
     let transcriber_config = proxy.transcriber_config().await?;
+    let injection_config = proxy.injection_config().await?;
     let portal_connected = proxy.portal_connected().await?;
     let last_transcript = proxy.last_transcript().await?;
     let last_error = proxy.last_error().await?;
@@ -142,6 +146,7 @@ async fn try_connect(
         state,
         shortcut_trigger,
         transcriber_config,
+        injection_config,
         portal_connected,
         last_transcript,
         last_error,
@@ -154,6 +159,7 @@ async fn try_connect(
     let mut shortcut_stream = proxy.receive_shortcut_trigger_changed().await;
     let mut transcriber_stream = proxy.receive_transcriber_config_changed().await;
     let mut error_stream = proxy.receive_last_error_changed().await;
+    let mut injection_stream = proxy.receive_injection_config_changed().await;
     let mut download_stream = proxy.receive_download_progress().await?;
 
     // Poll for commands periodically
@@ -206,6 +212,14 @@ async fn try_connect(
                     });
                 }
             }
+            Some(change) = injection_stream.next() => {
+                if let Ok(val) = change.get().await {
+                    let _ = update_tx.send(DaemonUpdate::PropertyChanged {
+                        name: "injection_config".to_string(),
+                        value: val,
+                    });
+                }
+            }
             Some(signal) = download_stream.next() => {
                 if let Ok(args) = signal.args() {
                     let _ = update_tx.send(DaemonUpdate::DownloadProgress {
@@ -238,6 +252,9 @@ async fn handle_command(
         }
         DaemonCommand::SetTranscriberConfig(config_json) => {
             proxy.set_transcriber_config(&config_json).await?;
+        }
+        DaemonCommand::SetInjectionConfig(config_json) => {
+            proxy.set_injection_config(&config_json).await?;
         }
         DaemonCommand::DownloadModel(name) => {
             proxy.download_model(&name).await?;

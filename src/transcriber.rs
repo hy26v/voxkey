@@ -19,10 +19,7 @@ pub enum Transcriber {
         model: String,
         endpoint: String,
     },
-    MistralRealtime {
-        api_key: String,
-        model: String,
-    },
+    MistralRealtime,
     Parakeet {
         model_name: String,
         execution_provider: voxkey_ipc::ExecutionProviderChoice,
@@ -47,10 +44,7 @@ impl Transcriber {
                 model: config.mistral.model.clone(),
                 endpoint: config.mistral.endpoint.clone(),
             },
-            TranscriberProvider::MistralRealtime => Self::MistralRealtime {
-                api_key: config.mistral_realtime.api_key.clone(),
-                model: config.mistral_realtime.model.clone(),
-            },
+            TranscriberProvider::MistralRealtime => Self::MistralRealtime,
             TranscriberProvider::Parakeet => Self::Parakeet {
                 model_name: config.parakeet.model.clone(),
                 execution_provider: config.parakeet.execution_provider,
@@ -334,21 +328,12 @@ mod tests {
             parakeet: ParakeetConfig::default(),
         };
         let t = Transcriber::from_config(&config);
-        match t {
-            Transcriber::MistralRealtime { api_key, model } => {
-                assert_eq!(api_key, "sk-rt");
-                assert_eq!(model, "voxtral-mini-transcribe-realtime-2602");
-            }
-            _ => panic!("Expected MistralRealtime variant"),
-        }
+        assert!(matches!(t, Transcriber::MistralRealtime));
     }
 
     #[test]
     fn is_streaming_returns_true_for_mistral_realtime() {
-        let t = Transcriber::MistralRealtime {
-            api_key: String::new(),
-            model: String::new(),
-        };
+        let t = Transcriber::MistralRealtime;
         assert!(t.is_streaming());
     }
 

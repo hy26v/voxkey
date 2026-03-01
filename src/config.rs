@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub use voxkey_ipc::TranscriberConfig;
+pub use voxkey_ipc::{InjectionConfig, TranscriberConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -12,6 +12,8 @@ pub struct Config {
     pub shortcut: ShortcutConfig,
     #[serde(default)]
     pub transcriber: TranscriberConfig,
+    #[serde(default)]
+    pub injection: InjectionConfig,
     #[serde(default)]
     pub persistence: PersistenceConfig,
     #[serde(default)]
@@ -103,6 +105,7 @@ impl Default for Config {
         Self {
             shortcut: ShortcutConfig::default(),
             transcriber: TranscriberConfig::default(),
+            injection: InjectionConfig::default(),
             persistence: PersistenceConfig::default(),
             audio: AudioConfig::default(),
         }

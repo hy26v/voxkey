@@ -212,6 +212,12 @@ impl DaemonInterface {
     }
 
     #[zbus(property)]
+    fn injection_config(&self) -> String {
+        serde_json::to_string(&self.shared.config().injection)
+            .unwrap_or_default()
+    }
+
+    #[zbus(property)]
     fn sample_rate(&self) -> u32 {
         self.shared.config().audio.sample_rate
     }
@@ -297,6 +303,40 @@ impl DaemonInterface {
                 .get()
                 .await
                 .transcriber_config_changed(iface_ref.signal_emitter())
+                .await;
+        }
+
+        self.shared.request_session_restart();
+
+        Ok(())
+    }
+
+    async fn set_injection_config(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        config_json: &str,
+    ) -> zbus::fdo::Result<()> {
+        let injection_config: voxkey_ipc::InjectionConfig =
+            serde_json::from_str(config_json).map_err(|e| {
+                zbus::fdo::Error::InvalidArgs(format!("Invalid injection config JSON: {e}"))
+            })?;
+        {
+            let mut inner = self.shared.inner.lock().unwrap();
+            inner.config.injection = injection_config;
+        }
+        self.shared.config().save().map_err(|e| {
+            zbus::fdo::Error::Failed(format!("Failed to save config: {e}"))
+        })?;
+
+        if let Ok(iface_ref) = connection
+            .object_server()
+            .interface::<_, DaemonInterface>(voxkey_ipc::OBJECT_PATH)
+            .await
+        {
+            let _ = iface_ref
+                .get()
+                .await
+                .injection_config_changed(iface_ref.signal_emitter())
                 .await;
         }
 

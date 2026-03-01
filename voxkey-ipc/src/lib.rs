@@ -176,6 +176,25 @@ impl Default for TranscriberConfig {
     }
 }
 
+/// Configuration for text injection behavior.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InjectionConfig {
+    #[serde(default = "default_typing_delay_ms")]
+    pub typing_delay_ms: u32,
+}
+
+fn default_typing_delay_ms() -> u32 {
+    5
+}
+
+impl Default for InjectionConfig {
+    fn default() -> Self {
+        Self {
+            typing_delay_ms: default_typing_delay_ms(),
+        }
+    }
+}
+
 /// D-Bus proxy for the GUI to communicate with the daemon.
 ///
 /// The daemon implements the server side of this interface using
@@ -197,6 +216,10 @@ pub trait Daemon {
     /// Transcriber configuration as serialized JSON.
     #[zbus(property)]
     fn transcriber_config(&self) -> zbus::Result<String>;
+
+    /// Injection configuration as serialized JSON.
+    #[zbus(property)]
+    fn injection_config(&self) -> zbus::Result<String>;
 
     /// Audio sample rate in Hz.
     #[zbus(property)]
@@ -223,6 +246,9 @@ pub trait Daemon {
 
     /// Update the transcriber configuration from JSON.
     fn set_transcriber_config(&self, config_json: &str) -> zbus::Result<()>;
+
+    /// Update the injection configuration from JSON.
+    fn set_injection_config(&self, config_json: &str) -> zbus::Result<()>;
 
     /// Update audio settings. Takes effect on next recording.
     fn set_audio(&self, sample_rate: u32, channels: u16) -> zbus::Result<()>;

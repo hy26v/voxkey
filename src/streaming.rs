@@ -27,6 +27,7 @@ pub async fn run_streaming_session(
     stop_rx: oneshot::Receiver<()>,
     shared: SharedState,
     connection: zbus::Connection,
+    typing_delay: std::time::Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let base_url = if config.endpoint.is_empty() {
         MistralRealtimeConfig::DEFAULT_ENDPOINT
@@ -137,8 +138,14 @@ pub async fn run_streaming_session(
                         match msg.r#type.as_str() {
                             "transcription.text.delta" => {
                                 if let Some(delta) = msg.text {
-                                    if let Err(e) = injector::inject_text(&desktop, &delta).await {
-                                        tracing::error!("Failed to inject text delta: {e}");
+                                    match injector::inject_text(&desktop, &delta, typing_delay).await {
+                                        Ok(()) => {}
+                                        Err(injector::InjectionError::Portal(e)) => {
+                                            return Err(format!("Portal error during streaming injection: {e}").into());
+                                        }
+                                        Err(injector::InjectionError::Local(e)) => {
+                                            tracing::error!("Failed to inject text delta: {e}");
+                                        }
                                     }
                                     accumulated_transcript.push_str(&delta);
                                 }

@@ -161,11 +161,13 @@ async fn run_session(config: &Config, connection: zbus::Connection, shared: &Sha
     let recorder = Recorder::new(&config.audio);
     let transcriber = Transcriber::from_config(&config.transcriber);
 
+    let typing_delay = std::time::Duration::from_millis(config.injection.typing_delay_ms as u64);
+
     // State management channel
     let (state_tx, mut state_rx) = mpsc::channel::<Event>(32);
 
     // Injector with its own background task
-    let injector = Injector::new(desktop.clone(), state_tx.clone(), shared.clone());
+    let injector = Injector::new(desktop.clone(), state_tx.clone(), shared.clone(), typing_delay);
 
     // Retry any injection that failed due to a dead session (e.g. after screen lock recovery)
     if let Some(pending_text) = shared.take_pending_injection() {
@@ -260,6 +262,7 @@ async fn run_session(config: &Config, connection: zbus::Connection, shared: &Sha
                                                 stop_rx,
                                                 shared.clone(),
                                                 connection.clone(),
+                                                typing_delay,
                                             ).await {
                                                 tracing::error!("Streaming session error: {e}");
                                                 shared.set_last_error(format!("Streaming error: {e}"));
