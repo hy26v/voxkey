@@ -31,6 +31,9 @@ from the user's perspective.
 - Settings now distinguishes the final integrity check from the network
   transfer instead of appearing stuck at 99%. Both model views show when files
   are being verified and become ready only after Voxkey confirms success.
+- Reopening Settings after an RPM update now detects and replaces an older
+  daemon automatically. New controls and live updates work immediately without
+  requiring a manual service restart or logout.
 - Custom Mistral Batch, Mistral Realtime, and Parakeet server endpoints are now
   checked before they are saved. Settings shows connection progress and keeps
   the address ready to correct or retry when the server cannot be reached.

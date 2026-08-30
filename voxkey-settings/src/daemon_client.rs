@@ -783,6 +783,22 @@ fn is_unknown_method_error(error: &zbus::Error) -> bool {
     }
 }
 
+fn is_unknown_property_error(error: &zbus::Error) -> bool {
+    match error {
+        zbus::Error::MethodError(name, _, _) => {
+            name.as_str() == "org.freedesktop.DBus.Error.UnknownProperty"
+        }
+        zbus::Error::FDO(error) => {
+            matches!(error.as_ref(), zbus::fdo::Error::UnknownProperty(_))
+        }
+        _ => false,
+    }
+}
+
+fn daemon_protocol_requires_upgrade(running_version: Option<u32>) -> bool {
+    !running_version.is_some_and(|version| version >= voxkey_ipc::DAEMON_PROTOCOL_VERSION)
+}
+
 async fn stop_service_inner() -> Result<(), String> {
     let connection = zbus::Connection::session()
         .await
@@ -813,7 +829,7 @@ async fn run_client(
 ) {
     let mut unavailable = start_service(&update_tx, false).await;
     let mut was_attached = false;
-    let mut legacy_restart_attempted = false;
+    let mut upgrade_restart_attempted = false;
 
     loop {
         let mut attached_this_attempt = false;
@@ -822,7 +838,7 @@ async fn run_client(
             &mut cmd_rx,
             &mut lifecycle_rx,
             &mut attached_this_attempt,
-            &mut legacy_restart_attempted,
+            &mut upgrade_restart_attempted,
         )
         .await
         {
@@ -854,7 +870,7 @@ async fn run_client(
             command = lifecycle_rx.recv() => match command {
                 Some(LifecycleCommand::StartService { unmask }) => {
                     unavailable = start_service(&update_tx, unmask).await;
-                    legacy_restart_attempted = false;
+                    upgrade_restart_attempted = false;
                 }
                 Some(LifecycleCommand::Quit { ack }) => {
                     stop_service().await;
@@ -875,7 +891,7 @@ async fn try_connect(
     cmd_rx: &mut tokio::sync::mpsc::Receiver<CommandRequest>,
     lifecycle_rx: &mut tokio::sync::mpsc::Receiver<LifecycleCommand>,
     attached: &mut bool,
-    legacy_restart_attempted: &mut bool,
+    upgrade_restart_attempted: &mut bool,
 ) -> Result<ConnectionOutcome, Box<dyn std::error::Error>> {
     let builder = zbus::connection::Builder::session()?.method_timeout(DAEMON_CALL_TIMEOUT);
     let connection = tokio::time::timeout(DAEMON_CALL_TIMEOUT, builder.build())
@@ -892,28 +908,52 @@ async fn try_connect(
     // This is deliberately the first daemon method call. Once it succeeds, a
     // settings crash or SIGKILL is observed by the daemon independently of the
     // GUI process and triggers the same graceful shutdown path as Quit.
-    match proxy.attach_settings().await {
-        Ok(()) => *attached = true,
-        Err(error) if is_unknown_method_error(&error) && !*legacy_restart_attempted => {
-            // RPM upgrades do not forcibly restart a live user service. Hand
-            // an older daemon off to the newly installed managed unit once,
-            // so the user never has to discover and restart it manually.
-            *legacy_restart_attempted = true;
-            tracing::info!("Running daemon predates UI lifecycle support; restarting it");
-            if let Err(quit_error) = proxy.quit().await {
-                tracing::warn!("Could not ask the previous daemon to quit: {quit_error}");
-            }
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(2), owner_stream.next()).await;
-            return Ok(ConnectionOutcome::Retry(restart_service(update_tx).await));
+    let mut upgrade_reason = match proxy.attach_settings().await {
+        Ok(()) => {
+            *attached = true;
+            None
         }
         Err(error) if is_unknown_method_error(&error) => {
-            return Err(std::io::Error::other(
-                "This Voxkey build still lacks UI lifecycle support after restart",
-            )
-            .into());
+            Some("predates Settings lifecycle support".to_string())
         }
         Err(error) => return Err(error.into()),
+    };
+
+    if upgrade_reason.is_none() {
+        let running_protocol = match proxy.protocol_version().await {
+            Ok(version) => Some(version),
+            Err(error) if is_unknown_property_error(&error) => None,
+            Err(error) => return Err(error.into()),
+        };
+        if daemon_protocol_requires_upgrade(running_protocol) {
+            upgrade_reason = Some(match running_protocol {
+                Some(version) => format!(
+                    "uses protocol {version}, but Settings requires {}",
+                    voxkey_ipc::DAEMON_PROTOCOL_VERSION
+                ),
+                None => "does not report a protocol version".to_string(),
+            });
+        }
+    }
+
+    if let Some(reason) = upgrade_reason {
+        if *upgrade_restart_attempted {
+            return Err(std::io::Error::other(format!(
+                "The installed Voxkey daemon is still incompatible after restart: {reason}"
+            ))
+            .into());
+        }
+
+        // RPM upgrades deliberately do not restart active user services. Hand
+        // the stale process off to the newly installed managed unit once so
+        // new Settings never stays attached to an older interface silently.
+        *upgrade_restart_attempted = true;
+        tracing::info!("Running daemon {reason}; restarting it after the package upgrade");
+        if let Err(quit_error) = proxy.quit().await {
+            tracing::warn!("Could not ask the previous daemon to quit: {quit_error}");
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), owner_stream.next()).await;
+        return Ok(ConnectionOutcome::Retry(restart_service(update_tx).await));
     }
 
     // Read initial state
@@ -927,9 +967,9 @@ async fn try_connect(
     let injection_config = proxy.injection_config().await?;
     let preview_config = proxy.preview_config().await?;
     let dictionary_config = proxy.dictionary_config().await?;
-    // These properties were added with the redesigned settings app. Defaults
-    // keep the rest of the UI usable if an older daemon is still running
-    // during a package upgrade; the service will expose them after restart.
+    // Keep optional display-only properties tolerant for third-party clients
+    // and forward compatibility. The protocol handshake above has already
+    // replaced an older packaged daemon before authoritative state is read.
     let transcription_history = proxy
         .transcription_history()
         .await
@@ -1984,16 +2024,33 @@ mod tests {
     }
 
     #[test]
-    fn only_unknown_method_requests_the_upgrade_handoff() {
+    fn only_missing_interface_members_request_the_upgrade_handoff() {
         let unknown_method = zbus::Error::FDO(Box::new(zbus::fdo::Error::UnknownMethod(
             "AttachSettings is not available".to_string(),
+        )));
+        let unknown_property = zbus::Error::FDO(Box::new(zbus::fdo::Error::UnknownProperty(
+            "ProtocolVersion is not available".to_string(),
         )));
         let disconnected = zbus::Error::FDO(Box::new(zbus::fdo::Error::Disconnected(
             "session bus closed".to_string(),
         )));
 
         assert!(is_unknown_method_error(&unknown_method));
+        assert!(is_unknown_property_error(&unknown_property));
         assert!(!is_unknown_method_error(&disconnected));
+        assert!(!is_unknown_property_error(&disconnected));
+    }
+
+    #[test]
+    fn protocol_handoff_accepts_current_and_newer_daemons_only() {
+        assert!(daemon_protocol_requires_upgrade(None));
+        assert!(daemon_protocol_requires_upgrade(Some(0)));
+        assert!(!daemon_protocol_requires_upgrade(Some(
+            voxkey_ipc::DAEMON_PROTOCOL_VERSION
+        )));
+        assert!(!daemon_protocol_requires_upgrade(Some(
+            voxkey_ipc::DAEMON_PROTOCOL_VERSION + 1
+        )));
     }
 
     #[test]

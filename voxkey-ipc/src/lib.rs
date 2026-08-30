@@ -17,6 +17,13 @@ pub const SETTINGS_BUS_NAME: &str = "io.github.hy26v.Voxkey";
 /// Object path the daemon interface is served at.
 pub const OBJECT_PATH: &str = "/io/github/hy26v/Voxkey/Daemon";
 
+/// Interface revision required by the current Settings application.
+///
+/// Increment this when Settings starts depending on a method, property, or
+/// signal that an older packaged daemon does not provide. Settings accepts a
+/// newer daemon, but replaces a missing or older revision after an RPM update.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
+
 /// Model-status value returned after every byte has arrived but before the
 /// downloaded files have passed integrity checks and been published.
 pub const MODEL_STATUS_VERIFYING_DOWNLOAD: &str = "verifying_download";
@@ -678,6 +685,10 @@ impl HistoryEntry {
     default_path = "/io/github/hy26v/Voxkey/Daemon"
 )]
 pub trait Daemon {
+    /// Revision of the daemon interface implemented by this process.
+    #[zbus(property)]
+    fn protocol_version(&self) -> zbus::Result<u32>;
+
     /// Current daemon state as a string.
     #[zbus(property)]
     fn state(&self) -> zbus::Result<String>;
@@ -885,6 +896,11 @@ mod tests {
         assert!(config.whisper_cpp.args.is_empty());
         assert_eq!(config.mistral.model, "voxtral-mini-2602");
         assert!(config.mistral.api_key.is_empty());
+    }
+
+    #[test]
+    fn daemon_protocol_version_is_an_explicit_nonzero_contract() {
+        assert_eq!(DAEMON_PROTOCOL_VERSION, 1);
     }
 
     #[test]

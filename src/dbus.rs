@@ -1141,6 +1141,11 @@ fn public_transcriber_config_json(config: &voxkey_ipc::TranscriberConfig) -> Str
 #[zbus::interface(name = "io.github.hy26v.Voxkey.Daemon1")]
 impl DaemonInterface {
     #[zbus(property)]
+    fn protocol_version(&self) -> u32 {
+        voxkey_ipc::DAEMON_PROTOCOL_VERSION
+    }
+
+    #[zbus(property)]
     fn state(&self) -> String {
         self.shared.state().to_string()
     }

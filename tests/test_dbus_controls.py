@@ -17,6 +17,7 @@ from helpers.dbus_portal import safe_introspect
 DAEMON_BUS_NAME = "io.github.hy26v.Voxkey.Daemon"
 DAEMON_OBJECT_PATH = "/io/github/hy26v/Voxkey/Daemon"
 DAEMON_INTERFACE = "io.github.hy26v.Voxkey.Daemon1"
+EXPECTED_DAEMON_PROTOCOL_VERSION = 1
 
 
 async def _wait_until(get_value, predicate, timeout=10):
@@ -61,6 +62,16 @@ async def _configure_backend(daemon, program):
     # Do not let a request target the retiring portal generation after the
     # first connected/idle observation during session reconstruction.
     await asyncio.sleep(0.3)
+
+
+@pytest.mark.asyncio
+async def test_daemon_reports_the_settings_protocol_it_implements(
+    daemon_process, dbus_session,
+):
+    assert daemon_process.reached_idle, daemon_process.startup_lines
+    daemon = await _daemon_proxy(dbus_session)
+
+    assert await daemon.get_protocol_version() == EXPECTED_DAEMON_PROTOCOL_VERSION
 
 
 @pytest.mark.asyncio
