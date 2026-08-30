@@ -46,9 +46,9 @@ def isolated_voxkey_home(tmp_path_factory):
     """Redirect all mutable Voxkey state to a temporary XDG root.
 
     Prevents the spawned daemon from reading or writing the caller's real
-    ~/.config/voxkey/config.toml or portal restore token.
-    Downloaded Parakeet models are the one read-only exception: the isolated
-    data home gets a symlink to the host's real model directory.
+    configuration, model store, transcription history, or portal restore
+    token. Real-model tests copy or hard-link an explicitly selected fixture
+    into this isolated data root instead of borrowing the live model store.
     """
     config_home = tmp_path_factory.mktemp("voxkey-xdg-config")
     state_home = tmp_path_factory.mktemp("voxkey-xdg-state")
@@ -57,6 +57,7 @@ def isolated_voxkey_home(tmp_path_factory):
     data_home = config_home / "data"
     data_voxkey_dir = data_home / "voxkey"
     data_voxkey_dir.mkdir(parents=True)
+    (data_voxkey_dir / "models").mkdir()
 
     test_config_source = os.environ.get("VOXKEY_TEST_CONFIG")
     if test_config_source is not None:
@@ -68,11 +69,6 @@ def isolated_voxkey_home(tmp_path_factory):
         dest_config = voxkey_config_dir / "config.toml"
         shutil.copyfile(source_path, dest_config)
         os.chmod(dest_config, 0o600)
-
-    host_data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    host_models_dir = Path(host_data_home) / "voxkey" / "models"
-    if host_models_dir.is_dir():
-        (data_voxkey_dir / "models").symlink_to(host_models_dir)
 
     saved_env = {
         key: os.environ.get(key)

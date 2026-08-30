@@ -113,6 +113,19 @@ const NEMOTRON_3_5_ARTIFACTS: &[ModelArtifact] = &[
     },
 ];
 
+/// Runtime files accepted for a user-supplied offline transducer.
+///
+/// Catalogue models are always checked against their immutable manifests
+/// below. This filename-only fallback exists solely for custom model IDs that
+/// Voxkey cannot checksum because their artifacts are not part of the
+/// catalogue.
+const CUSTOM_MODEL_ARTIFACTS: &[&str] = &[
+    "encoder.int8.onnx",
+    "decoder.int8.onnx",
+    "joiner.int8.onnx",
+    "tokens.txt",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ArtifactIdentity {
     device: u64,
@@ -263,13 +276,21 @@ fn is_model_available_in(models_dir: &std::path::Path, model_name: &str) -> bool
         return false;
     }
 
-    let Some(manifest) = manifest(model_name) else {
-        return false;
-    };
     let dir = models_dir.join(model_name);
     if !std::fs::symlink_metadata(&dir).is_ok_and(|metadata| metadata.file_type().is_dir()) {
         return false;
     }
+
+    let Some(manifest) = manifest(model_name) else {
+        // Custom IDs were supported before the downloadable catalogue was
+        // introduced. Keep that escape hatch without weakening catalogue
+        // integrity: every runtime file must be a non-empty regular file and
+        // O_NOFOLLOW prevents a symlink from standing in for an artifact.
+        return CUSTOM_MODEL_ARTIFACTS.iter().all(|name| {
+            current_artifact_identity(&dir.join(name)).is_ok_and(|identity| identity.size > 0)
+        });
+    };
+
     let current_identities = manifest
         .artifacts
         .iter()
@@ -352,6 +373,16 @@ mod tests {
                 manifest
                     .artifacts
                     .iter()
+                    .map(|artifact| artifact.name)
+                    .collect::<Vec<_>>(),
+                CUSTOM_MODEL_ARTIFACTS,
+                "{} uses a different runtime artifact layout",
+                model.id
+            );
+            assert_eq!(
+                manifest
+                    .artifacts
+                    .iter()
                     .map(|artifact| artifact.size)
                     .sum::<u64>(),
                 model.download_bytes,
@@ -367,19 +398,29 @@ mod tests {
     }
 
     #[test]
-    fn is_model_available_returns_true_when_all_files_present() {
+    fn a_complete_custom_offline_model_is_available() {
         let dir = tempfile::tempdir().unwrap();
-        let model_name = "test-model";
+        let model_name = "my-custom-transducer";
         let model_path = dir.path().join(model_name);
         std::fs::create_dir_all(&model_path).unwrap();
-        for artifact in V3_ARTIFACTS {
-            std::fs::write(model_path.join(artifact.name), b"fake").unwrap();
+        for artifact in CUSTOM_MODEL_ARTIFACTS {
+            std::fs::write(model_path.join(artifact), b"custom model data").unwrap();
         }
-        // We can't test with the real models_dir, so test the underlying logic
-        let all_present = V3_ARTIFACTS
-            .iter()
-            .all(|artifact| model_path.join(artifact.name).exists());
-        assert!(all_present);
+
+        assert!(is_model_available_in(dir.path(), model_name));
+    }
+
+    #[test]
+    fn a_catalogue_model_never_uses_the_custom_file_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_name = "parakeet-tdt-0.6b-v3";
+        let model_path = dir.path().join(model_name);
+        std::fs::create_dir_all(&model_path).unwrap();
+        for artifact in CUSTOM_MODEL_ARTIFACTS {
+            std::fs::write(model_path.join(artifact), b"unverified model data").unwrap();
+        }
+
+        assert!(!is_model_available_in(dir.path(), model_name));
     }
 
     #[test]
@@ -387,9 +428,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let model_path = temp.path().join("broken-model");
         std::fs::create_dir_all(&model_path).unwrap();
-        for artifact in V3_ARTIFACTS {
-            let path = model_path.join(artifact.name);
-            if artifact.name == "encoder.int8.onnx" {
+        for artifact in CUSTOM_MODEL_ARTIFACTS {
+            let path = model_path.join(artifact);
+            if *artifact == "encoder.int8.onnx" {
                 std::fs::create_dir(&path).unwrap();
             } else {
                 std::fs::write(&path, b"model data").unwrap();
@@ -411,8 +452,8 @@ mod tests {
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&models).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
-        for artifact in V3_ARTIFACTS {
-            std::fs::write(outside.join(artifact.name), b"model data").unwrap();
+        for artifact in CUSTOM_MODEL_ARTIFACTS {
+            std::fs::write(outside.join(artifact), b"model data").unwrap();
         }
 
         assert!(!is_model_available_in(&models, "../outside"));
@@ -428,8 +469,8 @@ mod tests {
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&models).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
-        for artifact in V3_ARTIFACTS {
-            std::fs::write(outside.join(artifact.name), b"model data").unwrap();
+        for artifact in CUSTOM_MODEL_ARTIFACTS {
+            std::fs::write(outside.join(artifact), b"model data").unwrap();
         }
 
         symlink(&outside, models.join("linked-model")).unwrap();
@@ -437,8 +478,8 @@ mod tests {
 
         let mixed = models.join("mixed-model");
         std::fs::create_dir(&mixed).unwrap();
-        for artifact in V3_ARTIFACTS {
-            symlink(outside.join(artifact.name), mixed.join(artifact.name)).unwrap();
+        for artifact in CUSTOM_MODEL_ARTIFACTS {
+            symlink(outside.join(artifact), mixed.join(artifact)).unwrap();
         }
         assert!(!is_model_available_in(&models, "mixed-model"));
     }

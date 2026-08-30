@@ -34,6 +34,9 @@ from the user's perspective.
 - Reopening Settings after an RPM update now detects and replaces an older
   daemon automatically. New controls and live updates work immediately without
   requiring a manual service restart or logout.
+- User-supplied local Parakeet models work again when their custom folder has
+  the four required runtime files. Settings opens that model's exact folder,
+  while downloadable models continue to require their pinned integrity checks.
 - Custom Mistral Batch, Mistral Realtime, and Parakeet server endpoints are now
   checked before they are saved. Settings shows connection progress and keeps
   the address ready to correct or retry when the server cannot be reached.

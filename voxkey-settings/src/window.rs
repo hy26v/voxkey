@@ -2897,11 +2897,19 @@ struct ModelStatusPresentation {
 
 fn model_status_presentation(status: &str, model_name: &str) -> ModelStatusPresentation {
     match status {
-        "available" => ModelStatusPresentation {
+        "available" if parakeet_model_can_download(model_name) => ModelStatusPresentation {
             subtitle: "Available on this computer".to_string(),
             show_download_progress: false,
             action: ModelStatusAction::None,
             show_delete: true,
+        },
+        "available" => ModelStatusPresentation {
+            subtitle: "Custom model files found".to_string(),
+            show_download_progress: false,
+            action: ModelStatusAction::OpenFolder,
+            // Voxkey cannot know whether an arbitrary custom directory holds
+            // unrelated user data, so only catalogue downloads expose Delete.
+            show_delete: false,
         },
         "downloading" => ModelStatusPresentation {
             subtitle: "Downloading…".to_string(),
@@ -5204,7 +5212,7 @@ fn wire_transcriber_actions(
                 return;
             }
             if button.label().as_deref() == ModelStatusAction::OpenFolder.label() {
-                handle.send(DaemonCommand::OpenModelsDir);
+                handle.send(DaemonCommand::OpenModelDir(model_name));
                 return;
             }
             if button.label().as_deref() == ModelStatusAction::RetryCheck.label() {
@@ -5237,9 +5245,12 @@ fn wire_transcriber_actions(
 
     // Open folder button
     {
+        let state = state.clone();
         let handle = handle.clone();
         open_folder_button.connect_clicked(move |_| {
-            handle.send(DaemonCommand::OpenModelsDir);
+            handle.send(DaemonCommand::OpenModelDir(
+                state.borrow().parakeet.model.clone(),
+            ));
         });
     }
 
@@ -6375,6 +6386,11 @@ mod tests {
         assert_eq!(available.action, ModelStatusAction::None);
         assert!(available.show_delete);
         assert!(available.subtitle.contains("this computer"));
+
+        let custom_available = model_status_presentation("available", "my-custom-model");
+        assert_eq!(custom_available.subtitle, "Custom model files found");
+        assert_eq!(custom_available.action, ModelStatusAction::OpenFolder);
+        assert!(!custom_available.show_delete);
     }
 
     #[test]

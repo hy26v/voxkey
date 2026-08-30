@@ -1579,12 +1579,22 @@ fn ensure_parakeet_model_available(model_name: &str) -> Result<(), DynError> {
     if crate::models::is_model_available(model_name) {
         return Ok(());
     }
-    Err(format!(
-        "Parakeet model '{}' not found at {}. Download it from Voxkey settings.",
-        model_name,
-        crate::models::model_dir(model_name).display()
-    )
-    .into())
+    Err(parakeet_model_unavailable_message(model_name).into())
+}
+
+fn parakeet_model_unavailable_message(model_name: &str) -> String {
+    let path = crate::models::model_dir(model_name);
+    if crate::models::manifest(model_name).is_some() {
+        format!(
+            "Parakeet model '{model_name}' not found at {}. Download it from Voxkey settings.",
+            path.display()
+        )
+    } else {
+        format!(
+            "Custom Parakeet model '{model_name}' is incomplete at {}. Open its model folder in Settings and add non-empty encoder.int8.onnx, decoder.int8.onnx, joiner.int8.onnx, and tokens.txt files.",
+            path.display()
+        )
+    }
 }
 
 async fn ensure_parakeet_model_available_cached(
@@ -3796,6 +3806,22 @@ mod tests {
             .expect_err("missing model files must stop PCM transcription before inference");
 
         assert!(error.to_string().contains(model_name), "{error}");
+        assert!(
+            error.to_string().contains("Open its model folder"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("tokens.txt"), "{error}");
+    }
+
+    #[test]
+    fn missing_catalogue_models_still_point_to_the_download_action() {
+        let message = parakeet_model_unavailable_message("parakeet-tdt-0.6b-v3");
+
+        assert!(
+            message.contains("Download it from Voxkey settings"),
+            "{message}"
+        );
+        assert!(!message.contains("Custom Parakeet"), "{message}");
     }
 
     #[test]

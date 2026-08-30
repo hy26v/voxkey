@@ -19,6 +19,8 @@ def test_voxkey_paths_are_isolated(isolated_voxkey_home):
     assert token_path == config_home / "voxkey" / "restore_token"
     assert data_home == config_home / "data"
     assert (data_home / "voxkey").is_dir()
+    assert (data_home / "voxkey" / "models").is_dir()
+    assert not (data_home / "voxkey" / "models").is_symlink()
     assert state_home.is_dir()
     assert state_home != (Path.home() / ".local" / "state").resolve()
 

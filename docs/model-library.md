@@ -35,6 +35,17 @@ still fails, Settings leaves the affected model in a recoverable state with a
 **Retry check** action; it does not guess whether unverified files are safe to
 use or leave the controls stuck indefinitely.
 
+Custom local Parakeet IDs already present in `config.toml` remain supported as
+offline transducers. Their matching folder under
+`$XDG_DATA_HOME/voxkey/models/` (normally
+`~/.local/share/voxkey/models/`) must contain non-empty regular files named
+`encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx`, and `tokens.txt`.
+Settings opens that exact folder to make setup and maintenance straightforward.
+Because Voxkey has no pinned checksums for user-supplied artifacts, it never
+labels them as catalogue downloads or offers to delete their directory.
+Built-in model IDs still require an exact size and SHA-256 match and can never
+fall back to this custom-file check.
+
 “Downloadable” does not mean every model uses an OSI-approved open-source
 license. Parakeet v2/v3 use Creative Commons; Nemotron 3.5 and Parakeet Unified
 use publisher-specific open-weight licenses. The settings app always shows the

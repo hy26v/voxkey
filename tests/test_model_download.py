@@ -19,6 +19,13 @@ DAEMON_INTERFACE = "io.github.hy26v.Voxkey.Daemon1"
 # before any network access. Keeps the suite offline and fast.
 UNKNOWN_MODEL = "voxkey-integration-test-model"
 KNOWN_MODEL = "parakeet-tdt-0.6b-v3"
+CUSTOM_MODEL = "voxkey-integration-custom-model"
+CUSTOM_MODEL_FILES = (
+    "encoder.int8.onnx",
+    "decoder.int8.onnx",
+    "joiner.int8.onnx",
+    "tokens.txt",
+)
 
 
 async def _daemon_interface(dbus_session):
@@ -61,6 +68,39 @@ async def test_status_of_a_model_that_was_never_downloaded(
     daemon = await _daemon_interface(dbus_session)
 
     assert await daemon.call_model_status(UNKNOWN_MODEL) == "not_downloaded"
+
+
+@pytest.mark.asyncio
+async def test_complete_custom_local_model_is_available_but_never_auto_deleted(
+    daemon_process, dbus_session,
+):
+    assert daemon_process.reached_idle, "Daemon did not reach Idle"
+    daemon = await _daemon_interface(dbus_session)
+    data_home = Path(os.environ["XDG_DATA_HOME"])
+    model_path = data_home / "voxkey" / "models" / CUSTOM_MODEL
+    model_path.mkdir()
+    try:
+        for name in CUSTOM_MODEL_FILES:
+            (model_path / name).write_bytes(b"custom model data")
+
+        assert await daemon.call_model_status(CUSTOM_MODEL) == "available"
+
+        # Unknown files have no pinned manifest. A complete regular-file set
+        # is accepted, but an empty runtime artifact immediately invalidates it.
+        (model_path / "tokens.txt").write_bytes(b"")
+        assert await daemon.call_model_status(CUSTOM_MODEL) == "not_downloaded"
+        (model_path / "tokens.txt").write_bytes(b"custom tokens")
+        assert await daemon.call_model_status(CUSTOM_MODEL) == "available"
+
+        # Custom folders may contain other user-managed files, so the daemon
+        # must keep catalogue-only deletion protection in place.
+        with pytest.raises(DBusError):
+            await daemon.call_delete_model(CUSTOM_MODEL)
+        assert all((model_path / name).is_file() for name in CUSTOM_MODEL_FILES)
+    finally:
+        for name in CUSTOM_MODEL_FILES:
+            (model_path / name).unlink(missing_ok=True)
+        model_path.rmdir()
 
 
 @pytest.mark.asyncio

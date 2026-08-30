@@ -63,6 +63,50 @@ fn models_dir_from(
     data_dir.join("voxkey").join("models")
 }
 
+fn model_name_is_one_directory(model_name: &str) -> bool {
+    let mut components = std::path::Path::new(model_name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
+fn prepare_model_dir_for_open(
+    models_dir: &std::path::Path,
+    model_name: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    if !model_name_is_one_directory(model_name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "The model identifier must be one folder name",
+        ));
+    }
+
+    std::fs::create_dir_all(models_dir)?;
+    let model_dir = models_dir.join(model_name);
+    match std::fs::symlink_metadata(&model_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "The model path is not a real directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::create_dir(&model_dir) {
+                Ok(()) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+                        && std::fs::symlink_metadata(&model_dir)
+                            .is_ok_and(|metadata| metadata.file_type().is_dir()) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(model_dir)
+}
+
 /// Complete daemon state captured when the settings client connects.
 #[derive(Debug)]
 pub struct DaemonSnapshot {
@@ -457,7 +501,7 @@ pub enum DaemonCommand {
     CancelModelDownload(String),
     DeleteModel(String),
     ModelStatus(String),
-    OpenModelsDir,
+    OpenModelDir(String),
     ReloadConfig,
     ClearRestoreToken,
 }
@@ -487,7 +531,7 @@ impl DaemonCommand {
             Self::CancelModelDownload(_) => "Cancel model download",
             Self::DeleteModel(_) => "Delete model",
             Self::ModelStatus(_) => "Check model status",
-            Self::OpenModelsDir => "Open models folder",
+            Self::OpenModelDir(_) => "Open model folder",
             Self::ReloadConfig => "Reload configuration",
             Self::ClearRestoreToken => "Reset desktop permission",
         }
@@ -572,7 +616,7 @@ impl std::fmt::Debug for DaemonCommand {
             Self::CancelModelDownload(s) => f.debug_tuple("CancelModelDownload").field(s).finish(),
             Self::DeleteModel(s) => f.debug_tuple("DeleteModel").field(s).finish(),
             Self::ModelStatus(s) => f.debug_tuple("ModelStatus").field(s).finish(),
-            Self::OpenModelsDir => write!(f, "OpenModelsDir"),
+            Self::OpenModelDir(s) => f.debug_tuple("OpenModelDir").field(s).finish(),
             Self::ReloadConfig => write!(f, "ReloadConfig"),
             Self::ClearRestoreToken => write!(f, "ClearRestoreToken"),
         }
@@ -1519,14 +1563,14 @@ async fn handle_command(
                 status,
             });
         }
-        DaemonCommand::OpenModelsDir => {
+        DaemonCommand::OpenModelDir(model_name) => {
             let models_dir = models_dir_from(
                 std::env::var_os("XDG_DATA_HOME").as_deref(),
                 std::env::var_os("HOME").as_deref(),
             );
-            std::fs::create_dir_all(&models_dir)?;
+            let model_dir = prepare_model_dir_for_open(&models_dir, &model_name)?;
             tokio::process::Command::new("xdg-open")
-                .arg(&models_dir)
+                .arg(&model_dir)
                 .spawn()?;
         }
         DaemonCommand::ReloadConfig => {
@@ -2116,5 +2160,40 @@ mod tests {
             ),
             std::path::PathBuf::from("/home/test/.local/share/voxkey/models")
         );
+    }
+
+    #[test]
+    fn opening_a_model_folder_is_scoped_to_one_safe_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let models = temp.path().join("models");
+
+        let opened = prepare_model_dir_for_open(&models, "my-custom-model").unwrap();
+
+        assert_eq!(opened, models.join("my-custom-model"));
+        assert!(opened.is_dir());
+        for invalid in ["", ".", "..", "../outside", "/tmp/outside", "nested/model"] {
+            let error = prepare_model_dir_for_open(&models, invalid).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        assert!(!temp.path().join("outside").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_a_model_folder_rejects_files_and_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let models = temp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("regular-file"), b"keep").unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, models.join("linked-model")).unwrap();
+
+        for name in ["regular-file", "linked-model"] {
+            let error = prepare_model_dir_for_open(&models, name).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 }
