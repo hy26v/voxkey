@@ -11,6 +11,9 @@ from the user's perspective.
 - Large local-model downloads can now be cancelled from either model view in
   Settings. Voxkey stops the transfer safely, removes the incomplete file, and
   keeps any model files that already finished so a later retry can reuse them.
+- Settings now stays responsive while checking large local models. Repeated
+  checks for the same model share one result, and integrity scans run one at a
+  time instead of competing for disk access.
 - Custom Mistral Batch, Mistral Realtime, and Parakeet server endpoints are now
   checked before they are saved. Settings shows connection progress and keeps
   the address ready to correct or retry when the server cannot be reached.

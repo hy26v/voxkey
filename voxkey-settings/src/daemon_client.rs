@@ -1,9 +1,10 @@
 // ABOUTME: Connects to the voxkey daemon over session D-Bus.
 // ABOUTME: Reads properties, calls methods, and forwards state changes to the GTK main loop.
 
-use std::sync::mpsc;
+use std::collections::HashMap;
+use std::sync::{Arc, mpsc};
 
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use voxkey_ipc::DaemonProxy;
 
 const SERVICE_UNIT: &str = "voxkey.service";
@@ -123,6 +124,83 @@ struct CommandRequest {
 }
 
 type CommandResponse = Option<voxkey_ipc::EndpointCheckResult>;
+
+#[derive(Default)]
+struct PendingModelStatusRequests {
+    completions:
+        HashMap<String, Vec<tokio::sync::oneshot::Sender<Result<CommandResponse, String>>>>,
+}
+
+impl PendingModelStatusRequests {
+    /// Register a status request. Returns true only when the caller must start
+    /// a D-Bus query; duplicate requests share its eventual result.
+    fn queue(
+        &mut self,
+        model_name: String,
+        completion: tokio::sync::oneshot::Sender<Result<CommandResponse, String>>,
+    ) -> bool {
+        match self.completions.entry(model_name) {
+            std::collections::hash_map::Entry::Occupied(mut pending) => {
+                pending.get_mut().push(completion);
+                false
+            }
+            std::collections::hash_map::Entry::Vacant(pending) => {
+                pending.insert(vec![completion]);
+                true
+            }
+        }
+    }
+
+    fn finish(
+        &mut self,
+        model_name: String,
+        result: Result<String, String>,
+        update_tx: &tokio::sync::mpsc::Sender<DaemonUpdate>,
+    ) {
+        let Some(completions) = self.completions.remove(&model_name) else {
+            tracing::warn!("Received an untracked model status result for {model_name}");
+            return;
+        };
+
+        match result {
+            Ok(status) => {
+                let _ = update_tx.try_send(DaemonUpdate::ModelStatusResult { model_name, status });
+                for completion in completions {
+                    let _ = completion.send(Ok(None));
+                }
+            }
+            Err(message) => {
+                tracing::error!("Check model status failed: {message}");
+                let _ = update_tx.try_send(DaemonUpdate::CommandFailed {
+                    operation: "Check model status".to_string(),
+                    message: message.clone(),
+                });
+                for completion in completions {
+                    let _ = completion.send(Err(message.clone()));
+                }
+            }
+        }
+    }
+}
+
+async fn query_model_status(
+    proxy: DaemonProxy<'_>,
+    gate: Arc<tokio::sync::Semaphore>,
+    model_name: String,
+) -> (String, Result<String, String>) {
+    let result = async {
+        let _permit = gate
+            .acquire_owned()
+            .await
+            .map_err(|_| "Model status queue stopped before replying".to_string())?;
+        proxy
+            .model_status(&model_name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    (model_name, result)
+}
 
 /// Completion of a command submitted to the daemon background thread.
 pub struct CommandCompletion {
@@ -704,6 +782,9 @@ async fn try_connect(
     let mut sample_rate_stream = proxy.receive_sample_rate_changed().await;
     let mut channels_stream = proxy.receive_channels_changed().await;
     let mut download_stream = proxy.receive_download_progress().await?;
+    let model_status_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let mut model_status_tasks = FuturesUnordered::new();
+    let mut pending_model_status = PendingModelStatusRequests::default();
 
     loop {
         tokio::select! {
@@ -824,8 +905,25 @@ async fn try_connect(
                     });
                 }
             }
+            Some((model_name, result)) = model_status_tasks.next(),
+                if !model_status_tasks.is_empty() =>
+            {
+                pending_model_status.finish(model_name, result, update_tx);
+            }
             command = cmd_rx.recv() => {
                 match command {
+                    Some(CommandRequest {
+                        command: DaemonCommand::ModelStatus(model_name),
+                        completion,
+                    }) => {
+                        if pending_model_status.queue(model_name.clone(), completion) {
+                            model_status_tasks.push(query_model_status(
+                                proxy.clone(),
+                                model_status_gate.clone(),
+                                model_name,
+                            ));
+                        }
+                    }
                     Some(request) => {
                         let operation = request.command.operation().to_string();
                         let rollback_property = request.command.rollback_property();
@@ -1132,6 +1230,52 @@ mod tests {
         request.completion.send(Ok(Some(expected.clone()))).unwrap();
 
         assert_eq!(completion.wait_endpoint_check().await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn duplicate_model_status_requests_share_one_result() {
+        let mut pending = PendingModelStatusRequests::default();
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+        let (update_tx, mut update_rx) = tokio::sync::mpsc::channel(2);
+
+        assert!(pending.queue("model".to_string(), first_tx));
+        assert!(!pending.queue("model".to_string(), second_tx));
+        pending.finish("model".to_string(), Ok("available".to_string()), &update_tx);
+
+        assert!(matches!(first_rx.await.unwrap(), Ok(None)));
+        assert!(matches!(second_rx.await.unwrap(), Ok(None)));
+        assert!(matches!(
+            update_rx.recv().await,
+            Some(DaemonUpdate::ModelStatusResult { model_name, status })
+                if model_name == "model" && status == "available"
+        ));
+        assert!(update_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_shared_model_status_request_replies_to_every_waiter() {
+        let mut pending = PendingModelStatusRequests::default();
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+        let (update_tx, mut update_rx) = tokio::sync::mpsc::channel(2);
+
+        assert!(pending.queue("model".to_string(), first_tx));
+        assert!(!pending.queue("model".to_string(), second_tx));
+        pending.finish(
+            "model".to_string(),
+            Err("status unavailable".to_string()),
+            &update_tx,
+        );
+
+        assert_eq!(first_rx.await.unwrap().unwrap_err(), "status unavailable");
+        assert_eq!(second_rx.await.unwrap().unwrap_err(), "status unavailable");
+        assert!(matches!(
+            update_rx.recv().await,
+            Some(DaemonUpdate::CommandFailed { operation, message })
+                if operation == "Check model status" && message == "status unavailable"
+        ));
+        assert!(update_rx.try_recv().is_err());
     }
 
     #[tokio::test]

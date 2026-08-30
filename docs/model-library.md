@@ -24,6 +24,12 @@ progress. Cancelling removes the incomplete file currently being received but
 keeps already verified files, so starting the download again does not repeat
 finished work.
 
+Settings checks downloaded artifacts in the background and combines repeated
+requests for the same model. Integrity scans run one at a time, so opening the
+library does not make large files compete for disk access or hold up other
+controls. A download, retry, or deletion that finishes during a scan takes
+precedence over the older result.
+
 “Downloadable” does not mean every model uses an OSI-approved open-source
 license. Parakeet v2/v3 use Creative Commons; Nemotron 3.5 and Parakeet Unified
 use publisher-specific open-weight licenses. The settings app always shows the

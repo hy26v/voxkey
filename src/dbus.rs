@@ -58,6 +58,7 @@ fn remove_restore_token(path: &std::path::Path) -> std::io::Result<bool> {
 pub struct SharedState {
     inner: Arc<Mutex<SharedStateInner>>,
     persistence_lock: Arc<Mutex<()>>,
+    model_status_scan_lock: Arc<tokio::sync::Mutex<()>>,
     restart_signal: Arc<tokio::sync::Notify>,
     shutdown_signal: Arc<tokio::sync::Notify>,
 }
@@ -97,6 +98,7 @@ struct SharedStateInner {
     transcription_history: Vec<voxkey_ipc::HistoryEntry>,
     last_error: String,
     model_downloads: HashMap<String, ActiveModelDownload>,
+    model_generations: HashMap<String, u64>,
     settings_lifecycle_generation: u64,
     settings_lifecycle_attached: bool,
 }
@@ -149,10 +151,12 @@ impl SharedState {
                 transcription_history,
                 last_error: String::new(),
                 model_downloads: HashMap::new(),
+                model_generations: HashMap::new(),
                 settings_lifecycle_generation: 0,
                 settings_lifecycle_attached: false,
             })),
             persistence_lock: Arc::new(Mutex::new(())),
+            model_status_scan_lock: Arc::new(tokio::sync::Mutex::new(())),
             restart_signal: Arc::new(tokio::sync::Notify::new()),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
         }
@@ -613,16 +617,31 @@ impl SharedState {
 
         let download = start(model_name.clone());
         let status = download.status.clone();
+        Self::bump_model_generation(&mut inner, &model_name);
         inner.model_downloads.insert(model_name, download);
         (status, true)
     }
 
-    pub fn model_download_status(&self, model_name: &str) -> Option<DownloadStatus> {
+    fn bump_model_generation(inner: &mut SharedStateInner, model_name: &str) {
+        let generation = inner
+            .model_generations
+            .entry(model_name.to_string())
+            .or_default();
+        *generation = generation.wrapping_add(1).max(1);
+    }
+
+    fn model_download_snapshot(&self, model_name: &str) -> (Option<DownloadStatus>, u64) {
         let inner = self.inner.lock().unwrap();
-        inner
+        let status = inner
             .model_downloads
             .get(model_name)
-            .map(|download| download.status.borrow().clone())
+            .map(|download| download.status.borrow().clone());
+        let generation = inner
+            .model_generations
+            .get(model_name)
+            .copied()
+            .unwrap_or_default();
+        (status, generation)
     }
 
     fn cancel_model_download(
@@ -653,6 +672,7 @@ impl SharedState {
             .is_some_and(|current| current.status.same_channel(finished));
         if is_current {
             inner.model_downloads.remove(model_name);
+            Self::bump_model_generation(&mut inner, model_name);
         }
     }
 
@@ -660,7 +680,7 @@ impl SharedState {
     where
         F: FnOnce(&str) -> Result<(), std::io::Error>,
     {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         if matches!(
             inner
                 .model_downloads
@@ -672,7 +692,9 @@ impl SharedState {
                 "Cannot delete model '{model_name}' while it is downloading"
             ));
         }
-        delete(model_name).map_err(|error| error.to_string())
+        delete(model_name).map_err(|error| error.to_string())?;
+        Self::bump_model_generation(&mut inner, model_name);
+        Ok(())
     }
 }
 
@@ -697,6 +719,82 @@ async fn await_model_download_cancellation(
             .await
             .map_err(|_| "Timed out while waiting for the model download to stop".to_string())?
             .map_err(|_| "The model download stopped without reporting its result".to_string())?;
+    }
+}
+
+fn immediate_model_status(status: Option<&DownloadStatus>) -> Option<&'static str> {
+    match status {
+        Some(DownloadStatus::InProgress(_)) => Some("downloading"),
+        Some(DownloadStatus::Complete) => Some("available"),
+        Some(DownloadStatus::Cancelled | DownloadStatus::Failed(_)) | None => None,
+    }
+}
+
+enum ModelStatusScan {
+    Current(&'static str),
+    Scanned { generation: u64, available: bool },
+}
+
+async fn resolve_model_status_with<F>(
+    shared: SharedState,
+    model_name: String,
+    check_available: F,
+) -> Result<String, String>
+where
+    F: Fn() -> bool + Send + Sync + 'static,
+{
+    let check_available = Arc::new(check_available);
+    loop {
+        let (status, _) = shared.model_download_snapshot(&model_name);
+        if let Some(status) = immediate_model_status(status.as_ref()) {
+            return Ok(status.to_string());
+        }
+
+        // Wait for the disk lane asynchronously so queued checks do not occupy
+        // Tokio's limited blocking-worker threads. The owned guard then moves
+        // into the blocking task, keeping scans serialized even if the D-Bus
+        // caller disconnects and drops this future while hashing is underway.
+        let scan_guard = shared.model_status_scan_lock.clone().lock_owned().await;
+        let scan_shared = shared.clone();
+        let scan_model_name = model_name.clone();
+        let check_available = check_available.clone();
+        let scan = tokio::task::spawn_blocking(move || {
+            let _scan_guard = scan_guard;
+            let (status, generation) = scan_shared.model_download_snapshot(&scan_model_name);
+            if let Some(status) = immediate_model_status(status.as_ref()) {
+                return ModelStatusScan::Current(status);
+            }
+            ModelStatusScan::Scanned {
+                generation,
+                available: check_available(),
+            }
+        })
+        .await
+        .map_err(|error| format!("Model integrity check stopped unexpectedly: {error}"))?;
+
+        let (generation, available) = match scan {
+            ModelStatusScan::Current(status) => return Ok(status.to_string()),
+            ModelStatusScan::Scanned {
+                generation,
+                available,
+            } => (generation, available),
+        };
+
+        let (latest_status, latest_generation) = shared.model_download_snapshot(&model_name);
+        if let Some(status) = immediate_model_status(latest_status.as_ref()) {
+            return Ok(status.to_string());
+        }
+        if latest_generation == generation {
+            return Ok(if available {
+                "available".to_string()
+            } else {
+                "not_downloaded".to_string()
+            });
+        }
+
+        // A download completed, a retry started, or a deletion finished while
+        // the scan was running. Repeat against the new filesystem generation
+        // instead of publishing the stale result over the newer operation.
     }
 }
 
@@ -1626,25 +1724,14 @@ impl DaemonInterface {
         Ok(())
     }
 
-    fn model_status(&self, model_name: &str) -> zbus::fdo::Result<String> {
-        if let Some(status) = self.shared.model_download_status(model_name) {
-            return Ok(match status {
-                DownloadStatus::InProgress(_) => "downloading".to_string(),
-                DownloadStatus::Complete => "available".to_string(),
-                DownloadStatus::Cancelled | DownloadStatus::Failed(_) => {
-                    if crate::models::is_model_available(model_name) {
-                        "available".to_string()
-                    } else {
-                        "not_downloaded".to_string()
-                    }
-                }
-            });
-        }
-        if crate::models::is_model_available(model_name) {
-            Ok("available".to_string())
-        } else {
-            Ok("not_downloaded".to_string())
-        }
+    async fn model_status(&self, model_name: &str) -> zbus::fdo::Result<String> {
+        let model_name = model_name.to_string();
+        let checked_model = model_name.clone();
+        resolve_model_status_with(self.shared.clone(), model_name, move || {
+            crate::models::is_model_available(&checked_model)
+        })
+        .await
+        .map_err(zbus::fdo::Error::Failed)
     }
 
     #[zbus(signal)]
@@ -1948,6 +2035,150 @@ mod tests {
             .expect_err("completion won the cancellation race");
 
         assert!(error.contains("finished downloading"), "{error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_model_status_scan_keeps_async_work_responsive_and_yields_to_a_download() {
+        let state = SharedState::new(Config::default());
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let scan_gate = gate.clone();
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let scan_state = state.clone();
+        let scan = tokio::spawn(resolve_model_status_with(
+            scan_state,
+            "model".to_string(),
+            move || {
+                let _ = entered_tx.send(());
+                let (open, wake) = &*scan_gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    let (next, timeout) = wake.wait_timeout(open, Duration::from_secs(1)).unwrap();
+                    open = next;
+                    if timeout.timed_out() {
+                        break;
+                    }
+                }
+                false
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_millis(200), entered_rx.recv())
+            .await
+            .expect("filesystem scan blocked the single-threaded async runtime")
+            .expect("filesystem scan stopped before it began");
+        let (_progress, watcher) = watch::channel(DownloadStatus::InProgress(12));
+        state.start_model_download_with("model".to_string(), |_| {
+            ActiveModelDownload::unmanaged(watcher)
+        });
+
+        let (open, wake) = &*gate;
+        *open.lock().unwrap() = true;
+        wake.notify_all();
+
+        assert_eq!(scan.await.unwrap(), Ok("downloading".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_finished_download_during_a_scan_forces_a_fresh_filesystem_result() {
+        let state = SharedState::new(Config::default());
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let scan_gate = gate.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scan_calls = calls.clone();
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let scan = tokio::spawn(resolve_model_status_with(
+            state.clone(),
+            "model".to_string(),
+            move || {
+                let call = scan_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    let _ = entered_tx.send(());
+                    let (open, wake) = &*scan_gate;
+                    let mut open = open.lock().unwrap();
+                    while !*open {
+                        let (next, timeout) =
+                            wake.wait_timeout(open, Duration::from_secs(1)).unwrap();
+                        open = next;
+                        if timeout.timed_out() {
+                            break;
+                        }
+                    }
+                    false
+                } else {
+                    true
+                }
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("model integrity scan did not start")
+            .expect("model integrity scan stopped before it began");
+
+        let (progress, watcher) = watch::channel(DownloadStatus::InProgress(99));
+        let (status, _) = state.start_model_download_with("model".to_string(), |_| {
+            ActiveModelDownload::unmanaged(watcher)
+        });
+        progress.send(DownloadStatus::Complete).unwrap();
+        state.finish_model_download("model", &status);
+        let (open, wake) = &*gate;
+        *open.lock().unwrap() = true;
+        wake.notify_all();
+
+        assert_eq!(scan.await.unwrap(), Ok("available".to_string()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_status_caller_does_not_release_its_running_disk_scan() {
+        let state = SharedState::new(Config::default());
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let first_gate = gate.clone();
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let first = tokio::spawn(resolve_model_status_with(
+            state.clone(),
+            "first".to_string(),
+            move || {
+                let _ = entered_tx.send(());
+                let (open, wake) = &*first_gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    let (next, timeout) = wake.wait_timeout(open, Duration::from_secs(1)).unwrap();
+                    open = next;
+                    if timeout.timed_out() {
+                        break;
+                    }
+                }
+                false
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("first model integrity scan did not start")
+            .expect("first model integrity scan stopped before it began");
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let second_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_flag = second_entered.clone();
+        let second = tokio::spawn(resolve_model_status_with(
+            state,
+            "second".to_string(),
+            move || {
+                second_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                false
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second_entered.load(std::sync::atomic::Ordering::SeqCst),
+            "two large model files were scanned at the same time"
+        );
+
+        let (open, wake) = &*gate;
+        *open.lock().unwrap() = true;
+        wake.notify_all();
+        assert_eq!(second.await.unwrap(), Ok("not_downloaded".to_string()));
+        assert!(second_entered.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// A download that already finished must not block a later attempt, so a
