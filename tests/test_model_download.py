@@ -1,6 +1,7 @@
 # ABOUTME: Exercises the model download D-Bus surface against the running daemon.
-# ABOUTME: Uses an unknown model name so no test ever reaches the model host.
+# ABOUTME: Uses rejected inputs and pre-network filesystem failures so the suite stays offline.
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -96,6 +97,52 @@ async def test_a_failed_download_leaves_nothing_on_disk(
         f"a failed download left {model_dir} behind"
     )
     assert await daemon.call_model_status(UNKNOWN_MODEL) == "not_downloaded"
+
+
+@pytest.mark.asyncio
+async def test_repeated_immediate_failures_emit_terminal_download_results(
+    daemon_process, dbus_session,
+):
+    """Every failed attempt must release UIs from their downloading state."""
+    assert daemon_process.reached_idle, "Daemon did not reach Idle"
+    daemon = await _daemon_interface(dbus_session)
+    data_home = Path(os.environ["XDG_DATA_HOME"])
+    model_path = data_home / "voxkey" / "models" / KNOWN_MODEL
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    assert not model_path.exists()
+    # A regular file where the catalogue directory belongs fails before any
+    # request reaches the network, keeping this integration test deterministic.
+    model_path.write_text("blocks the model directory")
+
+    finished = asyncio.Queue()
+    daemon.on_model_download_finished(
+        lambda model_name, outcome, message: finished.put_nowait(
+            (model_name, outcome, message),
+        ),
+    )
+
+    try:
+        first_error = None
+        for attempt in range(2):
+            await daemon.call_download_model(KNOWN_MODEL)
+            model_name, outcome, message = await asyncio.wait_for(
+                finished.get(), timeout=2,
+            )
+            assert model_name == KNOWN_MODEL
+            assert outcome == "failed"
+            assert "real directory" in message
+            current_error = await daemon.get_last_error()
+            assert current_error == f"Download failed: {message}"
+            if attempt == 0:
+                first_error = current_error
+            else:
+                assert current_error == first_error
+
+        assert daemon_process.poll() is None
+        assert await daemon.call_model_status(KNOWN_MODEL) == "not_downloaded"
+    finally:
+        model_path.unlink(missing_ok=True)
+        await daemon.call_clear_last_error()
 
 
 @pytest.mark.asyncio

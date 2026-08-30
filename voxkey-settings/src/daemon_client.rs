@@ -103,6 +103,11 @@ pub enum DaemonUpdate {
         model_name: String,
         percent: u8,
     },
+    ModelDownloadFinished {
+        model_name: String,
+        outcome: String,
+        message: String,
+    },
     ModelStatusResult {
         model_name: String,
         status: String,
@@ -971,6 +976,7 @@ async fn try_connect(
     let mut sample_rate_stream = proxy.receive_sample_rate_changed().await;
     let mut channels_stream = proxy.receive_channels_changed().await;
     let mut download_stream = proxy.receive_download_progress().await?;
+    let mut download_finished_stream = proxy.receive_model_download_finished().await?;
     let model_status_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let model_status_proxy = Arc::new(tokio::sync::OnceCell::new());
     let mut model_status_tasks = FuturesUnordered::new();
@@ -1097,6 +1103,20 @@ async fn try_connect(
                         model_name,
                         percent: args.percent,
                     });
+                }
+            }
+            Some(signal) = download_finished_stream.next() => {
+                if let Ok(args) = signal.args() {
+                    let model_name = args.model_name.to_string();
+                    pending_model_status.invalidate(&model_name);
+                    // Progress updates are intentionally lossy when GTK falls
+                    // behind; a terminal result is not. Waiting for capacity
+                    // guarantees a row cannot remain stuck on Downloading.
+                    let _ = update_tx.send(DaemonUpdate::ModelDownloadFinished {
+                        model_name,
+                        outcome: args.outcome.to_string(),
+                        message: args.message.to_string(),
+                    }).await;
                 }
             }
             Some((request_id, model_name, result)) = model_status_tasks.next(),

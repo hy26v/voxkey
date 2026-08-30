@@ -28,6 +28,19 @@ impl DownloadStatus {
             Self::Cancelled | Self::Failed(_) => None,
         }
     }
+
+    /// Return the stable D-Bus outcome and its optional failure details once
+    /// this transfer can no longer make progress.
+    pub(crate) fn terminal_outcome(&self) -> Option<(voxkey_ipc::ModelDownloadOutcome, &str)> {
+        match self {
+            Self::InProgress(_) => None,
+            Self::Complete => Some((voxkey_ipc::ModelDownloadOutcome::Complete, "")),
+            Self::Cancelled => Some((voxkey_ipc::ModelDownloadOutcome::Cancelled, "")),
+            Self::Failed(message) => {
+                Some((voxkey_ipc::ModelDownloadOutcome::Failed, message.as_str()))
+            }
+        }
+    }
 }
 
 /// A running model transfer and the status channel observed by D-Bus clients.
@@ -673,6 +686,23 @@ mod tests {
         assert_eq!(
             DownloadStatus::Failed("network error".to_string()).reported_percent(),
             None
+        );
+    }
+
+    #[test]
+    fn every_terminal_download_status_has_an_explicit_outcome() {
+        assert_eq!(DownloadStatus::InProgress(42).terminal_outcome(), None);
+        assert_eq!(
+            DownloadStatus::Complete.terminal_outcome(),
+            Some((voxkey_ipc::ModelDownloadOutcome::Complete, ""))
+        );
+        assert_eq!(
+            DownloadStatus::Cancelled.terminal_outcome(),
+            Some((voxkey_ipc::ModelDownloadOutcome::Cancelled, ""))
+        );
+        assert_eq!(
+            DownloadStatus::Failed("disk full".to_string()).terminal_outcome(),
+            Some((voxkey_ipc::ModelDownloadOutcome::Failed, "disk full"))
         );
     }
 

@@ -12,6 +12,15 @@ use crate::daemon_client::{DaemonCommand, DaemonHandle};
 
 const RETRY_MODEL_STATUS_LABEL: &str = "Retry check";
 
+pub(crate) fn download_failure_description(message: &str) -> &str {
+    let message = message.trim();
+    if message.is_empty() {
+        "The download stopped before the model was ready. Try again."
+    } else {
+        message
+    }
+}
+
 #[derive(Clone)]
 struct ModelRow {
     selected: gtk4::Image,
@@ -22,12 +31,16 @@ struct ModelRow {
 }
 
 impl ModelRow {
-    fn set_status(&self, status: &str) {
+    fn reset_status_style(&self) {
         self.progress.set_visible(false);
         self.action.remove_css_class("destructive-action");
         self.action.remove_css_class("suggested-action");
         self.status_icon.remove_css_class("success");
         self.status_icon.remove_css_class("warning");
+    }
+
+    fn set_status(&self, status: &str) {
+        self.reset_status_style();
         match status {
             "available" => {
                 self.status.set_title("Ready on this computer");
@@ -98,6 +111,19 @@ impl ModelRow {
                 self.action.set_sensitive(true);
             }
         }
+    }
+
+    fn set_download_failed(&self, message: &str) {
+        self.reset_status_style();
+        self.status.set_title("Download failed");
+        self.status
+            .set_subtitle(download_failure_description(message));
+        self.status_icon
+            .set_icon_name(Some("dialog-warning-symbolic"));
+        self.status_icon.add_css_class("warning");
+        self.action.set_label("Try again");
+        self.action.add_css_class("suggested-action");
+        self.action.set_sensitive(true);
     }
 
     fn set_progress(&self, percent: u8) {
@@ -195,6 +221,7 @@ impl ModelLibrary {
                 .title("Checking installation…")
                 .subtitle("Verifying the downloaded model files")
                 .subtitle_lines(2)
+                .use_markup(false)
                 .build();
             let status_icon = gtk4::Image::from_icon_name("content-loading-symbolic");
             status.add_prefix(&status_icon);
@@ -313,9 +340,33 @@ impl ModelLibrary {
         }
     }
 
+    pub fn set_download_result(&self, model_id: &str, status: &str, message: &str) {
+        if let Some(row) = self.rows.get(model_id) {
+            if status == "download_failed" {
+                row.set_download_failed(message);
+            } else {
+                row.set_status(status);
+            }
+        }
+    }
+
     pub fn set_selected(&self, model_id: Option<&str>) {
         for (id, row) in &self.rows {
             row.selected.set_visible(model_id == Some(*id));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_failure_details_are_actionable_and_trimmed() {
+        assert_eq!(
+            download_failure_description("  destination is read-only  "),
+            "destination is read-only"
+        );
+        assert!(download_failure_description(" ").contains("Try again"));
     }
 }

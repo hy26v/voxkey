@@ -1711,27 +1711,48 @@ impl DaemonInterface {
                     )
                     .await;
                 }
+
+                let Some((outcome, message)) = status
+                    .terminal_outcome()
+                    .map(|(outcome, message)| (outcome, message.to_string()))
+                else {
+                    continue;
+                };
                 match &status {
-                    DownloadStatus::InProgress(_) => {}
                     DownloadStatus::Complete => {
                         tracing::info!("Model download complete: {model_name}");
                         crate::notifications::info(
                             "Voxkey",
                             &format!("Model {model_name} is ready"),
                         );
-                        break;
                     }
                     DownloadStatus::Cancelled => {
                         tracing::info!("Model download cancelled: {model_name}");
-                        break;
                     }
                     DownloadStatus::Failed(msg) => {
                         tracing::error!("Model download failed: {msg}");
                         shared.set_last_error(format!("Download failed: {msg}"));
                         DaemonInterface::notify_last_error(&connection).await;
-                        break;
                     }
+                    DownloadStatus::InProgress(_) => unreachable!("terminal status was checked"),
                 }
+                if let Ok(iface_ref) = connection
+                    .object_server()
+                    .interface::<_, DaemonInterface>(voxkey_ipc::OBJECT_PATH)
+                    .await
+                    && let Err(error) = DaemonInterface::model_download_finished(
+                        iface_ref.signal_emitter(),
+                        &model_name,
+                        outcome.as_wire_value(),
+                        &message,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to publish the terminal model download result for {model_name}: {error}"
+                    );
+                }
+                break;
             }
             shared.finish_model_download(&model_name, &rx);
         });
@@ -1801,6 +1822,14 @@ impl DaemonInterface {
         ctxt: &zbus::object_server::SignalEmitter<'_>,
         model_name: &str,
         percent: u8,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn model_download_finished(
+        ctxt: &zbus::object_server::SignalEmitter<'_>,
+        model_name: &str,
+        outcome: &str,
+        message: &str,
     ) -> zbus::Result<()>;
 }
 

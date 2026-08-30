@@ -2094,9 +2094,6 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                         );
                         if show_toast {
                             toast_overlay_update.add_toast(last_error_toast());
-                            if value.starts_with("Download failed:") {
-                                model_library_update.request_statuses(&handle_update);
-                            }
                         }
                     }
                     "portal_connected" => {
@@ -2275,6 +2272,37 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                                 expert_mode_update.get(),
                             );
                         }
+                    }
+                }
+                DaemonUpdate::ModelDownloadFinished {
+                    model_name,
+                    outcome,
+                    message,
+                } => {
+                    if let Some(status) = model_download_outcome_status(&outcome) {
+                        model_library_update.set_download_result(&model_name, status, &message);
+                        if model_name == transcriber_state_update.borrow().parakeet.model {
+                            apply_model_status(
+                                status,
+                                &model_name,
+                                &model_status_row_update,
+                                &model_download_progress_update,
+                                &download_button_update,
+                                &delete_model_button_update,
+                                &open_folder_button_update,
+                                expert_mode_update.get(),
+                            );
+                            if status == "download_failed" {
+                                model_status_row_update.set_subtitle(
+                                    crate::model_library::download_failure_description(&message),
+                                );
+                            }
+                        }
+                    } else {
+                        // A future daemon may add another outcome. Fall back to
+                        // authoritative filesystem checks instead of leaving
+                        // an older Settings build in a busy state.
+                        model_library_update.request_statuses(&handle_update);
                     }
                 }
                 DaemonUpdate::ModelStatusResult { model_name, status } => {
@@ -2896,6 +2924,12 @@ fn model_status_presentation(status: &str, model_name: &str) -> ModelStatusPrese
             action: ModelStatusAction::RetryCheck,
             show_delete: false,
         },
+        "download_failed" => ModelStatusPresentation {
+            subtitle: "Download failed · Review the error, then try again".to_string(),
+            show_download_progress: false,
+            action: ModelStatusAction::Download,
+            show_delete: false,
+        },
         _ => ModelStatusPresentation {
             subtitle: parakeet_model_download_description(model_name)
                 .unwrap_or_else(|| "Custom model files not found".to_string()),
@@ -2907,6 +2941,14 @@ fn model_status_presentation(status: &str, model_name: &str) -> ModelStatusPrese
             },
             show_delete: false,
         },
+    }
+}
+
+fn model_download_outcome_status(outcome: &str) -> Option<&'static str> {
+    match voxkey_ipc::ModelDownloadOutcome::from_wire_value(outcome)? {
+        voxkey_ipc::ModelDownloadOutcome::Complete => Some("available"),
+        voxkey_ipc::ModelDownloadOutcome::Cancelled => Some("not_downloaded"),
+        voxkey_ipc::ModelDownloadOutcome::Failed => Some("download_failed"),
     }
 }
 
@@ -6297,11 +6339,31 @@ mod tests {
         assert!(!check_failed.show_download_progress);
         assert!(!check_failed.show_delete);
 
+        let download_failed = model_status_presentation("download_failed", "parakeet-tdt-0.6b-v3");
+        assert!(download_failed.subtitle.contains("try again"));
+        assert_eq!(download_failed.action, ModelStatusAction::Download);
+        assert!(!download_failed.show_download_progress);
+        assert!(!download_failed.show_delete);
+
         let available = model_status_presentation("available", "parakeet-tdt-0.6b-v3");
         assert!(!available.show_download_progress);
         assert_eq!(available.action, ModelStatusAction::None);
         assert!(available.show_delete);
         assert!(available.subtitle.contains("this computer"));
+    }
+
+    #[test]
+    fn terminal_download_outcomes_restore_an_actionable_model_state() {
+        assert_eq!(model_download_outcome_status("complete"), Some("available"));
+        assert_eq!(
+            model_download_outcome_status("cancelled"),
+            Some("not_downloaded")
+        );
+        assert_eq!(
+            model_download_outcome_status("failed"),
+            Some("download_failed")
+        );
+        assert_eq!(model_download_outcome_status("future-value"), None);
     }
 
     #[test]

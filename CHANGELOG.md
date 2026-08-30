@@ -25,6 +25,9 @@ from the user's perspective.
   and repeated copies of the same failure alert only once. A warning beside
   **General** keeps unresolved details discoverable, while dismissing an older
   message can no longer erase a newer error.
+- Model downloads now leave their busy state reliably when they finish, are
+  cancelled, or fail. Both model views show the failed attempt and an immediate
+  retry action, even when the same download error happens more than once.
 - Custom Mistral Batch, Mistral Realtime, and Parakeet server endpoints are now
   checked before they are saved. Settings shows connection progress and keeps
   the address ready to correct or retry when the server cannot be reached.

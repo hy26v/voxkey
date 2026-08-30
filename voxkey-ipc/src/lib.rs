@@ -17,6 +17,37 @@ pub const SETTINGS_BUS_NAME: &str = "io.github.hy26v.Voxkey";
 /// Object path the daemon interface is served at.
 pub const OBJECT_PATH: &str = "/io/github/hy26v/Voxkey/Daemon";
 
+/// Terminal result reported for a model download.
+///
+/// D-Bus carries these values as strings so older clients can ignore the new
+/// signal without needing to understand a new wire type. Keeping the parser in
+/// the shared crate prevents the daemon and Settings from drifting apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelDownloadOutcome {
+    Complete,
+    Cancelled,
+    Failed,
+}
+
+impl ModelDownloadOutcome {
+    pub const fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_wire_value(value: &str) -> Option<Self> {
+        match value {
+            "complete" => Some(Self::Complete),
+            "cancelled" => Some(Self::Cancelled),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
 /// Service name used with the API-key keyring methods for the Mistral batch API.
 pub const API_KEY_SERVICE_MISTRAL: &str = "mistral";
 
@@ -772,6 +803,12 @@ pub trait Daemon {
     /// Emitted during model download with progress percentage.
     #[zbus(signal)]
     fn download_progress(model_name: &str, percent: u8) -> zbus::Result<()>;
+
+    /// Emitted exactly once when a model download completes, is cancelled, or
+    /// fails. `outcome` is one of `complete`, `cancelled`, or `failed`;
+    /// `message` is populated for failures.
+    #[zbus(signal)]
+    fn model_download_finished(model_name: &str, outcome: &str, message: &str) -> zbus::Result<()>;
 }
 
 #[cfg(test)]
@@ -786,6 +823,21 @@ mod tests {
         assert!(config.whisper_cpp.args.is_empty());
         assert_eq!(config.mistral.model, "voxtral-mini-2602");
         assert!(config.mistral.api_key.is_empty());
+    }
+
+    #[test]
+    fn model_download_outcomes_round_trip_over_the_wire() {
+        for outcome in [
+            ModelDownloadOutcome::Complete,
+            ModelDownloadOutcome::Cancelled,
+            ModelDownloadOutcome::Failed,
+        ] {
+            assert_eq!(
+                ModelDownloadOutcome::from_wire_value(outcome.as_wire_value()),
+                Some(outcome)
+            );
+        }
+        assert_eq!(ModelDownloadOutcome::from_wire_value("downloading"), None);
     }
 
     #[test]
