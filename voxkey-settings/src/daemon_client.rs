@@ -428,7 +428,8 @@ pub enum DaemonCommand {
     ClearHistory,
     RetryHistoryEntry(u64),
     OpenRecordingFolder(String),
-    ClearLastError,
+    /// Dismiss only the error whose details the UI displayed.
+    DismissLastError(String),
     /// Store an API key in the system keyring for the named service.
     SetApiKey {
         service: String,
@@ -470,7 +471,7 @@ impl DaemonCommand {
             Self::ClearHistory => "Clear history",
             Self::RetryHistoryEntry(_) => "Retry transcription",
             Self::OpenRecordingFolder(_) => "Open recording folder",
-            Self::ClearLastError => "Dismiss error",
+            Self::DismissLastError(_) => "Dismiss error",
             Self::SetApiKey { .. } => "Save API key",
             Self::ClearApiKey { .. } => "Clear API key",
             Self::HasApiKey { .. } => "Check API key",
@@ -542,7 +543,7 @@ impl std::fmt::Debug for DaemonCommand {
             Self::ClearHistory => write!(f, "ClearHistory"),
             Self::RetryHistoryEntry(id) => f.debug_tuple("RetryHistoryEntry").field(id).finish(),
             Self::OpenRecordingFolder(_) => write!(f, "OpenRecordingFolder(<path>)"),
-            Self::ClearLastError => write!(f, "ClearLastError"),
+            Self::DismissLastError(_) => f.write_str("DismissLastError(<redacted>)"),
             Self::SetApiKey { service, .. } => f
                 .debug_struct("SetApiKey")
                 .field("service", service)
@@ -1406,8 +1407,8 @@ async fn handle_command(
                 .arg(folder)
                 .spawn()?;
         }
-        DaemonCommand::ClearLastError => {
-            proxy.clear_last_error().await?;
+        DaemonCommand::DismissLastError(expected) => {
+            proxy.dismiss_last_error(&expected).await?;
         }
         DaemonCommand::SetApiKey { .. }
         | DaemonCommand::ClearApiKey { .. }
@@ -1972,6 +1973,15 @@ mod tests {
 
         assert_eq!(debug, "CheckEndpoint(<redacted>)");
         assert!(!debug.contains(secret_query));
+    }
+
+    #[test]
+    fn conditional_error_dismissal_debug_output_is_redacted() {
+        let details = "Transcription failed at /private/recordings/sensitive.wav";
+        let debug = format!("{:?}", DaemonCommand::DismissLastError(details.to_string()));
+
+        assert_eq!(debug, "DismissLastError(<redacted>)");
+        assert!(!debug.contains(details));
     }
 
     #[test]

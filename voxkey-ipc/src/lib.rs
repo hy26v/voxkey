@@ -678,8 +678,14 @@ pub trait Daemon {
     /// Insert the most recently completed transcript again.
     fn insert_last_transcript(&self) -> zbus::Result<()>;
 
-    /// Dismiss the daemon's most recent recoverable error.
+    /// Unconditionally dismiss the daemon's most recent recoverable error.
+    /// Retained for older control surfaces; new UIs should use
+    /// `dismiss_last_error` to avoid clearing an unseen replacement.
     fn clear_last_error(&self) -> zbus::Result<()>;
+
+    /// Dismiss the displayed error only if it is still the daemon's current
+    /// error. This prevents a stale UI action from clearing a newer failure.
+    fn dismiss_last_error(&self, expected: &str) -> zbus::Result<()>;
 
     /// Update the shortcut trigger. Takes effect on next session recovery.
     fn set_shortcut(&self, trigger: &str) -> zbus::Result<()>;

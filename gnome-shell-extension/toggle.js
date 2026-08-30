@@ -25,7 +25,7 @@ import {
     INTERFACE,
     MENU_TEXT_MAX_CHARS,
     METHOD_CANCEL,
-    METHOD_CLEAR_ERROR,
+    METHOD_DISMISS_ERROR,
     METHOD_INSERT_LAST,
     METHOD_START,
     METHOD_STOP,
@@ -152,8 +152,16 @@ class VoxkeyToggle extends QuickMenuToggle {
         this.menu.addMenuItem(this._copyErrorItem);
 
         this._dismissErrorItem = new PopupMenu.PopupMenuItem('Dismiss error');
-        this._dismissErrorItem.connect('activate', () => this._callControl(
-            METHOD_CLEAR_ERROR, 'Could not dismiss the error'));
+        this._dismissErrorItem.connect('activate', () => {
+            const expected = this._lastError;
+            if (!expected)
+                return;
+            this._callControl(
+                METHOD_DISMISS_ERROR,
+                'Could not dismiss the error',
+                false,
+                new GLib.Variant('(s)', [expected]));
+        });
         this.menu.addMenuItem(this._dismissErrorItem);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -388,7 +396,7 @@ class VoxkeyToggle extends QuickMenuToggle {
         }
     }
 
-    async _callControl(method, failureTitle, dismissQuickSettings = false) {
+    async _callControl(method, failureTitle, dismissQuickSettings = false, parameters = null) {
         const proxy = this._proxy;
         const cancellable = this._cancellable;
         if (!proxy || cancellable.is_cancelled() || this._controlPending)
@@ -423,7 +431,7 @@ class VoxkeyToggle extends QuickMenuToggle {
             await new Promise((resolve, reject) => {
                 proxy.call(
                     method,
-                    null,
+                    parameters,
                     Gio.DBusCallFlags.NONE,
                     CONTROL_CALL_TIMEOUT_MS,
                     cancellable,

@@ -110,6 +110,19 @@ def test_shell_menu_leaves_configuration_reload_in_expert_settings():
     assert 'title("Reload configuration")' in settings
 
 
+def test_shell_dismisses_only_the_error_its_menu_displayed():
+    constants = (ROOT / "gnome-shell-extension" / "constants.js").read_text()
+    toggle = (ROOT / "gnome-shell-extension" / "toggle.js").read_text()
+    menu_builder = toggle.split("    _buildMenu() {", 1)[1].split(
+        "    async _connectDaemon() {", 1
+    )[0]
+
+    assert "METHOD_DISMISS_ERROR = 'DismissLastError'" in constants
+    assert "const expected = this._lastError" in menu_builder
+    assert "new GLib.Variant('(s)', [expected])" in menu_builder
+    assert "METHOD_CLEAR_ERROR" not in menu_builder
+
+
 def test_shell_control_calls_have_a_finite_timeout():
     constants = (ROOT / "gnome-shell-extension" / "constants.js").read_text()
     toggle = (ROOT / "gnome-shell-extension" / "toggle.js").read_text()

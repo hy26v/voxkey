@@ -20,7 +20,7 @@ export const METHOD_START = 'StartDictation';
 export const METHOD_STOP = 'StopDictation';
 export const METHOD_CANCEL = 'CancelDictation';
 export const METHOD_INSERT_LAST = 'InsertLastTranscript';
-export const METHOD_CLEAR_ERROR = 'ClearLastError';
+export const METHOD_DISMISS_ERROR = 'DismissLastError';
 
 export const ICON_IDLE = 'audio-input-microphone-symbolic';
 export const ICON_RECORDING = 'media-record-symbolic';

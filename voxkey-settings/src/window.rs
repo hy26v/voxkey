@@ -40,6 +40,32 @@ enum PreviewPreset {
     Custom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastErrorSource {
+    Snapshot,
+    LiveUpdate,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LastErrorState {
+    message: String,
+}
+
+impl LastErrorState {
+    fn has_error(&self) -> bool {
+        !self.message.trim().is_empty()
+    }
+
+    /// Replace the persistent error and report whether this is a genuinely new
+    /// live failure. Snapshot state stays discoverable without replaying an alert.
+    fn replace(&mut self, message: &str, source: LastErrorSource) -> bool {
+        let changed = self.message != message;
+        self.message.clear();
+        self.message.push_str(message);
+        source == LastErrorSource::LiveUpdate && changed && self.has_error()
+    }
+}
+
 const LOCAL_MODEL_CHOICE_START: u32 = 3;
 const STANDARD_TRANSCRIBER_CHOICES: u32 =
     LOCAL_MODEL_CHOICE_START + voxkey_ipc::model_library::LOCAL_MODELS.len() as u32;
@@ -1257,6 +1283,15 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     secondary_list.add_css_class("navigation-sidebar");
     let permissions_nav = navigation_row("Permissions", "preferences-system-privacy-symbolic");
     let settings_nav = navigation_row("General", "preferences-system-symbolic");
+    let settings_error_indicator = gtk4::Image::from_icon_name("dialog-error-symbolic");
+    settings_error_indicator.add_css_class("error");
+    settings_error_indicator.set_accessible_role(gtk4::AccessibleRole::Presentation);
+    settings_error_indicator.set_visible(false);
+    settings_nav
+        .child()
+        .and_downcast::<gtk4::Box>()
+        .expect("navigation rows use a box child")
+        .append(&settings_error_indicator);
     secondary_list.append(&permissions_nav);
     secondary_list.append(&settings_nav);
 
@@ -1268,7 +1303,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         });
     }
 
-    let last_error_state = Rc::new(RefCell::new(String::new()));
+    let last_error_state = Rc::new(RefCell::new(LastErrorState::default()));
     let daemon_available = Rc::new(Cell::new(false));
     {
         let last_error_state = last_error_state.clone();
@@ -1276,7 +1311,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         let handle = handle.clone();
         let toast_overlay = toast_overlay.clone();
         error_row.connect_activated(move |row| {
-            let error = last_error_state.borrow().clone();
+            let error = last_error_state.borrow().message.clone();
             if error.is_empty() {
                 return;
             }
@@ -1744,6 +1779,8 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     let updating_audio_widgets_update = updating_audio_widgets.clone();
     let recording_format_row_update = recording_format_row.clone();
     let permissions_nav_update = permissions_nav.clone();
+    let settings_nav_update = settings_nav.clone();
+    let settings_error_indicator_update = settings_error_indicator.clone();
     let permission_status_update = permission_status.clone();
     let retry_permission_button_update = retry_permission_button.clone();
     let permission_daemon_state = Rc::new(RefCell::new("Unavailable".to_string()));
@@ -1883,10 +1920,14 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                         &transcriber_state_update,
                         &updating_preview_widgets_update,
                     );
-                    if !last_error.is_empty() {
-                        toast_overlay_update.add_toast(last_error_toast());
-                    }
-                    apply_last_error(&last_error, &error_row_update, &last_error_state_update);
+                    apply_last_error(
+                        &last_error,
+                        LastErrorSource::Snapshot,
+                        &error_row_update,
+                        &settings_nav_update,
+                        &settings_error_indicator_update,
+                        &last_error_state_update,
+                    );
                     let (parsed_transcriber_config, parsed_injection_config) =
                         parse_initial_config_sections(&transcriber_config, &injection_config);
                     model_library_update.set_selected(parsed_transcriber_config.as_ref().and_then(
@@ -1947,7 +1988,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                         &state_icon,
                         &state_spinner,
                         "Unavailable",
-                        !last_error_state_update.borrow().trim().is_empty(),
+                        last_error_state_update.borrow().has_error(),
                     );
                     shortcut_row_update.set_subtitle(&shortcut_subtitle("", false));
                     apply_portal_state(
@@ -1988,7 +2029,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                         &state_icon,
                         &state_spinner,
                         "StartingService",
-                        !last_error_state_update.borrow().trim().is_empty(),
+                        last_error_state_update.borrow().has_error(),
                     );
                     apply_portal_state(
                         false,
@@ -2019,7 +2060,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                         &state_icon,
                         &state_spinner,
                         &state,
-                        !last_error_state_update.borrow().trim().is_empty(),
+                        last_error_state_update.borrow().has_error(),
                     );
                     apply_portal_state(
                         permission_portal_connected_update.get(),
@@ -2036,7 +2077,14 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                     "last_transcript" => {}
                     "transcription_history" => history_apply_update(&value),
                     "last_error" => {
-                        apply_last_error(&value, &error_row_update, &last_error_state_update);
+                        let show_toast = apply_last_error(
+                            &value,
+                            LastErrorSource::LiveUpdate,
+                            &error_row_update,
+                            &settings_nav_update,
+                            &settings_error_indicator_update,
+                            &last_error_state_update,
+                        );
                         update_state_row(
                             &state_row,
                             &state_icon,
@@ -2044,7 +2092,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                             permission_daemon_state_update.borrow().as_str(),
                             !value.trim().is_empty(),
                         );
-                        if !value.is_empty() {
+                        if show_toast {
                             toast_overlay_update.add_toast(last_error_toast());
                             if value.starts_with("Download failed:") {
                                 model_library_update.request_statuses(&handle_update);
@@ -2314,10 +2362,29 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     window
 }
 
-fn apply_last_error(message: &str, row: &adw::ActionRow, state: &Rc<RefCell<String>>) {
-    *state.borrow_mut() = message.to_string();
+fn apply_last_error(
+    message: &str,
+    source: LastErrorSource,
+    row: &adw::ActionRow,
+    settings_nav: &gtk4::ListBoxRow,
+    settings_error_indicator: &gtk4::Image,
+    state: &Rc<RefCell<LastErrorState>>,
+) -> bool {
+    let (show_toast, has_error) = {
+        let mut state = state.borrow_mut();
+        let show_toast = state.replace(message, source);
+        (show_toast, state.has_error())
+    };
     row.set_subtitle(message);
-    row.set_visible(!message.trim().is_empty());
+    row.set_visible(has_error);
+    settings_error_indicator.set_visible(has_error);
+    settings_nav.set_tooltip_text(has_error.then_some("Open General to review the current error"));
+    settings_nav.update_property(&[gtk4::accessible::Property::Description(if has_error {
+        "General settings; Voxkey needs attention"
+    } else {
+        "General settings"
+    })]);
+    show_toast
 }
 
 /// Strip D-Bus / implementation prefixes so toasts stay actionable for users.
@@ -2390,6 +2457,7 @@ fn build_error_details_dialog(
     dialog.set_close_response("close");
 
     let message = message.to_string();
+    let error_to_dismiss = message.clone();
     let toast_overlay_for_copy = toast_overlay.clone();
     dialog.connect_response(Some("copy"), move |_, _| {
         if let Some(display) = gtk4::gdk::Display::default() {
@@ -2401,7 +2469,7 @@ fn build_error_details_dialog(
     let handle = handle.clone();
     let toast_overlay = toast_overlay.clone();
     dialog.connect_response(Some("dismiss"), move |_, _| {
-        let completion = handle.send(DaemonCommand::ClearLastError);
+        let completion = handle.send(DaemonCommand::DismissLastError(error_to_dismiss.clone()));
         toast_after_success(completion, &toast_overlay, "Error dismissed");
     });
 
@@ -6753,6 +6821,62 @@ mod tests {
             sanitize_command_failure("   "),
             "Try again, or check General for details."
         );
+    }
+
+    #[test]
+    fn existing_errors_stay_visible_without_replaying_live_alerts() {
+        let mut state = LastErrorState::default();
+
+        assert!(!state.replace("old failure", LastErrorSource::Snapshot));
+        assert!(state.has_error());
+        assert_eq!(state.message, "old failure");
+
+        assert!(!state.replace("old failure", LastErrorSource::LiveUpdate));
+        assert!(state.replace("new failure", LastErrorSource::LiveUpdate));
+        assert!(!state.replace("new failure", LastErrorSource::LiveUpdate));
+
+        assert!(!state.replace("  ", LastErrorSource::LiveUpdate));
+        assert!(!state.has_error());
+        assert!(state.replace("new failure", LastErrorSource::LiveUpdate));
+    }
+
+    #[test]
+    fn existing_error_marks_general_navigation_until_dismissed() {
+        if !initialize_adwaita() {
+            return;
+        }
+        let error_row = adw::ActionRow::new();
+        let settings_nav = navigation_row("General", "preferences-system-symbolic");
+        let indicator = gtk4::Image::new();
+        indicator.set_visible(false);
+        let state = Rc::new(RefCell::new(LastErrorState::default()));
+
+        assert!(!apply_last_error(
+            "old failure",
+            LastErrorSource::Snapshot,
+            &error_row,
+            &settings_nav,
+            &indicator,
+            &state,
+        ));
+        assert!(error_row.is_visible());
+        assert!(indicator.is_visible());
+        assert_eq!(
+            settings_nav.tooltip_text().as_deref(),
+            Some("Open General to review the current error")
+        );
+
+        assert!(!apply_last_error(
+            "",
+            LastErrorSource::LiveUpdate,
+            &error_row,
+            &settings_nav,
+            &indicator,
+            &state,
+        ));
+        assert!(!error_row.is_visible());
+        assert!(!indicator.is_visible());
+        assert!(settings_nav.tooltip_text().is_none());
     }
 
     #[test]

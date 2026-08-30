@@ -21,6 +21,10 @@ from the user's perspective.
   for the desktop keyring. Other changes and service controls continue working,
   while credential saves and removals stay ordered and obsolete status checks
   no longer delay the current operation.
+- Existing errors no longer reappear as fresh alerts whenever Settings opens,
+  and repeated copies of the same failure alert only once. A warning beside
+  **General** keeps unresolved details discoverable, while dismissing an older
+  message can no longer erase a newer error.
 - Custom Mistral Batch, Mistral Realtime, and Parakeet server endpoints are now
   checked before they are saved. Settings shows connection progress and keeps
   the address ready to correct or retry when the server cannot be reached.

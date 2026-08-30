@@ -165,8 +165,16 @@ input_device = "{missing_device}"
         await daemon.call_start_dictation()
 
     assert await daemon.get_state() == "Idle"
-    assert missing_device in await daemon.get_last_error()
+    current_error = await daemon.get_last_error()
+    assert missing_device in current_error
     assert await daemon.get_audio_level() == 0.0
+
+    with pytest.raises(DBusError, match="newer error"):
+        await daemon.call_dismiss_last_error("an older error from the UI")
+    assert await daemon.get_last_error() == current_error
+
+    await daemon.call_dismiss_last_error(current_error)
+    assert await daemon.get_last_error() == ""
 
 
 def _pactl(*args):

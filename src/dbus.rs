@@ -83,6 +83,13 @@ pub struct LastInsertion {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastErrorDismissal {
+    Cleared,
+    AlreadyClear,
+    Replaced,
+}
+
 struct SharedStateInner {
     state: State,
     configuration_change_in_progress: bool,
@@ -360,6 +367,29 @@ impl SharedState {
         if should_notify {
             crate::notifications::last_error(&text);
         }
+    }
+
+    fn clear_last_error(&self) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.last_error.is_empty() {
+            return false;
+        }
+        inner.last_error.clear();
+        true
+    }
+
+    /// Clear only the error whose details the caller actually reviewed. This
+    /// keeps a delayed dialog or Shell menu action from erasing a newer failure.
+    fn dismiss_last_error(&self, expected: &str) -> LastErrorDismissal {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.last_error.is_empty() {
+            return LastErrorDismissal::AlreadyClear;
+        }
+        if inner.last_error != expected {
+            return LastErrorDismissal::Replaced;
+        }
+        inner.last_error.clear();
+        LastErrorDismissal::Cleared
     }
 
     pub fn config(&self) -> Config {
@@ -1215,8 +1245,28 @@ impl DaemonInterface {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> zbus::fdo::Result<()> {
-        self.shared.set_last_error(String::new());
-        Self::notify_last_error(connection).await;
+        if self.shared.clear_last_error() {
+            Self::notify_last_error(connection).await;
+        }
+        Ok(())
+    }
+
+    /// Dismiss the error the caller displayed without clearing a newer one
+    /// that may have arrived while its confirmation UI was open.
+    async fn dismiss_last_error(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        expected: &str,
+    ) -> zbus::fdo::Result<()> {
+        match self.shared.dismiss_last_error(expected) {
+            LastErrorDismissal::Cleared => Self::notify_last_error(connection).await,
+            LastErrorDismissal::AlreadyClear => {}
+            LastErrorDismissal::Replaced => {
+                return Err(zbus::fdo::Error::Failed(
+                    "A newer error is available. Review it before dismissing.".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1773,6 +1823,38 @@ mod tests {
         assert!(state.finish_settings_lifecycle_monitor(second));
     }
     use crate::config::Config;
+
+    #[test]
+    fn conditional_error_dismissal_preserves_a_newer_failure() {
+        let state = SharedState::new(Config::default());
+        state.inner.lock().unwrap().last_error = "new failure".to_string();
+
+        assert_eq!(
+            state.dismiss_last_error("older failure"),
+            LastErrorDismissal::Replaced
+        );
+        assert_eq!(state.last_error(), "new failure");
+        assert_eq!(
+            state.dismiss_last_error("new failure"),
+            LastErrorDismissal::Cleared
+        );
+        assert!(state.last_error().is_empty());
+        assert_eq!(
+            state.dismiss_last_error("new failure"),
+            LastErrorDismissal::AlreadyClear
+        );
+    }
+
+    #[test]
+    fn legacy_error_clear_is_idempotent() {
+        let state = SharedState::new(Config::default());
+        assert!(!state.clear_last_error());
+
+        state.inner.lock().unwrap().last_error = "failure".to_string();
+        assert!(state.clear_last_error());
+        assert!(!state.clear_last_error());
+        assert!(state.last_error().is_empty());
+    }
 
     #[cfg(unix)]
     #[test]
