@@ -1,5 +1,5 @@
 Name:           voxkey
-Version:        0.5.0
+Version:        0.6.2
 Release:        1%{?dist}
 Summary:        Wayland voice dictation daemon
 License:        MIT
@@ -11,8 +11,6 @@ Requires:       alsa-lib
 Requires:       libxkbcommon
 Requires:       gtk4
 Requires:       libadwaita
-
-
 %description
 Press a key, speak, and your words appear as typed text in any Wayland
 application. Uses XDG Desktop Portal interfaces for global shortcuts
@@ -33,15 +31,15 @@ rm -rf %{buildroot}
 
 install -Dm755 %{_sourcedir}/voxkey %{buildroot}%{_bindir}/voxkey
 install -Dm755 %{_sourcedir}/voxkey-settings %{buildroot}%{_bindir}/voxkey-settings
+install -Dm755 %{_sourcedir}/keyboard-recovery %{buildroot}%{_bindir}/voxkey-keyboard-recovery
 
 install -Dm755 %{_sourcedir}/libonnxruntime.so %{buildroot}%{_libdir}/voxkey/libonnxruntime.so
 install -Dm755 %{_sourcedir}/libsherpa-onnx-c-api.so %{buildroot}%{_libdir}/voxkey/libsherpa-onnx-c-api.so
+install -Dm644 %{_sourcedir}/ggml-silero-v6.2.0.bin \
+    %{buildroot}%{_datadir}/voxkey/models/ggml-silero-v6.2.0.bin
 
 install -Dm644 %{_sourcedir}/voxkey.service \
     %{buildroot}%{_userunitdir}/voxkey.service
-
-install -Dm644 %{_sourcedir}/io.github.hy26v.Voxkey.Daemon.service \
-    %{buildroot}%{_datadir}/dbus-1/services/io.github.hy26v.Voxkey.Daemon.service
 
 install -Dm644 %{_sourcedir}/io.github.hy26v.Voxkey.desktop \
     %{buildroot}%{_datadir}/applications/io.github.hy26v.Voxkey.desktop
@@ -59,9 +57,20 @@ install -Dm644 %{_sourcedir}/io.github.hy26v.Voxkey-128.png \
 install -Dm644 %{_sourcedir}/90-voxkey.preset \
     %{buildroot}%{_userpresetdir}/90-voxkey.preset
 
-%pre
-# Stop running daemon instances to prevent duplicate processes after install/upgrade
-killall voxkey 2>/dev/null || true
+install -Dm644 %{_sourcedir}/gnome-shell-extension/metadata.json \
+    %{buildroot}%{_datadir}/gnome-shell/extensions/voxkey@hy26v.github.io/metadata.json
+install -Dm644 %{_sourcedir}/gnome-shell-extension/extension.js \
+    %{buildroot}%{_datadir}/gnome-shell/extensions/voxkey@hy26v.github.io/extension.js
+install -Dm644 %{_sourcedir}/gnome-shell-extension/constants.js \
+    %{buildroot}%{_datadir}/gnome-shell/extensions/voxkey@hy26v.github.io/constants.js
+install -Dm644 %{_sourcedir}/gnome-shell-extension/util.js \
+    %{buildroot}%{_datadir}/gnome-shell/extensions/voxkey@hy26v.github.io/util.js
+install -Dm644 %{_sourcedir}/gnome-shell-extension/capsule.js \
+    %{buildroot}%{_datadir}/gnome-shell/extensions/voxkey@hy26v.github.io/capsule.js
+install -Dm644 %{_sourcedir}/gnome-shell-extension/toggle.js \
+    %{buildroot}%{_datadir}/gnome-shell/extensions/voxkey@hy26v.github.io/toggle.js
+install -Dm644 %{_sourcedir}/gnome-shell-extension/stylesheet.css \
+    %{buildroot}%{_datadir}/gnome-shell/extensions/voxkey@hy26v.github.io/stylesheet.css
 
 %post
 %systemd_user_post voxkey.service
@@ -75,11 +84,14 @@ killall voxkey 2>/dev/null || true
 %files
 %{_bindir}/voxkey
 %{_bindir}/voxkey-settings
+%{_bindir}/voxkey-keyboard-recovery
+%dir %{_libdir}/voxkey
 %{_libdir}/voxkey/libonnxruntime.so
 %{_libdir}/voxkey/libsherpa-onnx-c-api.so
+%{_datadir}/voxkey/models/ggml-silero-v6.2.0.bin
 %{_userunitdir}/voxkey.service
 %{_userpresetdir}/90-voxkey.preset
-%{_datadir}/dbus-1/services/io.github.hy26v.Voxkey.Daemon.service
+%{_datadir}/gnome-shell/extensions/voxkey@hy26v.github.io/
 %{_datadir}/applications/io.github.hy26v.Voxkey.desktop
 %{_datadir}/metainfo/io.github.hy26v.Voxkey.metainfo.xml
 %{_datadir}/icons/hicolor/512x512/apps/io.github.hy26v.Voxkey.png

@@ -154,34 +154,6 @@ async def test_start_session_grants_keyboard(dbus_session, portal_proxy):
 
 
 @pytest.mark.asyncio
-async def test_notify_keyboard_keysym(dbus_session, portal_proxy):
-    """NotifyKeyboardKeysym should send a keystroke without error."""
-    session_handle = await _create_rd_session(dbus_session, portal_proxy)
-    await _select_keyboard(dbus_session, portal_proxy, session_handle)
-    await _start_session(dbus_session, portal_proxy, session_handle)
-
-    rd = portal_proxy.get_interface(REMOTE_DESKTOP_IFACE)
-
-    # Send 'a' keysym (0x61) -- press then release
-    XKB_KEY_a = 0x61
-    try:
-        await rd.call_notify_keyboard_keysym(
-            session_handle,
-            {},
-            XKB_KEY_a,
-            1,  # pressed
-        )
-        await rd.call_notify_keyboard_keysym(
-            session_handle,
-            {},
-            XKB_KEY_a,
-            0,  # released
-        )
-    finally:
-        await _close_session(dbus_session, session_handle)
-
-
-@pytest.mark.asyncio
 async def test_session_cleanup(dbus_session, portal_proxy):
     """Closing a RemoteDesktop session should succeed without error."""
     session_handle = await _create_rd_session(dbus_session, portal_proxy)

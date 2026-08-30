@@ -1,0 +1,138 @@
+/* ABOUTME: Styling for Voxkey's interactive floating dictation control surface. */
+/* ABOUTME: Distinguishes the recording and final-transcription phases. */
+
+/* GNOME Shell chrome is dark across styles; match OSD-like surfaces rather than
+ * GTK Adwaita light/dark tokens, which are not available to extension CSS. */
+.voxkey-recording-indicator {
+    spacing: 5px;
+    padding: 10px 14px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 20px;
+    background-color: rgba(13, 13, 15, 0.97);
+    box-shadow: 0 6px 22px 5px rgba(0, 0, 0, 0.40);
+    color: rgba(255, 255, 255, 0.94);
+    font-weight: 600;
+    transition-duration: 120ms;
+}
+
+.voxkey-recording-status-row {
+    spacing: 10px;
+    height: 24px;
+}
+
+.voxkey-recording-indicator--recording {
+    border-color: rgba(246, 97, 81, 0.38);
+}
+
+.voxkey-recording-indicator--processing {
+    border-color: rgba(153, 193, 255, 0.40);
+}
+
+.voxkey-recording-badge {
+    width: 22px;
+    height: 22px;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 999px;
+    background-color: rgba(255, 255, 255, 0.10);
+    transition-duration: 120ms;
+}
+
+.voxkey-recording-indicator-icon {
+    color: rgba(255, 255, 255, 0.92);
+}
+
+.voxkey-recording-indicator--recording .voxkey-recording-badge {
+    border-color: rgba(255, 255, 255, 0.24);
+    background-color: #e5484d;
+    box-shadow: 0 0 8px 1px rgba(229, 72, 77, 0.34);
+}
+
+.voxkey-recording-indicator--processing .voxkey-recording-badge {
+    border-color: rgba(153, 193, 255, 0.40);
+    background-color: rgba(98, 160, 234, 0.32);
+}
+
+.voxkey-recording-indicator--recording .voxkey-recording-indicator-icon {
+    color: #ffffff;
+}
+
+.voxkey-recording-indicator--processing .voxkey-recording-indicator-icon {
+    color: #c2d9ff;
+}
+
+.voxkey-recording-indicator-label {
+    color: rgba(255, 255, 255, 0.96);
+    font-size: 0.94em;
+}
+
+.voxkey-recording-timer {
+    padding: 2px 7px;
+    border-radius: 999px;
+    background-color: rgba(255, 255, 255, 0.09);
+    color: rgba(255, 255, 255, 0.78);
+    font-family: monospace;
+    font-size: 0.82em;
+    font-weight: 500;
+}
+
+.voxkey-recording-context {
+    color: rgba(255, 255, 255, 0.48);
+    font-size: 0.76em;
+    font-weight: 400;
+    text-align: left;
+}
+
+.voxkey-recording-transcript {
+    color: rgba(255, 255, 255, 0.82);
+    font-size: 0.90em;
+    font-weight: 400;
+    text-align: left;
+}
+
+.voxkey-recording-activity {
+    spacing: 3px;
+    width: 39px;
+    height: 20px;
+}
+
+.voxkey-recording-activity-bar {
+    width: 3px;
+    height: 3px;
+    border-radius: 999px;
+    background-color: rgba(255, 255, 255, 0.88);
+    transition-duration: 70ms;
+}
+
+.voxkey-recording-indicator--processing .voxkey-recording-activity-bar {
+    background-color: #c2d9ff;
+}
+
+.voxkey-recording-actions {
+    spacing: 8px;
+    height: 28px;
+}
+
+.voxkey-capsule-button {
+    padding: 5px 13px;
+    border: 1px solid rgba(255, 255, 255, 0.13);
+    border-radius: 999px;
+    background-color: rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.90);
+    font-size: 0.82em;
+    font-weight: 600;
+}
+
+.voxkey-capsule-button:hover,
+.voxkey-capsule-button:focus {
+    border-color: rgba(255, 255, 255, 0.25);
+    background-color: rgba(255, 255, 255, 0.16);
+}
+
+.voxkey-capsule-button:active {
+    background-color: rgba(255, 255, 255, 0.22);
+}
+
+.voxkey-capsule-button--transcribe {
+    border-color: rgba(246, 97, 81, 0.32);
+    background-color: rgba(229, 72, 77, 0.28);
+}

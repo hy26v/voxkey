@@ -88,7 +88,7 @@ async def _bind_dictate_shortcut(bus, portal_proxy, session_handle):
     shortcuts = [
         ["dictate_hold", {
             "description": Variant("s", "Hold to dictate"),
-            "preferred-trigger": Variant("s", "<Super>space"),
+            "preferred-trigger": Variant("s", "<Super><Alt>d"),
         }],
     ]
 

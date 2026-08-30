@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# ABOUTME: Starts an isolated PipeWire stack for integration tests in CI.
+# ABOUTME: Keeps test audio and D-Bus state out of any existing desktop session.
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+audio_runtime="$(mktemp -d "${TMPDIR:-/tmp}/voxkey-ci-audio.XXXXXX")"
+chmod 700 "$audio_runtime"
+export XDG_RUNTIME_DIR="$audio_runtime"
+export VOXKEY_TEST_AUDIO_ISOLATED="$audio_runtime"
+
+process_ids=()
+cleanup() {
+    if ((${#process_ids[@]} > 0)); then
+        kill "${process_ids[@]}" 2>/dev/null || true
+        wait "${process_ids[@]}" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+pipewire >"$audio_runtime/pipewire.log" 2>&1 &
+process_ids+=("$!")
+pipewire-pulse >"$audio_runtime/pipewire-pulse.log" 2>&1 &
+process_ids+=("$!")
+wireplumber >"$audio_runtime/wireplumber.log" 2>&1 &
+process_ids+=("$!")
+
+audio_ready=false
+for _attempt in {1..100}; do
+    if pactl info >/dev/null 2>&1; then
+        audio_ready=true
+        break
+    fi
+    sleep 0.1
+done
+
+if [[ "$audio_ready" != true ]]; then
+    printf '%s\n' 'The isolated PipeWire stack did not become ready.' >&2
+    for log in "$audio_runtime"/*.log; do
+        printf '\n%s\n' "--- $log" >&2
+        tail -n 100 "$log" >&2 || true
+    done
+    exit 1
+fi
+
+cd "$repo_root"
+./scripts/verify integration "$@"

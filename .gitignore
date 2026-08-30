@@ -16,6 +16,7 @@ target/
 
 # Test artifacts
 tests/output/
+.codex-reports/
 
 # Config
 *.restore_token
@@ -29,11 +30,32 @@ whisper.cpp/
 
 # Local scripts
 scripts/
+!scripts/
+scripts/*
+!scripts/ci-integration
+!scripts/verify
+!scripts/local-install.sh
+!scripts/keyboard-recovery
+!scripts/preview_quality.py
+!scripts/degrade_fixtures.sh
+!scripts/preview_baselines/
+!scripts/preview_baselines/*.json
 
 # Private repo
 .git-private/
 CLAUDE.md
 docs/
+!docs/
+docs/*
+!docs/incidents/
+docs/incidents/*
+!docs/incidents/*.md
+!docs/audits/
+docs/audits/*
+!docs/audits/*.md
+!docs/release-readiness.md
+!docs/fedora-vm-testing.md
+!docs/model-library.md
 .claude/
 .env
 .env.*

@@ -6,10 +6,14 @@ on:
       - 'v*'
 
 jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
   build-rpm:
+    needs: verify
     runs-on: ubuntu-latest
     container:
-      image: registry.fedoraproject.org/fedora:43
+      image: registry.fedoraproject.org/fedora:44
     steps:
       - name: Install build dependencies
         run: |
@@ -17,41 +21,65 @@ jobs:
             rust cargo gcc gcc-c++ clang-libs \
             alsa-lib-devel libxkbcommon-devel \
             gtk4-devel libadwaita-devel \
-            rpm-build ImageMagick git
+            rpm-build ImageMagick git python3 curl
 
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: false
 
+      - name: Validate tag and package versions
+        id: version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | python3 -c \
+            'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "voxkey"))')"
+          if [[ "$tag_version" != "$cargo_version" ]]; then
+            echo "Tag version $tag_version does not match Cargo version $cargo_version" >&2
+            exit 1
+          fi
+          if [[ "$tag_version" == *+* ]]; then
+            echo "RPM release tags cannot contain SemVer build metadata" >&2
+            exit 1
+          fi
+          echo "version=$tag_version" >> "$GITHUB_OUTPUT"
+          echo "rpm_version=${tag_version/-/~}" >> "$GITHUB_OUTPUT"
+
       - name: Build release binaries
         run: |
           export RUSTFLAGS="-C link-arg=-Wl,-rpath,/usr/lib64/voxkey"
-          cargo build --release --workspace
-
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          cargo build --release -p voxkey -p voxkey-settings
 
       - name: Prepare RPM sources
         run: |
           mkdir -p rpmbuild/SOURCES
           cp target/release/voxkey rpmbuild/SOURCES/
           cp target/release/voxkey-settings rpmbuild/SOURCES/
+          cp scripts/keyboard-recovery rpmbuild/SOURCES/
           cp target/release/deps/libonnxruntime.so rpmbuild/SOURCES/
           cp target/release/deps/libsherpa-onnx-c-api.so rpmbuild/SOURCES/
           cp data/voxkey.service rpmbuild/SOURCES/
-          cp data/io.github.hy26v.Voxkey.Daemon.service rpmbuild/SOURCES/
           cp data/io.github.hy26v.Voxkey.desktop rpmbuild/SOURCES/
           cp data/io.github.hy26v.Voxkey.metainfo.xml rpmbuild/SOURCES/
           cp logo.png rpmbuild/SOURCES/io.github.hy26v.Voxkey-512.png
           convert logo.png -resize 256x256 rpmbuild/SOURCES/io.github.hy26v.Voxkey-256.png
           convert logo.png -resize 128x128 rpmbuild/SOURCES/io.github.hy26v.Voxkey-128.png
           cp data/90-voxkey.preset rpmbuild/SOURCES/
+          curl --fail --location --retry 3 \
+            --output rpmbuild/SOURCES/ggml-silero-v6.2.0.bin \
+            https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin
+          echo "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987  rpmbuild/SOURCES/ggml-silero-v6.2.0.bin" \
+            | sha256sum --check --strict
+          mkdir -p rpmbuild/SOURCES/gnome-shell-extension
+          cp gnome-shell-extension/metadata.json gnome-shell-extension/extension.js \
+            gnome-shell-extension/constants.js gnome-shell-extension/util.js \
+            gnome-shell-extension/capsule.js gnome-shell-extension/toggle.js \
+            gnome-shell-extension/stylesheet.css \
+            rpmbuild/SOURCES/gnome-shell-extension/
 
       - name: Update spec version
         run: |
-          sed -i "s/^Version:.*/Version:        ${{ steps.version.outputs.version }}/" voxkey.spec
+          sed -i "s/^Version:.*/Version:        ${{ steps.version.outputs.rpm_version }}/" voxkey.spec
 
       - name: Build RPM
         run: |

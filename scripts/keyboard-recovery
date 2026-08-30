@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# ABOUTME: Recovers a GNOME Wayland session from a suspected Voxkey input lockup.
+# ABOUTME: Masks every activation path, verifies no virtual device remains, reports state.
+
+# Run this from a remote shell (SSH) or TTY if the keyboard is unusable. It is
+# safe to run at any time: every step is idempotent and nothing here restarts
+# IBus or changes your input sources — the two actions that made the
+# 2026-07-18 incident worse. See docs/incidents/2026-07-18-keyboard-lockup.md.
+
+set -uo pipefail
+
+echo "== Voxkey keyboard recovery =="
+if [[ -t 0 ]]; then
+    echo "Running interactively. If this session's keyboard is broken, use"
+    echo "SSH or a TTY instead so you can read the output."
+fi
+
+step() { printf '\n-- %s\n' "$1"; }
+
+step "1. Stop and mask the service (masking blocks D-Bus reactivation)"
+systemctl --user disable --now voxkey.service 2>/dev/null || true
+systemctl --user mask voxkey.service
+
+step "2. Terminate any remaining daemon process"
+pkill -TERM -x voxkey 2>/dev/null || true
+sleep 1
+if pgrep -x voxkey >/dev/null; then
+    echo "  daemon still running after SIGTERM, sending SIGKILL"
+    pkill -KILL -x voxkey || true
+    sleep 1
+fi
+pgrep -a -x voxkey >/dev/null \
+    && echo "  WARNING: voxkey process survived; reboot is the reliable exit" \
+    || echo "  no voxkey process remains"
+
+step "3. Restart portal services holding virtual-device state"
+systemctl --user restart xdg-desktop-portal-gnome.service 2>/dev/null \
+    || systemctl --user restart xdg-desktop-portal-gtk.service 2>/dev/null \
+    || echo "  WARNING: no desktop portal backend unit found to restart"
+systemctl --user restart xdg-desktop-portal.service 2>/dev/null || true
+
+step "4. Verify no Voxkey user-session state can activate anything"
+active=$(systemctl --user is-active voxkey.service)
+enabled=$(systemctl --user is-enabled voxkey.service 2>/dev/null)
+echo "  service active=$active enabled=$enabled (expected inactive masked)"
+
+step "5. Report Mutter RemoteDesktop objects still registered"
+remote_desktop_tree=$(busctl --user tree org.gnome.Mutter.RemoteDesktop 2>/dev/null \
+    | grep -E "/org/gnome/Mutter/RemoteDesktop" || true)
+if [[ -n "$remote_desktop_tree" ]]; then
+    printf '%s\n' "$remote_desktop_tree" | sed 's/^/  /'
+else
+    echo "  no RemoteDesktop sessions/devices visible (or busctl unavailable);"
+    echo "  rely on the physical-keyboard check below — libei virtual keyboards"
+    echo "  are not always enumerable from outside the compositor"
+fi
+
+step "6. Check keyboard LED state for stuck-lock evidence"
+seen_leds=""
+for leds in /sys/class/leds/*::capslock; do
+    [[ -e "$leds" ]] || continue
+    name=$(basename "$leds")
+    case "$seen_leds" in *"|$name|"*) continue ;; esac
+    seen_leds="$seen_leds|$name|"
+    printf '  %s=%s\n' "$name" "$(cat "$leds/brightness" 2>/dev/null)"
+done
+[[ -z "$seen_leds" ]] && echo "  no capslock LEDs found"
+echo "  NOTE: no tested in-session method exists to force-release a stuck"
+echo "  modifier on GNOME Wayland. If Shift or another modifier is stuck,"
+echo "  save your work over SSH and plan a logout or reboot. Do NOT restart"
+echo "  IBus: that made the original incident worse."
+
+step "7. Physical keyboard check"
+cat <<'EOF'
+Back at the graphical session, verify in order:
+  1. Ordinary letters type normally.
+  2. Shift works on both sides.
+  3. Ctrl, Alt, Super respond (e.g. Super opens the overview).
+  4. Copy/paste works across two different applications.
+If any of these fail, the residual state lives in the compositor, not in
+Voxkey — Voxkey is now masked and cannot recreate it. A logout (or reboot)
+is the known recovery; report the failure with the output of this script.
+EOF
+
+step "Done"
+echo "To let Voxkey run again afterwards:"
+echo "  systemctl --user unmask voxkey.service"
+echo "  systemctl --user enable --now voxkey.service"

@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# ABOUTME: Runs Voxkey's reproducible automated quality gate.
+# ABOUTME: Supports Rust-only, isolated integration, or complete verification.
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+mode="${1:-all}"
+if (($# > 0)); then
+    shift
+fi
+
+rust_checks() {
+    printf '%s\n' 'Checking Rust formatting'
+    cargo fmt --all -- --check
+
+    printf '%s\n' 'Running Clippy with warnings denied'
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+
+    printf '%s\n' 'Running Rust tests'
+    cargo test --workspace --all-targets --locked
+}
+
+integration_checks() {
+    if [[ -z "${XDG_RUNTIME_DIR:-}" || \
+          "${VOXKEY_TEST_AUDIO_ISOLATED:-}" != "$XDG_RUNTIME_DIR" ]]; then
+        printf '%s\n' \
+            'Refusing to run integration tests on the live audio session.' \
+            'Use ./scripts/ci-integration to create an isolated PipeWire runtime.' >&2
+        return 2
+    fi
+
+    printf '%s\n' 'Building the daemon for integration tests'
+    cargo build --locked -p voxkey
+    cargo build --locked -p voxkey --example mock_eis_server
+
+    local configured_target="${CARGO_TARGET_DIR:-target}"
+    local target_dir
+    if [[ "$configured_target" = /* ]]; then
+        target_dir="$configured_target"
+    else
+        target_dir="$repo_root/$configured_target"
+    fi
+
+    export VOXKEY_BIN="$target_dir/debug/voxkey"
+    export VOXKEY_TEST_EIS_SERVER="$target_dir/debug/examples/mock_eis_server"
+    export LD_LIBRARY_PATH="$target_dir/debug/deps:$target_dir/debug${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+    printf '%s\n' 'Running isolated D-Bus and audio integration tests'
+    if (($# > 0)); then
+        python3 -m pytest "$@"
+    else
+        python3 -m pytest tests
+    fi
+}
+
+cd "$repo_root"
+case "$mode" in
+    rust)
+        rust_checks
+        ;;
+    integration)
+        integration_checks "$@"
+        ;;
+    all)
+        rust_checks
+        "$repo_root/scripts/ci-integration"
+        ;;
+    *)
+        printf 'Usage: %s [rust|integration|all]\n' "$0" >&2
+        exit 2
+        ;;
+esac

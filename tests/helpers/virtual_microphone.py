@@ -5,6 +5,32 @@ import os
 import signal
 import subprocess
 import time
+from pathlib import Path
+
+
+def _require_isolated_audio_runtime():
+    """Refuse to mutate the caller's live PipeWire/PulseAudio session.
+
+    The integration launcher creates a private XDG runtime directory and puts
+    its exact path in VOXKEY_TEST_AUDIO_ISOLATED. Requiring both values to
+    match makes a direct `pytest` invocation fail before pactl can change the
+    default source or load a test sink.
+    """
+    runtime_value = os.environ.get("XDG_RUNTIME_DIR", "")
+    isolated_value = os.environ.get("VOXKEY_TEST_AUDIO_ISOLATED", "")
+    if not runtime_value or not isolated_value:
+        raise RuntimeError(
+            "Audio integration tests require scripts/ci-integration; refusing "
+            "to modify the live default microphone"
+        )
+
+    runtime = Path(runtime_value).resolve()
+    isolated = Path(isolated_value).resolve()
+    if runtime != isolated or not runtime.name.startswith("voxkey-ci-audio."):
+        raise RuntimeError(
+            "Audio integration runtime is not the isolated Voxkey PipeWire "
+            "session; refusing to modify the default microphone"
+        )
 
 
 class VirtualMicrophone:
@@ -21,6 +47,9 @@ class VirtualMicrophone:
         self._module_id = None
         self._original_default_source = None
         self._playback_proc = None
+        # Initialize cleanup ownership before the safety check. Python may run
+        # __del__ on an object whose constructor raised at that boundary.
+        _require_isolated_audio_runtime()
         self._cleanup_stale_modules()
         self._create_null_sink()
         self._set_as_default_source()

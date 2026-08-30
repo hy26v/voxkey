@@ -5,9 +5,8 @@ After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
-ExecStart=/usr/bin/voxkey
-Restart=on-failure
-RestartSec=2
+ExecStart=/usr/bin/voxkey --settings-managed
+Restart=no
 
 [Install]
 WantedBy=graphical-session.target

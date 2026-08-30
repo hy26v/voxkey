@@ -1,5 +1,5 @@
-# ABOUTME: Tests that the voxkey daemon recovers from portal errors, permission changes, and service restarts.
-# ABOUTME: Validates that no error path causes the daemon to crash or hang.
+# ABOUTME: Tests fail-closed portal handling, stale permissions, and graceful shutdown.
+# ABOUTME: Validates that startup and shutdown error paths do not hang.
 
 import os
 import signal
@@ -16,6 +16,7 @@ from helpers.dbus_portal import (
     PORTAL_OBJECT_PATH,
     has_interface,
 )
+from helpers.mock_portal import SESSION_IFACE
 
 
 # ---------------------------------------------------------------------------
@@ -39,36 +40,26 @@ def _daemon_binary():
 class TestPortalResponseCodes:
     """Tests that the daemon handles all portal response codes correctly."""
 
-    def test_response_1_user_cancelled_returns_to_idle(
+    def test_normal_mock_session_remains_alive(
         self, daemon_process
     ):
-        """When portal returns response=1 (user cancelled), daemon goes idle.
-
-        The daemon should not crash, hang, or retry without user action.
-        """
+        """The healthy private portal session remains alive while idle."""
         assert _daemon_is_alive(daemon_process), "Daemon should be alive"
 
-        # Give daemon time to hit the permission dialog and potentially get
-        # a response=1 if the portal is configured to auto-deny for tests.
         time.sleep(3)
         assert _daemon_is_alive(daemon_process), (
-            "Daemon crashed after potential response=1 from portal"
+            "Daemon exited during a healthy mock portal session"
         )
 
-    def test_response_2_session_aborted_triggers_recovery(
+    def test_normal_mock_session_does_not_restart_automatically(
         self, daemon_process
     ):
-        """When portal returns response=2 (session ended), daemon recovers.
-
-        The daemon should detect the session abort, tear down stale state,
-        and attempt to rebuild its sessions automatically.
-        """
+        """A healthy session remains stable without an automatic rebuild."""
         assert _daemon_is_alive(daemon_process), "Daemon should be alive"
 
-        # Daemon should survive a session-level abort without crashing
         time.sleep(3)
         assert _daemon_is_alive(daemon_process), (
-            "Daemon crashed after potential response=2 from portal"
+            "Daemon restarted or exited during a healthy mock portal session"
         )
 
 
@@ -76,8 +67,8 @@ class TestPortalResponseCodes:
 # Tests: D-Bus disconnect and reconnect
 # ---------------------------------------------------------------------------
 
-class TestDBusDisconnectRecovery:
-    """Tests that the daemon detects and recovers from D-Bus disconnections."""
+class TestDBusFailureHandling:
+    """Tests bounded handling around D-Bus failures."""
 
     @pytest.mark.asyncio
     async def test_daemon_survives_portal_proxy_introspection_failure(
@@ -182,7 +173,7 @@ class TestStaleRestoreToken:
 class TestNoCrashOrHang:
     """Tests that various error conditions do not crash or hang the daemon."""
 
-    def test_daemon_exits_cleanly_on_sigterm(self, daemon_process):
+    def test_daemon_exits_cleanly_on_sigterm(self, daemon_process, portal_control):
         """SIGTERM should cause a clean shutdown, not a hang."""
         assert _daemon_is_alive(daemon_process)
 
@@ -198,6 +189,14 @@ class TestNoCrashOrHang:
         assert exit_code in (0, -signal.SIGTERM, 143), (
             f"Daemon exited with unexpected code {exit_code}"
         )
+        closed = portal_control.closed_session_types()
+        assert "remote_desktop" not in closed, (
+            "Idle shutdown found a RemoteDesktop grant that should not exist"
+        )
+        assert "shortcuts" in closed, (
+            "SIGTERM must explicitly close the GlobalShortcuts session"
+        )
+        assert "remote_desktop" not in portal_control.active_session_types()
 
     def test_daemon_exits_cleanly_on_sigint(self, daemon_process):
         """SIGINT should cause a clean shutdown, not a hang."""
@@ -214,6 +213,29 @@ class TestNoCrashOrHang:
         assert exit_code in (0, -signal.SIGINT, 130), (
             f"Daemon exited with unexpected code {exit_code}"
         )
+
+    def test_unresponsive_portal_close_cannot_strand_shutdown(
+        self,
+        daemon_process,
+        portal_control,
+    ):
+        """A nonresponsive persistent session cannot strand shutdown."""
+        assert _daemon_is_alive(daemon_process)
+        portal_control.suppress_next_method_reply(SESSION_IFACE, "Close")
+
+        daemon_process.send_signal(signal.SIGTERM)
+        try:
+            daemon_process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            daemon_process.kill()
+            daemon_process.wait()
+            pytest.fail("a nonresponsive portal stranded daemon shutdown")
+
+        diagnostics = daemon_process.stderr.read().decode("utf-8", errors="replace")
+        assert (
+            "globalshortcuts session close timed out" in diagnostics.lower()
+            or "teardown exceeded its total deadline" in diagnostics.lower()
+        ), diagnostics
 
     def test_daemon_does_not_hang_during_startup(self, mock_portal):
         """The daemon must not hang indefinitely during initialization."""
@@ -250,6 +272,58 @@ class TestNoCrashOrHang:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
+
+    @pytest.mark.parametrize(
+        ("fault", "maximum_seconds"),
+        [
+            ("method_reply", 15),
+            ("portal_response", 35),
+        ],
+    )
+    def test_unresponsive_portal_startup_has_a_total_deadline(
+        self,
+        mock_portal,
+        virtual_mic,
+        fault,
+        maximum_seconds,
+    ):
+        """Neither a missing method reply nor a missing Response can hang startup."""
+        bus_address, controller, _ = mock_portal
+        controller.clear_metrics()
+        if fault == "method_reply":
+            controller.suppress_next_method_reply(
+                GLOBAL_SHORTCUTS_IFACE, "CreateSession",
+            )
+        else:
+            controller.suppress_next_portal_response(
+                GLOBAL_SHORTCUTS_IFACE, "CreateSession",
+            )
+
+        env = os.environ.copy()
+        env["DBUS_SESSION_BUS_ADDRESS"] = bus_address
+        proc = subprocess.Popen(
+            [_daemon_binary()],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        started = time.monotonic()
+        try:
+            try:
+                proc.wait(timeout=maximum_seconds)
+            except subprocess.TimeoutExpired:
+                pytest.fail(
+                    f"daemon exceeded its {maximum_seconds}s startup budget "
+                    f"after a missing portal {fault.replace('_', ' ')}"
+                )
+            elapsed = time.monotonic() - started
+            diagnostics = proc.stderr.read().decode("utf-8", errors="replace")
+            assert "timed out" in diagnostics.lower(), diagnostics
+            assert elapsed < maximum_seconds
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
 
     def test_multiple_daemon_instances_do_not_deadlock(self, mock_portal):
         """Starting two daemons should not cause either to deadlock."""

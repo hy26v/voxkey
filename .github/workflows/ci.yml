@@ -1,0 +1,56 @@
+name: Quality Gate
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Format, lint, and Rust tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Install build and quality dependencies
+        run: |
+          dnf install -y \
+            rust cargo clippy rustfmt gcc gcc-c++ clang-libs git \
+            alsa-lib-devel libxkbcommon-devel \
+            gtk4-devel libadwaita-devel
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Rust quality gate
+        run: ./scripts/verify rust
+
+  integration:
+    name: Isolated integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Install build, test, and audio dependencies
+        run: |
+          dnf install -y \
+            rust cargo gcc gcc-c++ clang-libs git \
+            alsa-lib-devel libxkbcommon-devel \
+            python3 python3-dbus-next python3-pytest python3-pytest-asyncio \
+            python3-websockets \
+            dbus-daemon pipewire pipewire-pulseaudio wireplumber \
+            pulseaudio-utils pipewire-utils ffmpeg-free
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run tests with isolated D-Bus and PipeWire
+        run: dbus-run-session -- ./scripts/ci-integration

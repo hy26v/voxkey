@@ -1,12 +1,14 @@
 # ABOUTME: Tests that voxkey persists the RemoteDesktop restore token correctly.
 # ABOUTME: Validates file permissions, token rotation, and corrupt/missing token handling.
 
+import json
 import os
 import select
-import stat
-import time
 import signal
+import stat
 import subprocess
+import time
+from pathlib import Path
 
 import pytest
 
@@ -79,6 +81,9 @@ def _start_daemon(bus_address, timeout=15):
 
     while time.monotonic() < deadline:
         if proc.poll() is not None:
+            remaining = proc.stderr.read()
+            if remaining:
+                lines.extend(remaining.decode("utf-8", errors="replace").splitlines())
             break
         ready = select.select([proc.stderr], [], [], 0.5)[0]
         if ready:
@@ -122,6 +127,55 @@ def _collect_stderr(proc, timeout=0.5):
     return lines
 
 
+def _daemon_state(bus_address):
+    result = subprocess.run(
+        [
+            "gdbus", "call", "--address", bus_address,
+            "--dest", "io.github.hy26v.Voxkey.Daemon",
+            "--object-path", "/io/github/hy26v/Voxkey/Daemon",
+            "--method", "org.freedesktop.DBus.Properties.Get",
+            "io.github.hy26v.Voxkey.Daemon1", "State",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    return result.stdout if result.returncode == 0 else ""
+
+
+def _insert_last_transcript(bus_address, portal_control, previous_token=None):
+    """Insert seeded history and wait until its short-lived grant is gone."""
+    result = subprocess.run(
+        [
+            "gdbus", "call", "--address", bus_address,
+            "--dest", "io.github.hy26v.Voxkey.Daemon",
+            "--object-path", "/io/github/hy26v/Voxkey/Daemon",
+            "--method", "io.github.hy26v.Voxkey.Daemon1.InsertLastTranscript",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        token = _read_token()
+        if (
+            token
+            and token != previous_token
+            and "Idle" in _daemon_state(bus_address)
+            and "remote_desktop" not in portal_control.active_session_types()
+        ):
+            return token
+        time.sleep(0.05)
+    pytest.fail(
+        "Text insertion did not rotate its token and release RemoteDesktop; "
+        f"state={_daemon_state(bus_address)!r}, "
+        f"active={portal_control.active_session_types()!r}, token={_read_token()!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -146,40 +200,61 @@ def _clean_token_file():
         os.unlink(path)
 
 
+@pytest.fixture(autouse=True)
+def _seed_insertion_history(isolated_voxkey_home):
+    """Give every manually started daemon deterministic text to insert."""
+    state_dir = Path(os.environ["XDG_STATE_HOME"]) / "voxkey"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "history.json").write_text(json.dumps([
+        {
+            "id": 1,
+            "recorded_at_unix_ms": 1,
+            "text": "restore token lifecycle",
+            "provider": "Whisper.cpp",
+            "outcome": "completed",
+        }
+    ]))
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
-class TestTokenSavedAfterStart:
-    """Restore token is saved to config dir after RemoteDesktop.Start."""
+class TestTokenSavedOnDemand:
+    """Restore tokens are absent at idle and saved for actual insertion."""
 
-    def test_token_file_created_after_daemon_start(self, daemon_process):
-        """After the daemon starts and completes RemoteDesktop.Start,
-        a restore token file should exist in the config directory.
-        """
+    def test_token_file_created_by_first_insertion(
+        self, daemon_process, portal_control,
+    ):
         assert daemon_process.reached_idle, (
             "Daemon did not reach Idle — mock portal setup incomplete"
         )
 
         path = _token_file_path()
-        assert os.path.exists(path), "Token file was not created"
+        assert not os.path.exists(path), (
+            "Idle startup acquired RemoteDesktop instead of waiting for insertion"
+        )
+        token = _insert_last_transcript(
+            daemon_process.bus_address, portal_control,
+        )
 
-        token = _read_token()
         assert token, "Token file exists but is empty"
-        assert len(token) > 0, "Token should be a non-empty string"
+        assert os.path.exists(path), "Insertion did not persist its restore token"
 
 
 class TestTokenFilePermissions:
     """Token file must have restrictive permissions (0600)."""
 
-    def test_token_file_mode_is_0600(self, daemon_process):
+    def test_token_file_mode_is_0600(
+        self, daemon_process, portal_control,
+    ):
         """The restore token file should only be readable/writable by the owner."""
         assert daemon_process.reached_idle, (
             "Daemon did not reach Idle — mock portal setup incomplete"
         )
 
         path = _token_file_path()
-        assert os.path.exists(path), "Token file was not created"
+        _insert_last_transcript(daemon_process.bus_address, portal_control)
 
         file_stat = os.stat(path)
         mode = stat.S_IMODE(file_stat.st_mode)
@@ -188,84 +263,125 @@ class TestTokenFilePermissions:
         )
 
 
-class TestTokenLoadedOnStartup:
-    """Daemon loads restore token on startup and passes it to SelectDevices."""
+class TestConfigFilePermissions:
+    """config.toml must be private: it holds the dictionary, and a plaintext
+    API key whenever the system keyring was unavailable."""
 
-    def test_daemon_uses_existing_token(self, mock_portal):
+    @pytest.mark.asyncio
+    async def test_config_written_by_the_daemon_is_mode_0600(
+        self, daemon_process, dbus_session,
+    ):
+        """A setting changed over D-Bus must be persisted owner-only."""
+        assert daemon_process.reached_idle, (
+            "Daemon did not reach Idle — mock portal setup incomplete"
+        )
+
+        from helpers.dbus_portal import safe_introspect
+
+        bus_name = "io.github.hy26v.Voxkey.Daemon"
+        object_path = "/io/github/hy26v/Voxkey/Daemon"
+        introspection = await safe_introspect(dbus_session, bus_name, object_path)
+        daemon = dbus_session.get_proxy_object(
+            bus_name, object_path, introspection,
+        ).get_interface("io.github.hy26v.Voxkey.Daemon1")
+
+        # Start from a deliberately world-readable file so the assertion
+        # proves the daemon tightens permissions rather than inheriting them.
+        path = os.path.join(_voxkey_config_dir(), "config.toml")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write("")
+        os.chmod(path, 0o644)
+
+        await daemon.call_set_shortcut("<Super><Alt>k")
+
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o600, (
+            f"config.toml permissions are {oct(mode)}, expected 0o600"
+        )
+
+        leftovers = [
+            name
+            for name in os.listdir(_voxkey_config_dir())
+            if ".tmp" in name
+        ]
+        assert not leftovers, f"save left scratch files behind: {leftovers}"
+
+
+class TestTokenLoadedOnDemand:
+    """An existing restore token is not consumed until text insertion."""
+
+    def test_daemon_uses_existing_token_for_insertion(self, mock_portal):
         """When a valid token file exists, the daemon should use it
         during SelectDevices to avoid re-prompting the user.
         """
-        bus_address, _, _ = mock_portal
+        bus_address, portal_control, _ = mock_portal
 
-        # Write a token before starting the daemon
-        _write_token("test-restore-token-abc123")
+        existing_token = "test-restore-token-abc123"
+        _write_token(existing_token)
+        portal_control.clear_metrics()
 
         proc = _start_daemon(bus_address)
         try:
-            if not proc.reached_idle:
-                pytest.skip("Daemon did not reach Idle — mock portal setup incomplete")
-
-            # Check startup lines and any additional stderr
-            all_lines = list(proc.startup_lines) + _collect_stderr(proc)
-            # The daemon should log that it loaded a restore token
-            token_lines = [l for l in all_lines if "restore_token" in l.lower() or "restore token" in l.lower()]
-            assert any("loaded" in l.lower() or "using" in l.lower() for l in token_lines), (
-                f"Daemon did not log loading restore token. Logs: {all_lines}"
+            assert proc.reached_idle, proc.startup_lines
+            assert portal_control.selected_restore_tokens() == [], (
+                "Idle startup consumed a RemoteDesktop restore token"
             )
+            rotated = _insert_last_transcript(
+                bus_address, portal_control, existing_token,
+            )
+            assert portal_control.selected_restore_tokens() == [existing_token]
+            assert rotated != existing_token
         finally:
             _stop_daemon(proc)
 
 
 class TestTokenRotation:
-    """After each Start, the new token replaces the old one."""
+    """Each insertion's portal Start rotates the saved token."""
 
-    def test_token_changes_after_restart(self, mock_portal):
-        """Restarting the daemon should produce a new restore token."""
-        bus_address, _, _ = mock_portal
-
-        # First run: let daemon get a token
-        proc1 = _start_daemon(bus_address)
+    def test_token_changes_after_each_insertion(self, mock_portal):
+        bus_address, portal_control, _ = mock_portal
+        portal_control.clear_metrics()
+        proc = _start_daemon(bus_address)
         try:
-            if not proc1.reached_idle:
-                pytest.skip("Daemon did not reach Idle — mock portal setup incomplete")
-            token1 = _read_token()
-            if not token1:
-                pytest.skip("Portal did not return a restore token")
-        finally:
-            _stop_daemon(proc1)
-
-        # Second run: should get a different token
-        proc2 = _start_daemon(bus_address)
-        try:
-            if not proc2.reached_idle:
-                pytest.skip("Daemon did not reach Idle on second run")
-            token2 = _read_token()
-            if not token2:
-                pytest.skip("Portal did not return a restore token on second run")
+            assert proc.reached_idle, proc.startup_lines
+            token1 = _insert_last_transcript(bus_address, portal_control)
+            token2 = _insert_last_transcript(bus_address, portal_control, token1)
             assert token2 != token1, (
-                f"Token was not rotated after restart: {token1!r} == {token2!r}"
+                f"Token was not rotated after insertion: {token1!r} == {token2!r}"
             )
+            assert portal_control.selected_restore_tokens() == [None, token1]
         finally:
-            _stop_daemon(proc2)
+            _stop_daemon(proc)
 
 
 class TestCorruptTokenFallback:
     """Corrupt/invalid token file: daemon falls back to normal permission prompt."""
 
     def test_corrupt_token_does_not_crash(self, mock_portal):
-        """If the token file contains garbage, the daemon should start
-        normally and fall back to requesting permissions fresh.
-        """
-        bus_address, _, _ = mock_portal
+        """An unusable token is ignored when insertion actually needs access."""
+        bus_address, portal_control, _ = mock_portal
         corrupt_content = "THIS_IS_NOT_A_VALID_TOKEN_\x00\xff\xfe_GARBAGE"
         _write_token(corrupt_content)
+        portal_control.clear_metrics()
 
         proc = _start_daemon(bus_address)
         try:
-            # Daemon should still be running
-            assert proc.poll() is None, (
-                f"Daemon crashed with corrupt token (exit code: {proc.returncode})"
+            assert proc.reached_idle, (
+                f"Daemon did not recover from corrupt token: {proc.startup_lines}"
             )
+            assert proc.poll() is None, (
+                f"Daemon crashed with corrupt token (exit code: {proc.returncode}); "
+                f"logs: {proc.startup_lines}"
+            )
+            assert _read_token() == corrupt_content, (
+                "Idle startup touched a token before RemoteDesktop was needed"
+            )
+            token = _insert_last_transcript(
+                bus_address, portal_control, corrupt_content,
+            )
+            assert token != corrupt_content
+            assert portal_control.selected_restore_tokens() == [None]
 
             all_lines = list(proc.startup_lines) + _collect_stderr(proc)
             all_text = " ".join(all_lines).lower()
@@ -275,19 +391,23 @@ class TestCorruptTokenFallback:
 
 
 class TestMissingTokenStartsFresh:
-    """Missing token file: daemon starts fresh without crashing."""
+    """Missing token file: idle needs no grant and first insertion starts fresh."""
 
     def test_no_token_file_starts_clean(self, mock_portal):
-        """If no token file exists, the daemon should start normally."""
-        bus_address, _, _ = mock_portal
+        bus_address, portal_control, _ = mock_portal
         _remove_token()
         assert not os.path.exists(_token_file_path())
+        portal_control.clear_metrics()
 
         proc = _start_daemon(bus_address)
         try:
+            assert proc.reached_idle, proc.startup_lines
             assert proc.poll() is None, (
                 f"Daemon crashed without token file (exit code: {proc.returncode})"
             )
+            assert portal_control.active_session_types() == ["shortcuts"]
+            _insert_last_transcript(bus_address, portal_control)
+            assert portal_control.selected_restore_tokens() == [None]
 
             all_lines = list(proc.startup_lines) + _collect_stderr(proc)
             all_text = " ".join(all_lines).lower()
@@ -297,58 +417,26 @@ class TestMissingTokenStartsFresh:
             _stop_daemon(proc)
 
 
-class TestTokenSingleUse:
-    """Restore token is single-use and cannot be reused."""
+class TestRejectedTokenFallback:
+    """A portal-rejected token is retried once without persistence."""
 
-    def test_reused_token_triggers_new_permission(self, mock_portal):
-        """Using the same token twice should cause the portal to reject it,
-        and the daemon should handle this by requesting fresh permissions.
-        """
-        bus_address, _, _ = mock_portal
+    def test_rejected_token_triggers_fresh_permission(self, mock_portal):
+        bus_address, portal_control, _ = mock_portal
+        stale_token = "mock-stale-restore-token"
+        _write_token(stale_token)
+        portal_control.clear_metrics()
+        portal_control.reject_next_restore_token()
 
-        # First run: get a real token
-        proc1 = _start_daemon(bus_address)
+        proc = _start_daemon(bus_address)
         try:
-            if not proc1.reached_idle:
-                pytest.skip("Daemon did not reach Idle — mock portal setup incomplete")
-            token_after_first = _read_token()
-            if not token_after_first:
-                pytest.skip("Portal did not return a restore token")
-        finally:
-            _stop_daemon(proc1)
-
-        # Save the token that was just used/rotated
-        used_token = token_after_first
-
-        # Second run: daemon will consume and rotate the token
-        proc2 = _start_daemon(bus_address)
-        try:
-            pass
-        finally:
-            _stop_daemon(proc2)
-
-        # Now write back the already-consumed token from first run
-        _write_token(used_token)
-
-        # Third run: the stale token should be rejected
-        proc3 = _start_daemon(bus_address)
-        try:
-            assert proc3.poll() is None, (
-                f"Daemon crashed on stale token (exit code: {proc3.returncode})"
+            assert proc.reached_idle, proc.startup_lines
+            replacement = _insert_last_transcript(
+                bus_address, portal_control, stale_token,
             )
-
-            all_lines = list(proc3.startup_lines) + _collect_stderr(proc3)
-            all_text = " ".join(all_lines).lower()
-
-            # Should not have crashed
-            assert "panic" not in all_text, f"Daemon panicked on stale token: {all_lines}"
-
-            # Should get a new token (because the stale one was rejected)
-            token_after_third = _read_token()
-            if not token_after_third:
-                pytest.skip("Portal did not return a replacement token")
-            assert token_after_third != used_token, (
+            assert proc.poll() is None
+            assert portal_control.selected_restore_tokens() == [stale_token, None]
+            assert replacement != stale_token, (
                 "Stale token was not replaced after rejection"
             )
         finally:
-            _stop_daemon(proc3)
+            _stop_daemon(proc)

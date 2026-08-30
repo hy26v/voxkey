@@ -1,0 +1,8 @@
+{
+  "uuid": "voxkey@hy26v.github.io",
+  "name": "Voxkey",
+  "description": "GNOME control surface for Voxkey dictation with start, finish, cancel, live microphone level, transcription previews, and last-transcript actions.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/hy26v/voxkey",
+  "version-name": "2.1.0"
+}

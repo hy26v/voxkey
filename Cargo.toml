@@ -1,9 +1,10 @@
 [workspace]
 members = ["voxkey-ipc", "voxkey-settings"]
+default-members = [".", "voxkey-ipc", "voxkey-settings"]
 
 [package]
 name = "voxkey"
-version = "0.5.0"
+version = "0.6.2"
 edition = "2024"
 license = "MIT"
 description = "Wayland voice dictation daemon"
@@ -11,21 +12,37 @@ repository = "https://github.com/hy26v/voxkey"
 
 [dependencies]
 voxkey-ipc = { path = "voxkey-ipc" }
+fancy-regex = "0.14"
 ashpd = { version = "0.13.0-alpha", default-features = false, features = ["tokio", "global_shortcuts", "remote_desktop", "screencast"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 futures-util = "0.3"
 cpal = "0.16"
 hound = "3.5"
 xkbcommon = "0.9"
+reis = { version = "0.7", features = ["tokio"] }
+rustix = { version = "1", features = ["fs", "process", "time"] }
 toml = "0.8"
+toml_edit = { version = "0.22", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 reqwest = { version = "0.12", features = ["multipart", "json", "rustls-tls", "stream"], default-features = false }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 base64 = "0.22"
 http = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-sherpa-rs = { version = "0.6", features = ["download-binaries"] }
+# 1.12.24 was the first sherpa-onnx release with modified-beam-search and
+# hotword support for NeMo/Parakeet TDT models. Keep the exact version we
+# exercise in Voxkey's real-model tests instead of the obsolete sherpa-rs
+# wrapper, which bundles sherpa-onnx 1.12.9 and exits on this configuration.
+sherpa-onnx = { version = "=1.13.5", default-features = false, features = ["shared"] }
 tempfile = "3"
+notify-rust = { version = "4", default-features = false, features = ["z"] }
+secret-service = { version = "5", default-features = false, features = ["rt-tokio-crypto-rust"] }
+
+[dev-dependencies]
+calloop = "0.14"
+reis = { version = "0.7", features = ["calloop", "tokio"] }

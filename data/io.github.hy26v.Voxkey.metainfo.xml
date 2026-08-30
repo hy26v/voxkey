@@ -9,16 +9,17 @@
   <description>
     <p>
       Press a shortcut, speak, and text appears at your cursor.
-      Voxkey uses XDG Desktop Portal interfaces for global shortcuts
-      and keyboard injection — no X11, no clipboard hacks, no virtual
-      keyboard tools.
+      Voxkey integrates with the XDG Desktop Portal for global shortcuts
+      and keyboard injection, with no X11 or virtual keyboard tools required.
     </p>
     <ul>
       <li>Toggle dictation with a global keyboard shortcut</li>
-      <li>Text injection directly at the cursor in any focused application</li>
-      <li>Local transcription via whisper.cpp, or cloud via Mistral</li>
-      <li>Real-time streaming transcription via Mistral Realtime</li>
-      <li>Settings GUI for live configuration</li>
+      <li>Text appears directly at the cursor in any focused application</li>
+      <li>Offline transcription with Parakeet (25 languages) or whisper.cpp</li>
+      <li>Cloud transcription with Mistral, including real-time streaming</li>
+      <li>Corrected live previews in the GNOME status capsule for every transcription backend</li>
+      <li>Adaptive GNOME settings app for models, microphones, dictionary, and permissions</li>
+      <li>Searchable transcription history stored locally on your computer</li>
     </ul>
   </description>
 
@@ -41,6 +42,75 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.6.2" date="2026-08-13">
+      <description>
+        <p>Recording-shortcut changes now take effect on GNOME.</p>
+        <ul>
+          <li>Replace the active GNOME portal binding when selecting a new recording shortcut</li>
+          <li>Retire the previous shortcut so only the newly selected key toggles dictation</li>
+          <li>Repair configurations that displayed a different shortcut from GNOME's active binding</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.6.1" date="2026-08-13">
+      <description>
+        <p>One-button dictation and an updated local Parakeet runtime.</p>
+        <ul>
+          <li>Use a safe function or dedicated media key by itself as the recording shortcut</li>
+          <li>See the active GNOME portal binding and follow desktop-side shortcut changes live</li>
+          <li>Run local Parakeet transcription directly through the current sherpa-onnx runtime</li>
+          <li>Remove packaged private inference libraries cleanly when uninstalling Voxkey</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.6.0" date="2026-08-13">
+      <description>
+        <p>A richer GNOME experience with safer, more reliable dictation.</p>
+        <ul>
+          <li>See recording status and corrected live previews in the GNOME Shell status capsule</li>
+          <li>Manage transcription history, dictionary rules, models, microphones, and permissions in the redesigned settings app</li>
+          <li>Keep Mistral API keys securely in the system keyring</li>
+          <li>Recover safely from portal, recording, transcription, and screen-lock failures</li>
+          <li>Use stronger shortcut validation and fail-closed keyboard injection</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.5.0" date="2026-03-01">
+      <description>
+        <p>Reliability improvements and configurable text insertion speed.</p>
+        <ul>
+          <li>Choose how fast text is inserted at your cursor, from 0 to 50 milliseconds per character</li>
+          <li>Dictation recovers gracefully from transient errors instead of requiring a restart</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.0" date="2026-03-01">
+      <description>
+        <p>Faster text insertion.</p>
+        <ul>
+          <li>Text appears at the cursor more quickly after you stop speaking</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.3.0" date="2026-02-28">
+      <description>
+        <p>Dictation continues working after the screen unlocks.</p>
+        <ul>
+          <li>Voxkey reconnects automatically after a screen lock or compositor restart, without needing to restart the daemon</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.2.0" date="2026-02-23">
+      <description>
+        <p>Offline dictation with Parakeet.</p>
+        <ul>
+          <li>Speak in 25 languages with high-accuracy local transcription powered by NVIDIA Parakeet</li>
+          <li>Download Parakeet models directly from the settings app, with progress shown live</li>
+          <li>Choose between CPU and CUDA acceleration for transcription</li>
+          <li>No internet connection or API key required for Parakeet</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-02-11">
       <description>
         <p>Initial release.</p>

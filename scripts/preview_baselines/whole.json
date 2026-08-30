@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "strategy": "whole",
+  "engine_id": "whisper.cpp/ggml-base.bin@sha256:60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+  "fixtures": [
+    "long_passage.wav",
+    "punctuation.wav",
+    "the_quick_brown_fox.wav"
+  ],
+  "pause_seconds": 2.0,
+  "settle_seconds": 3.0,
+  "interval_ms": 1000,
+  "metrics": {
+    "updates": 4,
+    "dropped_words_total": 0,
+    "time_to_first_preview_seconds": 5.19,
+    "stable_word_count": 32,
+    "stable_word_lag_mean_seconds": 0.0,
+    "stable_word_lag_p95_seconds": 0.0,
+    "stable_word_lag_max_seconds": 0.0,
+    "preview_final_word_f1": 1.0,
+    "preview_final_sequence_ratio": 1.0,
+    "final_word_f1": 1.0,
+    "final_sequence_ratio": 1.0,
+    "final_ground_truth_word_f1": 1.0,
+    "final_ground_truth_sequence_ratio": 1.0,
+    "hallucinated_preview_words": [],
+    "final_words_missing_from_preview": [],
+    "hallucinated_final_words": [],
+    "ground_truth_words_missing_from_final": [],
+    "last_preview": "The quick brown fox jumps over the lazy dog. She sells seashells by the seashore. Hello world, is this working? Yes, it is. The quick brown fox jumps over the lazy dog.",
+    "final_transcript": "The quick brown fox jumps over the lazy dog. She sells seashells by the seashore. Hello world, is this working? Yes, it is. The quick brown fox jumps over the lazy dog.",
+    "ground_truth": "The quick brown fox jumps over the lazy dog. She sells seashells by the seashore. Hello world, is this working? Yes, it is. The quick brown fox jumps over the lazy dog."
+  }
+}
