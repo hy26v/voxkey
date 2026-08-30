@@ -1,7 +1,7 @@
 // ABOUTME: Connects to the voxkey daemon over session D-Bus.
 // ABOUTME: Reads properties, calls methods, and forwards state changes to the GTK main loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, mpsc};
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -21,6 +21,7 @@ const KEYRING_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 // Endpoint checks include DNS, TLS, and a bounded network probe. Keep their
 // D-Bus method timeout above the daemon's own eight-second probe deadline.
 const ENDPOINT_CHECK_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+const ENDPOINT_CHECK_CONCURRENCY: usize = 2;
 const UPDATE_QUEUE_CAPACITY: usize = 256;
 const COMMAND_QUEUE_CAPACITY: usize = 32;
 const LIFECYCLE_QUEUE_CAPACITY: usize = 4;
@@ -131,6 +132,126 @@ struct CommandRequest {
 }
 
 type CommandResponse = Option<voxkey_ipc::EndpointCheckResult>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredCommandLane {
+    Endpoint,
+    Keyring,
+}
+
+impl DeferredCommandLane {
+    fn concurrency(self) -> usize {
+        match self {
+            Self::Endpoint => ENDPOINT_CHECK_CONCURRENCY,
+            // Reads and writes share one FIFO lane so a status query can never
+            // overtake a key the user just saved or removed.
+            Self::Keyring => 1,
+        }
+    }
+}
+
+/// Keeps potentially interactive or network-bound calls away from the main
+/// daemon command loop while placing a strict bound on their resource use.
+#[derive(Default)]
+struct DeferredCommandScheduler {
+    endpoint_active: usize,
+    endpoint_waiting: VecDeque<CommandRequest>,
+    keyring_active: usize,
+    keyring_waiting: VecDeque<CommandRequest>,
+}
+
+impl DeferredCommandScheduler {
+    fn lane_mut(
+        &mut self,
+        lane: DeferredCommandLane,
+    ) -> (&mut usize, &mut VecDeque<CommandRequest>) {
+        match lane {
+            DeferredCommandLane::Endpoint => {
+                (&mut self.endpoint_active, &mut self.endpoint_waiting)
+            }
+            DeferredCommandLane::Keyring => (&mut self.keyring_active, &mut self.keyring_waiting),
+        }
+    }
+
+    /// Returns the request when it may start immediately; otherwise queues it
+    /// in FIFO order for its lane.
+    fn submit(&mut self, request: CommandRequest) -> Option<CommandRequest> {
+        let lane = request
+            .command
+            .deferred_lane()
+            .expect("only deferred commands may enter the deferred scheduler");
+        if lane == DeferredCommandLane::Keyring {
+            let service = match &request.command {
+                // A newer read supersedes older reads for the same service.
+                DaemonCommand::HasApiKey { service, .. } => Some(service.clone()),
+                // A user-requested write makes every background status read
+                // stale and should not wait behind one for another provider.
+                DaemonCommand::SetApiKey { .. } | DaemonCommand::ClearApiKey { .. } => None,
+                _ => unreachable!("every deferred keyring command must be classified"),
+            };
+            self.supersede_waiting_key_status(service.as_deref());
+        }
+        let limit = lane.concurrency();
+        let (active, waiting) = self.lane_mut(lane);
+        if *active < limit {
+            *active += 1;
+            Some(request)
+        } else {
+            waiting.push_back(request);
+            None
+        }
+    }
+
+    /// Releases a lane slot and returns its oldest queued request, if any. A
+    /// replacement inherits the active slot so the counters stay exact.
+    fn complete(&mut self, lane: DeferredCommandLane) -> Option<CommandRequest> {
+        let (active, waiting) = self.lane_mut(lane);
+        debug_assert!(*active > 0, "a deferred lane completed while idle");
+        if let Some(next) = waiting.pop_front() {
+            Some(next)
+        } else {
+            *active = (*active)
+                .checked_sub(1)
+                .expect("a deferred lane completed while idle");
+            None
+        }
+    }
+
+    /// A queued status read is already obsolete when any newer operation for
+    /// that service arrives. Drop it instead of making a key save wait behind
+    /// reads whose request IDs the UI will ignore.
+    fn supersede_waiting_key_status(&mut self, service: Option<&str>) {
+        let mut current = std::mem::take(&mut self.keyring_waiting);
+        while let Some(request) = current.pop_front() {
+            let superseded = matches!(
+                &request.command,
+                DaemonCommand::HasApiKey {
+                    service: pending_service,
+                    ..
+                } if service.is_none_or(|service| pending_service == service)
+            );
+            if superseded {
+                let _ = request.completion.send(Err(
+                    "API key status check was superseded by a newer credential operation"
+                        .to_string(),
+                ));
+            } else {
+                self.keyring_waiting.push_back(request);
+            }
+        }
+    }
+}
+
+struct DeferredCommandResult {
+    lane: DeferredCommandLane,
+    operation: &'static str,
+    reports_failure_inline: bool,
+    completion: tokio::sync::oneshot::Sender<Result<CommandResponse, String>>,
+    result: Result<(CommandResponse, Option<DaemonUpdate>), String>,
+}
+
+type DeferredCommandTask =
+    std::pin::Pin<Box<dyn std::future::Future<Output = DeferredCommandResult>>>;
 
 struct PendingModelStatusRequest {
     request_id: u64,
@@ -382,6 +503,16 @@ impl DaemonCommand {
             self,
             Self::SetShortcut(_) | Self::CheckEndpoint(_) | Self::SaveCheckedEndpoint(_)
         )
+    }
+
+    fn deferred_lane(&self) -> Option<DeferredCommandLane> {
+        match self {
+            Self::CheckEndpoint(_) => Some(DeferredCommandLane::Endpoint),
+            Self::SetApiKey { .. } | Self::ClearApiKey { .. } | Self::HasApiKey { .. } => {
+                Some(DeferredCommandLane::Keyring)
+            }
+            _ => None,
+        }
     }
 
     fn supersedes_model_status(&self) -> Option<&str> {
@@ -843,6 +974,8 @@ async fn try_connect(
     let model_status_proxy = Arc::new(tokio::sync::OnceCell::new());
     let mut model_status_tasks = FuturesUnordered::new();
     let mut pending_model_status = PendingModelStatusRequests::default();
+    let mut deferred_command_tasks = FuturesUnordered::<DeferredCommandTask>::new();
+    let mut deferred_command_scheduler = DeferredCommandScheduler::default();
 
     loop {
         tokio::select! {
@@ -970,6 +1103,16 @@ async fn try_connect(
             {
                 pending_model_status.finish(request_id, model_name, result, update_tx);
             }
+            Some(outcome) = deferred_command_tasks.next(),
+                if !deferred_command_tasks.is_empty() =>
+            {
+                let lane = outcome.lane;
+                let next = deferred_command_scheduler.complete(lane);
+                finish_deferred_command(outcome, update_tx);
+                if let Some(next) = next {
+                    deferred_command_tasks.push(Box::pin(run_deferred_command(next)));
+                }
+            }
             command = cmd_rx.recv() => {
                 match command {
                     Some(CommandRequest {
@@ -985,6 +1128,11 @@ async fn try_connect(
                                 request_id,
                                 model_name,
                             ));
+                        }
+                    }
+                    Some(request) if request.command.deferred_lane().is_some() => {
+                        if let Some(request) = deferred_command_scheduler.submit(request) {
+                            deferred_command_tasks.push(Box::pin(run_deferred_command(request)));
                         }
                     }
                     Some(request) => {
@@ -1096,6 +1244,99 @@ async fn publish_authoritative_property(
     }
 }
 
+async fn run_deferred_command(request: CommandRequest) -> DeferredCommandResult {
+    let lane = request
+        .command
+        .deferred_lane()
+        .expect("only deferred commands may be started in a deferred lane");
+    let operation = request.command.operation();
+    let reports_failure_inline = request.command.reports_failure_inline();
+    let result = handle_deferred_command(request.command)
+        .await
+        .map_err(|error| error.to_string());
+    DeferredCommandResult {
+        lane,
+        operation,
+        reports_failure_inline,
+        completion: request.completion,
+        result,
+    }
+}
+
+async fn handle_deferred_command(
+    command: DaemonCommand,
+) -> Result<(CommandResponse, Option<DaemonUpdate>), Box<dyn std::error::Error>> {
+    match command {
+        DaemonCommand::CheckEndpoint(config_json) => {
+            let connection = endpoint_check_connection().await?;
+            let check_proxy = DaemonProxy::new(&connection).await?;
+            let result_json = check_proxy.check_transcriber_endpoint(&config_json).await?;
+            let result = serde_json::from_str::<voxkey_ipc::EndpointCheckResult>(&result_json)?;
+            Ok((Some(result), None))
+        }
+        DaemonCommand::SetApiKey { service, key } => {
+            let connection = keyring_connection().await?;
+            DaemonProxy::new(&connection)
+                .await?
+                .set_api_key(&service, &key)
+                .await?;
+            Ok((None, None))
+        }
+        DaemonCommand::ClearApiKey { service } => {
+            let connection = keyring_connection().await?;
+            DaemonProxy::new(&connection)
+                .await?
+                .clear_api_key(&service)
+                .await?;
+            Ok((None, None))
+        }
+        DaemonCommand::HasApiKey {
+            service,
+            request_id,
+        } => {
+            let connection = keyring_connection().await?;
+            let present = DaemonProxy::new(&connection)
+                .await?
+                .has_api_key(&service)
+                .await?;
+            Ok((
+                None,
+                Some(DaemonUpdate::ApiKeyStatus {
+                    service,
+                    present,
+                    request_id,
+                }),
+            ))
+        }
+        _ => unreachable!("ordinary commands cannot run in a deferred lane"),
+    }
+}
+
+fn finish_deferred_command(
+    outcome: DeferredCommandResult,
+    update_tx: &tokio::sync::mpsc::Sender<DaemonUpdate>,
+) {
+    let result = match outcome.result {
+        Ok((response, update)) => {
+            if let Some(update) = update {
+                let _ = update_tx.try_send(update);
+            }
+            Ok(response)
+        }
+        Err(message) => {
+            tracing::error!("{} failed: {message}", outcome.operation);
+            if !outcome.reports_failure_inline {
+                let _ = update_tx.try_send(DaemonUpdate::CommandFailed {
+                    operation: outcome.operation.to_string(),
+                    message: message.clone(),
+                });
+            }
+            Err(message)
+        }
+    };
+    let _ = outcome.completion.send(result);
+}
+
 async fn handle_command(
     proxy: &DaemonProxy<'_>,
     update_tx: &tokio::sync::mpsc::Sender<DaemonUpdate>,
@@ -1114,12 +1355,8 @@ async fn handle_command(
         DaemonCommand::SaveCheckedEndpoint(config_json) => {
             proxy.set_transcriber_config(&config_json).await?;
         }
-        DaemonCommand::CheckEndpoint(config_json) => {
-            let connection = endpoint_check_connection().await?;
-            let check_proxy = DaemonProxy::new(&connection).await?;
-            let result_json = check_proxy.check_transcriber_endpoint(&config_json).await?;
-            let result = serde_json::from_str::<voxkey_ipc::EndpointCheckResult>(&result_json)?;
-            return Ok(Some(result));
+        DaemonCommand::CheckEndpoint(_) => {
+            unreachable!("endpoint checks must use their deferred command lane")
         }
         DaemonCommand::SetInjectionConfig(config_json) => {
             proxy.set_injection_config(&config_json).await?;
@@ -1172,34 +1409,10 @@ async fn handle_command(
         DaemonCommand::ClearLastError => {
             proxy.clear_last_error().await?;
         }
-        DaemonCommand::SetApiKey { service, key } => {
-            let connection = keyring_connection().await?;
-            DaemonProxy::new(&connection)
-                .await?
-                .set_api_key(&service, &key)
-                .await?;
-        }
-        DaemonCommand::ClearApiKey { service } => {
-            let connection = keyring_connection().await?;
-            DaemonProxy::new(&connection)
-                .await?
-                .clear_api_key(&service)
-                .await?;
-        }
-        DaemonCommand::HasApiKey {
-            service,
-            request_id,
-        } => {
-            let connection = keyring_connection().await?;
-            let present = DaemonProxy::new(&connection)
-                .await?
-                .has_api_key(&service)
-                .await?;
-            let _ = update_tx.try_send(DaemonUpdate::ApiKeyStatus {
-                service,
-                present,
-                request_id,
-            });
+        DaemonCommand::SetApiKey { .. }
+        | DaemonCommand::ClearApiKey { .. }
+        | DaemonCommand::HasApiKey { .. } => {
+            unreachable!("keyring calls must use their deferred command lane")
         }
         DaemonCommand::DownloadModel(name) => {
             proxy.download_model(&name).await?;
@@ -1265,6 +1478,22 @@ async fn endpoint_check_connection() -> Result<zbus::Connection, Box<dyn std::er
 mod tests {
     use super::*;
 
+    fn command_request(
+        command: DaemonCommand,
+    ) -> (
+        CommandRequest,
+        tokio::sync::oneshot::Receiver<Result<CommandResponse, String>>,
+    ) {
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        (
+            CommandRequest {
+                command,
+                completion,
+            },
+            receiver,
+        )
+    }
+
     #[tokio::test]
     async fn daemon_handle_sends_without_a_polling_timer() {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(1);
@@ -1296,6 +1525,234 @@ mod tests {
         request.completion.send(Ok(Some(expected.clone()))).unwrap();
 
         assert_eq!(completion.wait_endpoint_check().await.unwrap(), expected);
+    }
+
+    #[test]
+    fn slow_commands_are_assigned_to_their_isolated_lane() {
+        assert_eq!(
+            DaemonCommand::CheckEndpoint("{}".to_string()).deferred_lane(),
+            Some(DeferredCommandLane::Endpoint)
+        );
+        for command in [
+            DaemonCommand::SetApiKey {
+                service: "service".to_string(),
+                key: "secret".to_string(),
+            },
+            DaemonCommand::ClearApiKey {
+                service: "service".to_string(),
+            },
+            DaemonCommand::HasApiKey {
+                service: "service".to_string(),
+                request_id: 1,
+            },
+        ] {
+            assert_eq!(command.deferred_lane(), Some(DeferredCommandLane::Keyring));
+        }
+        assert_eq!(DaemonCommand::ReloadConfig.deferred_lane(), None);
+    }
+
+    #[test]
+    fn endpoint_scheduler_is_bounded_and_starts_waiters_in_fifo_order() {
+        let mut scheduler = DeferredCommandScheduler::default();
+        for request_id in 1..=ENDPOINT_CHECK_CONCURRENCY {
+            let (request, _receiver) =
+                command_request(DaemonCommand::CheckEndpoint(request_id.to_string()));
+            assert_eq!(
+                scheduler
+                    .submit(request)
+                    .map(|request| request.command.operation()),
+                Some("Check server")
+            );
+        }
+        let (waiting, _receiver) =
+            command_request(DaemonCommand::CheckEndpoint("oldest waiter".to_string()));
+        assert!(scheduler.submit(waiting).is_none());
+        assert_eq!(scheduler.endpoint_active, ENDPOINT_CHECK_CONCURRENCY);
+        assert_eq!(scheduler.endpoint_waiting.len(), 1);
+
+        let next = scheduler
+            .complete(DeferredCommandLane::Endpoint)
+            .expect("the oldest endpoint waiter must inherit the freed slot");
+        assert!(matches!(
+            next.command,
+            DaemonCommand::CheckEndpoint(ref value) if value == "oldest waiter"
+        ));
+        assert_eq!(scheduler.endpoint_active, ENDPOINT_CHECK_CONCURRENCY);
+        assert!(scheduler.endpoint_waiting.is_empty());
+
+        assert!(scheduler.complete(DeferredCommandLane::Endpoint).is_none());
+        assert_eq!(scheduler.endpoint_active, ENDPOINT_CHECK_CONCURRENCY - 1);
+        assert!(scheduler.complete(DeferredCommandLane::Endpoint).is_none());
+        assert_eq!(scheduler.endpoint_active, 0);
+    }
+
+    #[test]
+    fn keyring_scheduler_serializes_reads_and_writes_in_fifo_order() {
+        let mut scheduler = DeferredCommandScheduler::default();
+        let commands = [
+            DaemonCommand::HasApiKey {
+                service: "service".to_string(),
+                request_id: 1,
+            },
+            DaemonCommand::SetApiKey {
+                service: "service".to_string(),
+                key: "replacement".to_string(),
+            },
+            DaemonCommand::HasApiKey {
+                service: "service".to_string(),
+                request_id: 2,
+            },
+        ];
+        for (index, command) in commands.into_iter().enumerate() {
+            let (request, _receiver) = command_request(command);
+            assert_eq!(scheduler.submit(request).is_some(), index == 0);
+        }
+        assert_eq!(scheduler.keyring_active, 1);
+        assert_eq!(scheduler.keyring_waiting.len(), 2);
+
+        let write = scheduler
+            .complete(DeferredCommandLane::Keyring)
+            .expect("the write must follow the first read");
+        assert!(matches!(write.command, DaemonCommand::SetApiKey { .. }));
+        let read = scheduler
+            .complete(DeferredCommandLane::Keyring)
+            .expect("the final read must follow the write");
+        assert!(matches!(
+            read.command,
+            DaemonCommand::HasApiKey { request_id: 2, .. }
+        ));
+        assert!(scheduler.complete(DeferredCommandLane::Keyring).is_none());
+        assert_eq!(scheduler.keyring_active, 0);
+    }
+
+    #[test]
+    fn newer_keyring_operations_supersede_only_stale_waiting_reads() {
+        let mut scheduler = DeferredCommandScheduler::default();
+        let (active, _active_receiver) = command_request(DaemonCommand::HasApiKey {
+            service: "service".to_string(),
+            request_id: 1,
+        });
+        assert!(scheduler.submit(active).is_some());
+
+        let (stale_read, mut stale_receiver) = command_request(DaemonCommand::HasApiKey {
+            service: "service".to_string(),
+            request_id: 2,
+        });
+        assert!(scheduler.submit(stale_read).is_none());
+        let (other_read, mut other_receiver) = command_request(DaemonCommand::HasApiKey {
+            service: "other-service".to_string(),
+            request_id: 1,
+        });
+        assert!(scheduler.submit(other_read).is_none());
+        let (write, _write_receiver) = command_request(DaemonCommand::SetApiKey {
+            service: "service".to_string(),
+            key: "replacement".to_string(),
+        });
+        assert!(scheduler.submit(write).is_none());
+        assert!(
+            matches!(stale_receiver.try_recv(), Ok(Err(message)) if message.contains("superseded"))
+        );
+        assert!(
+            matches!(other_receiver.try_recv(), Ok(Err(message)) if message.contains("superseded"))
+        );
+
+        let (older_read, mut older_receiver) = command_request(DaemonCommand::HasApiKey {
+            service: "service".to_string(),
+            request_id: 3,
+        });
+        assert!(scheduler.submit(older_read).is_none());
+        let (latest_read, _latest_receiver) = command_request(DaemonCommand::HasApiKey {
+            service: "service".to_string(),
+            request_id: 4,
+        });
+        assert!(scheduler.submit(latest_read).is_none());
+        assert!(
+            matches!(older_receiver.try_recv(), Ok(Err(message)) if message.contains("superseded"))
+        );
+        assert_eq!(scheduler.keyring_waiting.len(), 2);
+
+        let write = scheduler
+            .complete(DeferredCommandLane::Keyring)
+            .expect("the credential write must be next");
+        assert!(matches!(write.command, DaemonCommand::SetApiKey { .. }));
+        let latest_read = scheduler
+            .complete(DeferredCommandLane::Keyring)
+            .expect("the latest status read must follow the write");
+        assert!(matches!(
+            latest_read.command,
+            DaemonCommand::HasApiKey { request_id: 4, .. }
+        ));
+        assert!(scheduler.complete(DeferredCommandLane::Keyring).is_none());
+        assert_eq!(scheduler.keyring_active, 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_results_preserve_updates_completions_and_inline_errors() {
+        let (update_tx, mut update_rx) = tokio::sync::mpsc::channel(2);
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        finish_deferred_command(
+            DeferredCommandResult {
+                lane: DeferredCommandLane::Keyring,
+                operation: "Check API key",
+                reports_failure_inline: false,
+                completion,
+                result: Ok((
+                    None,
+                    Some(DaemonUpdate::ApiKeyStatus {
+                        service: "service".to_string(),
+                        present: true,
+                        request_id: 7,
+                    }),
+                )),
+            },
+            &update_tx,
+        );
+        assert!(matches!(receiver.await.unwrap(), Ok(None)));
+        assert!(matches!(
+            update_rx.recv().await,
+            Some(DaemonUpdate::ApiKeyStatus {
+                service,
+                present: true,
+                request_id: 7,
+            }) if service == "service"
+        ));
+
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        finish_deferred_command(
+            DeferredCommandResult {
+                lane: DeferredCommandLane::Endpoint,
+                operation: "Check server",
+                reports_failure_inline: true,
+                completion,
+                result: Err("probe failed".to_string()),
+            },
+            &update_tx,
+        );
+        assert_eq!(receiver.await.unwrap().unwrap_err(), "probe failed");
+        assert!(update_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn deferred_keyring_failures_still_publish_command_errors() {
+        let (update_tx, mut update_rx) = tokio::sync::mpsc::channel(1);
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        finish_deferred_command(
+            DeferredCommandResult {
+                lane: DeferredCommandLane::Keyring,
+                operation: "Save API key",
+                reports_failure_inline: false,
+                completion,
+                result: Err("keyring unavailable".to_string()),
+            },
+            &update_tx,
+        );
+
+        assert_eq!(receiver.await.unwrap().unwrap_err(), "keyring unavailable");
+        assert!(matches!(
+            update_rx.recv().await,
+            Some(DaemonUpdate::CommandFailed { operation, message })
+                if operation == "Save API key" && message == "keyring unavailable"
+        ));
     }
 
     #[tokio::test]

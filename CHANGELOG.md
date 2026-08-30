@@ -17,6 +17,10 @@ from the user's perspective.
 - Slow model verification no longer fails on the ordinary five-second command
   deadline. If a check still cannot finish, both model views now offer a clear
   **Retry check** action instead of remaining disabled.
+- Settings remains responsive while checking a transcription server or waiting
+  for the desktop keyring. Other changes and service controls continue working,
+  while credential saves and removals stay ordered and obsolete status checks
+  no longer delay the current operation.
 - Custom Mistral Batch, Mistral Realtime, and Parakeet server endpoints are now
   checked before they are saved. Settings shows connection progress and keeps
   the address ready to correct or retry when the server cannot be reached.
