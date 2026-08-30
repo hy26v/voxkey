@@ -199,6 +199,45 @@ async def test_repeated_immediate_failures_emit_terminal_download_results(
 
 
 @pytest.mark.asyncio
+async def test_unreplaceable_artifact_fails_before_a_large_transfer(
+    daemon_process, dbus_session,
+):
+    """A bad destination entry must be reported before downloading its bytes."""
+    assert daemon_process.reached_idle, "Daemon did not reach Idle"
+    daemon = await _daemon_interface(dbus_session)
+    data_home = Path(os.environ["XDG_DATA_HOME"])
+    model_path = data_home / "voxkey" / "models" / KNOWN_MODEL
+    artifact_path = model_path / "encoder.int8.onnx"
+    model_path.mkdir(parents=True)
+    artifact_path.mkdir()
+
+    finished = asyncio.Queue()
+    daemon.on_model_download_finished(
+        lambda model_name, outcome, message: finished.put_nowait(
+            (model_name, outcome, message),
+        ),
+    )
+
+    try:
+        await daemon.call_download_model(KNOWN_MODEL)
+        model_name, outcome, message = await asyncio.wait_for(
+            finished.get(), timeout=2,
+        )
+
+        assert model_name == KNOWN_MODEL
+        assert outcome == "failed"
+        assert "not a replaceable file" in message
+        assert "Remove or rename" in message
+        assert artifact_path.is_dir(), "preflight modified the obstructing entry"
+        assert not (model_path / "encoder.int8.part").exists()
+        assert await daemon.call_model_status(KNOWN_MODEL) == "not_downloaded"
+    finally:
+        artifact_path.rmdir()
+        model_path.rmdir()
+        await daemon.call_clear_last_error()
+
+
+@pytest.mark.asyncio
 async def test_deleting_a_model_cannot_target_anything_outside_the_catalogue(
     daemon_process, dbus_session,
 ):

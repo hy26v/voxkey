@@ -24,6 +24,15 @@ progress. Cancelling removes the incomplete file currently being received but
 keeps already verified files, so starting the download again does not repeat
 finished work.
 
+Before opening a network connection, Voxkey verifies which files a retry can
+reuse, removes any stale partial file, and checks the actual model filesystem.
+The remaining files must fit while leaving 128 MB free. If they do not, the
+model row reports the available space and how much to clear instead of failing
+partway through a large transfer. A folder or special file occupying an
+artifact path is also reported before any bytes are downloaded. Only one model
+transfer runs at a time so these storage checks stay meaningful and large
+downloads do not compete for disk or network bandwidth.
+
 Settings checks downloaded artifacts in the background and combines repeated
 requests for the same model. Integrity scans run one at a time, so opening the
 library does not make large files compete for disk access or hold up other

@@ -617,13 +617,14 @@ impl SharedState {
     }
 
     /// Begin downloading a model, or follow the download already running for
-    /// it. Starting a second one would have both write the same files at once
-    /// and leave a corrupt model on disk that still looks complete.
+    /// it. Starting a second transfer would make storage preflight unreliable
+    /// and cause large downloads to compete for disk and network bandwidth.
+    /// A repeated request for the same model still follows its existing task.
     /// The boolean is true only for the caller that owns progress monitoring.
     pub fn start_model_download(
         &self,
         model_name: String,
-    ) -> (watch::Receiver<DownloadStatus>, bool) {
+    ) -> Result<(watch::Receiver<DownloadStatus>, bool), String> {
         self.start_model_download_with(model_name, |model_name| {
             ActiveModelDownload::managed(crate::model_download::start_download(model_name))
         })
@@ -633,7 +634,7 @@ impl SharedState {
         &self,
         model_name: String,
         start: F,
-    ) -> (watch::Receiver<DownloadStatus>, bool)
+    ) -> Result<(watch::Receiver<DownloadStatus>, bool), String>
     where
         F: FnOnce(String) -> ActiveModelDownload,
     {
@@ -642,14 +643,30 @@ impl SharedState {
             && matches!(*running.status.borrow(), DownloadStatus::InProgress(_))
         {
             tracing::info!("Model {model_name} is already downloading; following that download");
-            return (running.status.clone(), false);
+            return Ok((running.status.clone(), false));
+        }
+
+        if let Some(other_model) = inner.model_downloads.iter().find_map(|(name, download)| {
+            (name != &model_name
+                && matches!(*download.status.borrow(), DownloadStatus::InProgress(_)))
+            .then_some(name)
+        }) {
+            let other_name = voxkey_ipc::model_library::local_model(other_model)
+                .map(|model| model.name)
+                .unwrap_or(other_model);
+            let requested_name = voxkey_ipc::model_library::local_model(&model_name)
+                .map(|model| model.name)
+                .unwrap_or(&model_name);
+            return Err(format!(
+                "{other_name} is already downloading. Finish or cancel it before downloading {requested_name}."
+            ));
         }
 
         let download = start(model_name.clone());
         let status = download.status.clone();
         Self::bump_model_generation(&mut inner, &model_name);
         inner.model_downloads.insert(model_name, download);
-        (status, true)
+        Ok((status, true))
     }
 
     fn bump_model_generation(inner: &mut SharedStateInner, model_name: &str) {
@@ -1696,7 +1713,10 @@ impl DaemonInterface {
         crate::model_download::validate_model_name(model_name)
             .map_err(zbus::fdo::Error::InvalidArgs)?;
         let model_name = model_name.to_string();
-        let (mut rx, starts_monitor) = self.shared.start_model_download(model_name.clone());
+        let (mut rx, starts_monitor) = self
+            .shared
+            .start_model_download(model_name.clone())
+            .map_err(zbus::fdo::Error::Failed)?;
         if !starts_monitor {
             return Ok(());
         }
@@ -2130,7 +2150,9 @@ mod tests {
             ActiveModelDownload::unmanaged(watcher),
         );
 
-        let (joined, _) = state.start_model_download("parakeet-tdt-0.6b-v3".to_string());
+        let (joined, _) = state
+            .start_model_download("parakeet-tdt-0.6b-v3".to_string())
+            .unwrap();
 
         assert!(matches!(*joined.borrow(), DownloadStatus::InProgress(42)));
         drop(progress);
@@ -2145,10 +2167,31 @@ mod tests {
             ActiveModelDownload::unmanaged(watcher),
         );
 
-        let (_joined, starts_monitor) =
-            state.start_model_download("parakeet-tdt-0.6b-v3".to_string());
+        let (_joined, starts_monitor) = state
+            .start_model_download("parakeet-tdt-0.6b-v3".to_string())
+            .unwrap();
 
         assert!(!starts_monitor);
+    }
+
+    #[test]
+    fn a_different_model_waits_for_the_active_download() {
+        let state = SharedState::new(Config::default());
+        let (_progress, watcher) = watch::channel(DownloadStatus::InProgress(42));
+        state.inner.lock().unwrap().model_downloads.insert(
+            "parakeet-tdt-0.6b-v3".to_string(),
+            ActiveModelDownload::unmanaged(watcher),
+        );
+
+        let error = state
+            .start_model_download_with("parakeet-tdt-0.6b-v2".to_string(), |_| {
+                panic!("a second large transfer must not start")
+            })
+            .expect_err("different model downloads must be serialized");
+
+        assert!(error.contains("Parakeet v3"), "{error}");
+        assert!(error.contains("Parakeet v2"), "{error}");
+        assert!(error.contains("cancel"), "{error}");
     }
 
     #[test]
@@ -2230,9 +2273,11 @@ mod tests {
             .expect("filesystem scan blocked the single-threaded async runtime")
             .expect("filesystem scan stopped before it began");
         let (_progress, watcher) = watch::channel(DownloadStatus::InProgress(12));
-        state.start_model_download_with("model".to_string(), |_| {
-            ActiveModelDownload::unmanaged(watcher)
-        });
+        state
+            .start_model_download_with("model".to_string(), |_| {
+                ActiveModelDownload::unmanaged(watcher)
+            })
+            .unwrap();
 
         let (open, wake) = &*gate;
         *open.lock().unwrap() = true;
@@ -2278,9 +2323,11 @@ mod tests {
             .expect("model integrity scan stopped before it began");
 
         let (progress, watcher) = watch::channel(DownloadStatus::InProgress(99));
-        let (status, _) = state.start_model_download_with("model".to_string(), |_| {
-            ActiveModelDownload::unmanaged(watcher)
-        });
+        let (status, _) = state
+            .start_model_download_with("model".to_string(), |_| {
+                ActiveModelDownload::unmanaged(watcher)
+            })
+            .unwrap();
         progress.send(DownloadStatus::Complete).unwrap();
         state.finish_model_download("model", &status);
         let (open, wake) = &*gate;
@@ -2362,7 +2409,9 @@ mod tests {
                 ActiveModelDownload::unmanaged(watcher),
             );
 
-        let (restarted, _) = state.start_model_download("voxkey-unknown-model".to_string());
+        let (restarted, _) = state
+            .start_model_download("voxkey-unknown-model".to_string())
+            .unwrap();
 
         let status = restarted.borrow().clone();
         assert!(
@@ -2428,8 +2477,8 @@ mod tests {
         *open.lock().unwrap() = true;
         wake.notify_all();
 
-        let (first, _) = first.join().unwrap();
-        let (second, _) = second.join().unwrap();
+        let (first, _) = first.join().unwrap().unwrap();
+        let (second, _) = second.join().unwrap().unwrap();
         assert!(!second_started, "both requests started their own transfer");
         assert!(first.same_channel(&second));
     }
@@ -2576,7 +2625,7 @@ mod tests {
         wake.notify_all();
 
         deletion.join().unwrap().unwrap();
-        download.join().unwrap();
+        download.join().unwrap().unwrap();
         assert!(
             !started_during_deletion,
             "download started while its model directory was being deleted"

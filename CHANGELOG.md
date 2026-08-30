@@ -11,6 +11,10 @@ from the user's perspective.
 - Large local-model downloads can now be cancelled from either model view in
   Settings. Voxkey stops the transfer safely, removes the incomplete file, and
   keeps any model files that already finished so a later retry can reuse them.
+- Local-model downloads now check their destination and available storage
+  before transferring hundreds of megabytes. Voxkey keeps 128 MB free, reports
+  exactly what must be cleared, and prevents simultaneous model downloads from
+  competing for the same disk and network capacity.
 - Settings now stays responsive while checking large local models. Repeated
   checks for the same model share one result, and integrity scans run one at a
   time instead of competing for disk access.

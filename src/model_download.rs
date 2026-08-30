@@ -2,11 +2,15 @@
 // ABOUTME: Supports progress callbacks and cancellation for GUI integration.
 
 use std::time::Duration;
+use std::{io, os::unix::fs::MetadataExt};
 use tokio::sync::watch;
 
 const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MODEL_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Leave enough room for desktop state and filesystem bookkeeping instead of
+/// allowing a model transfer to consume the user's final available blocks.
+const DOWNLOAD_FREE_SPACE_MARGIN_BYTES: u64 = 128_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadStatus {
@@ -121,6 +125,157 @@ fn can_skip_download(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PlannedArtifact {
+    artifact: crate::models::ModelArtifact,
+    already_downloaded: bool,
+    /// Blocks occupied by an invalid regular file that publication replaces.
+    reclaimable_bytes: u64,
+}
+
+#[derive(Debug)]
+struct DownloadPreflight {
+    artifacts: Vec<PlannedArtifact>,
+    peak_additional_bytes: u64,
+    available_bytes: Option<u64>,
+}
+
+fn existing_artifact_allocation(path: &std::path::Path) -> io::Result<u64> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.nlink() == 1 => {
+            Ok(metadata.blocks().saturating_mul(512))
+        }
+        // Replacing one hard link does not release the inode's blocks while
+        // another name still references it, so do not count them as reusable.
+        Ok(metadata) if metadata.file_type().is_file() => Ok(0),
+        // Publication replaces the link itself and never follows its target.
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(0),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Cannot download the model because {} is not a replaceable file. Remove or rename it, then try again.",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error),
+    }
+}
+
+fn discard_stale_partial(path: &std::path::Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            std::fs::remove_file(path)
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Cannot download the model because {} is not a removable partial file. Remove or rename it, then try again.",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn peak_additional_download_bytes(artifacts: &[PlannedArtifact]) -> u64 {
+    let mut published_delta = 0_i128;
+    let mut peak = 0_i128;
+
+    for planned in artifacts
+        .iter()
+        .filter(|planned| !planned.already_downloaded)
+    {
+        // The current partial coexists with the old destination. Once it is
+        // published, an invalid regular destination releases its old blocks.
+        let during_transfer = published_delta.saturating_add(i128::from(planned.artifact.size));
+        peak = peak.max(during_transfer);
+        published_delta = during_transfer.saturating_sub(i128::from(planned.reclaimable_bytes));
+    }
+
+    u64::try_from(peak.max(0)).unwrap_or(u64::MAX)
+}
+
+fn available_space(path: &std::path::Path) -> io::Result<u64> {
+    let statistics = rustix::fs::statvfs(path).map_err(io::Error::from)?;
+    let fragment_size = if statistics.f_frsize == 0 {
+        statistics.f_bsize
+    } else {
+        statistics.f_frsize
+    };
+    Ok(statistics.f_bavail.saturating_mul(fragment_size))
+}
+
+fn build_download_preflight(
+    destination: &std::path::Path,
+    artifacts: &'static [crate::models::ModelArtifact],
+) -> io::Result<DownloadPreflight> {
+    let mut planned = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts.iter().copied() {
+        let path = destination.join(artifact.name);
+        let reclaimable_bytes = existing_artifact_allocation(&path)?;
+        discard_stale_partial(&path.with_extension("part"))?;
+        planned.push(PlannedArtifact {
+            artifact,
+            already_downloaded: can_skip_download(&path, Some(artifact)),
+            reclaimable_bytes,
+        });
+    }
+
+    let peak_additional_bytes = peak_additional_download_bytes(&planned);
+    let available_bytes = if peak_additional_bytes == 0 {
+        None
+    } else {
+        Some(available_space(destination).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "Could not check free storage for model downloads at {}: {error}",
+                    destination.display()
+                ),
+            )
+        })?)
+    };
+    Ok(DownloadPreflight {
+        artifacts: planned,
+        peak_additional_bytes,
+        available_bytes,
+    })
+}
+
+fn readable_storage(bytes: u64) -> String {
+    const MB: u64 = 1_000_000;
+    const GB: u64 = 1_000_000_000;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else {
+        format!("{} MB", bytes.div_ceil(MB))
+    }
+}
+
+fn ensure_download_space(required: u64, available: Option<u64>) -> Result<(), String> {
+    if required == 0 {
+        return Ok(());
+    }
+    let available = available.ok_or_else(|| {
+        "Could not determine how much storage is available for the model download".to_string()
+    })?;
+    let minimum = required.saturating_add(DOWNLOAD_FREE_SPACE_MARGIN_BYTES);
+    if available >= minimum {
+        return Ok(());
+    }
+
+    let shortfall = minimum.saturating_sub(available);
+    Err(format!(
+        "Not enough free storage for the model download. The remaining files need {}, and Voxkey keeps {} free for safe operation; only {} is available. Free at least {} and try again.",
+        readable_storage(required),
+        readable_storage(DOWNLOAD_FREE_SPACE_MARGIN_BYTES),
+        readable_storage(available),
+        readable_storage(shortfall),
+    ))
+}
+
 struct PartialDownload {
     path: std::path::PathBuf,
     published: bool,
@@ -204,26 +359,30 @@ async fn download_model(
     let dest_dir = crate::models::model_dir(model_name);
     prepare_model_directory(&dest_dir)?;
 
+    // Verify reusable files, clear only Voxkey's known scratch names, reject
+    // unreplaceable destinations, and check the actual target filesystem
+    // before opening a network connection. The scan is intentionally blocking
+    // work, just like ordinary model-status integrity checks.
+    let preflight_dir = dest_dir.clone();
+    let artifacts = manifest.artifacts;
+    let preflight =
+        tokio::task::spawn_blocking(move || build_download_preflight(&preflight_dir, artifacts))
+            .await??;
+    ensure_download_space(preflight.peak_additional_bytes, preflight.available_bytes)?;
+
     let client = reqwest::Client::new();
-    let total_bytes = manifest
-        .artifacts
+    let total_bytes = artifacts
         .iter()
         .fold(0_u64, |total, artifact| total.saturating_add(artifact.size));
     let mut completed_bytes = 0_u64;
 
-    for artifact in manifest.artifacts.iter().copied() {
+    for planned in preflight.artifacts {
+        let artifact = planned.artifact;
         let file_name = artifact.name;
         let url = format!("{base}/{file_name}");
         let dest_path = dest_dir.join(file_name);
 
-        // Hashing a large existing artifact is blocking work. Keep it off the
-        // async worker so D-Bus cancellation remains responsive while a retry
-        // checks which verified files it can reuse.
-        let path_to_verify = dest_path.clone();
-        let already_downloaded =
-            tokio::task::spawn_blocking(move || can_skip_download(&path_to_verify, Some(artifact)))
-                .await?;
-        if already_downloaded {
+        if planned.already_downloaded {
             completed_bytes = completed_bytes.saturating_add(artifact.size);
             if let Some(percent) = download_progress_percent(completed_bytes, total_bytes, 0) {
                 let _ = progress.send(DownloadStatus::InProgress(percent));
@@ -532,6 +691,28 @@ fn delete_model_from(models_dir: &std::path::Path, model_name: &str) -> Result<(
 mod tests {
     use super::*;
 
+    const TEST_ARTIFACTS: &[crate::models::ModelArtifact] = &[crate::models::ModelArtifact {
+        name: "artifact.onnx",
+        size: 10,
+        sha256: "6dbdb6a147ad4d808455652bf5a10120161678395f6bfbd21eb6fe4e731aceeb",
+    }];
+
+    fn planned_artifact(
+        size: u64,
+        already_downloaded: bool,
+        reclaimable_bytes: u64,
+    ) -> PlannedArtifact {
+        PlannedArtifact {
+            artifact: crate::models::ModelArtifact {
+                name: "artifact",
+                size,
+                sha256: "unused by space planning",
+            },
+            already_downloaded,
+            reclaimable_bytes,
+        }
+    }
+
     #[test]
     fn base_url_resolves_v2() {
         assert!(base_url("parakeet-tdt-0.6b-v2").unwrap().contains("v2"));
@@ -669,6 +850,114 @@ mod tests {
         };
 
         assert!(!can_skip_download(&path, Some(expected)));
+    }
+
+    #[test]
+    fn preflight_reuses_verified_files_and_discards_stale_scratch() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("model");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("artifact.onnx"), b"model data").unwrap();
+        std::fs::write(destination.join("artifact.part"), b"stale partial").unwrap();
+
+        let preflight = build_download_preflight(&destination, TEST_ARTIFACTS).unwrap();
+
+        assert!(preflight.artifacts[0].already_downloaded);
+        assert_eq!(preflight.peak_additional_bytes, 0);
+        assert_eq!(preflight.available_bytes, None);
+        assert!(!destination.join("artifact.part").exists());
+    }
+
+    #[test]
+    fn preflight_rejects_an_unreplaceable_artifact_before_transfer() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("model");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::create_dir(destination.join("artifact.onnx")).unwrap();
+
+        let error = build_download_preflight(&destination, TEST_ARTIFACTS)
+            .expect_err("an artifact directory cannot be replaced by a downloaded file");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("Remove or rename"), "{error}");
+    }
+
+    #[test]
+    fn preflight_rejects_an_unremovable_partial_before_transfer() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("model");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::create_dir(destination.join("artifact.part")).unwrap();
+
+        let error = build_download_preflight(&destination, TEST_ARTIFACTS)
+            .expect_err("a directory cannot be reused as download scratch space");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("partial file"), "{error}");
+    }
+
+    #[test]
+    fn space_planning_accounts_for_reused_and_replaced_files() {
+        let all_missing = [
+            planned_artifact(650_000_000, false, 0),
+            planned_artifact(20_000_000, false, 0),
+        ];
+        assert_eq!(peak_additional_download_bytes(&all_missing), 670_000_000);
+
+        let large_repair = [
+            planned_artifact(650_000_000, false, 650_000_000),
+            planned_artifact(20_000_000, false, 0),
+        ];
+        assert_eq!(peak_additional_download_bytes(&large_repair), 650_000_000);
+
+        let large_reused = [
+            planned_artifact(650_000_000, true, 650_000_000),
+            planned_artifact(20_000_000, false, 0),
+        ];
+        assert_eq!(peak_additional_download_bytes(&large_reused), 20_000_000);
+    }
+
+    #[test]
+    fn hard_linked_artifact_blocks_are_not_counted_as_reclaimable() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("artifact.onnx");
+        let other_link = temp.path().join("other-link.onnx");
+        std::fs::write(&artifact, vec![0_u8; 8_192]).unwrap();
+        std::fs::hard_link(&artifact, &other_link).unwrap();
+
+        assert_eq!(existing_artifact_allocation(&artifact).unwrap(), 0);
+    }
+
+    #[test]
+    fn download_space_check_preserves_its_safety_margin() {
+        let required = 670_000_000;
+        let minimum = required + DOWNLOAD_FREE_SPACE_MARGIN_BYTES;
+        assert!(ensure_download_space(required, Some(minimum)).is_ok());
+
+        let error = ensure_download_space(required, Some(minimum - 1))
+            .expect_err("one byte below the safe minimum must be rejected");
+        assert!(error.contains("Not enough free storage"), "{error}");
+        assert!(error.contains("Free at least"), "{error}");
+        assert!(ensure_download_space(0, None).is_ok());
+    }
+
+    #[test]
+    fn download_space_check_requires_an_authoritative_measurement() {
+        let error = ensure_download_space(1, None)
+            .expect_err("a download must not proceed when free space could not be measured");
+        assert!(error.contains("determine"), "{error}");
+    }
+
+    #[test]
+    fn required_storage_is_rounded_up_in_decimal_units() {
+        assert_eq!(readable_storage(670_478_772), "671 MB");
+        assert_eq!(readable_storage(1_500_000_000), "1.5 GB");
+    }
+
+    #[test]
+    fn free_space_is_measured_on_the_actual_destination_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(available_space(temp.path()).unwrap() > 0);
     }
 
     #[test]
