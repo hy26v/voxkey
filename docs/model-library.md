@@ -30,6 +30,11 @@ library does not make large files compete for disk access or hold up other
 controls. A download, retry, or deletion that finishes during a scan takes
 precedence over the older result.
 
+Integrity checks have a separate, bounded allowance for slow storage. If one
+still fails, Settings leaves the affected model in a recoverable state with a
+**Retry check** action; it does not guess whether unverified files are safe to
+use or leave the controls stuck indefinitely.
+
 “Downloadable” does not mean every model uses an OSI-approved open-source
 license. Parakeet v2/v3 use Creative Commons; Nemotron 3.5 and Parakeet Unified
 use publisher-specific open-weight licenses. The settings app always shows the

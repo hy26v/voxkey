@@ -2244,6 +2244,21 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                         );
                     }
                 }
+                DaemonUpdate::ModelStatusFailed { model_name } => {
+                    model_library_update.set_status(&model_name, "check_failed");
+                    if model_name == transcriber_state_update.borrow().parakeet.model {
+                        apply_model_status(
+                            "check_failed",
+                            &model_name,
+                            &model_status_row_update,
+                            &model_download_progress_update,
+                            &download_button_update,
+                            &delete_model_button_update,
+                            &open_folder_button_update,
+                            expert_mode_update.get(),
+                        );
+                    }
+                }
                 DaemonUpdate::ApiKeyStatus {
                     service,
                     present,
@@ -2751,6 +2766,7 @@ enum ModelStatusAction {
     None,
     Download,
     CancelDownload,
+    RetryCheck,
     OpenFolder,
 }
 
@@ -2760,6 +2776,7 @@ impl ModelStatusAction {
             Self::None => None,
             Self::Download => Some("Download"),
             Self::CancelDownload => Some("Cancel download"),
+            Self::RetryCheck => Some("Retry check"),
             Self::OpenFolder => Some("Open model folder"),
         }
     }
@@ -2803,6 +2820,12 @@ fn model_status_presentation(status: &str, model_name: &str) -> ModelStatusPrese
             subtitle: "Checking model…".to_string(),
             show_download_progress: false,
             action: ModelStatusAction::None,
+            show_delete: false,
+        },
+        "check_failed" => ModelStatusPresentation {
+            subtitle: "Couldn’t check the model files".to_string(),
+            show_download_progress: false,
+            action: ModelStatusAction::RetryCheck,
             show_delete: false,
         },
         _ => ModelStatusPresentation {
@@ -2897,7 +2920,9 @@ fn apply_model_status(
         download_button.set_visible(true);
         if matches!(
             presentation.action,
-            ModelStatusAction::Download | ModelStatusAction::OpenFolder
+            ModelStatusAction::Download
+                | ModelStatusAction::RetryCheck
+                | ModelStatusAction::OpenFolder
         ) {
             download_button.add_css_class("suggested-action");
         }
@@ -5053,6 +5078,20 @@ fn wire_transcriber_actions(
                 handle.send(DaemonCommand::OpenModelsDir);
                 return;
             }
+            if button.label().as_deref() == ModelStatusAction::RetryCheck.label() {
+                apply_model_status(
+                    "checking",
+                    &model_name,
+                    &model_status_row,
+                    &model_download_progress,
+                    button,
+                    &delete_model_button,
+                    &open_folder_button,
+                    expert_mode.get(),
+                );
+                handle.send(DaemonCommand::ModelStatus(model_name));
+                return;
+            }
             apply_model_status(
                 "downloading",
                 &model_name,
@@ -6183,6 +6222,12 @@ mod tests {
         assert!(!deleting.show_download_progress);
         assert_eq!(deleting.action, ModelStatusAction::None);
         assert!(!deleting.show_delete);
+
+        let check_failed = model_status_presentation("check_failed", "parakeet-tdt-0.6b-v3");
+        assert_eq!(check_failed.subtitle, "Couldn’t check the model files");
+        assert_eq!(check_failed.action, ModelStatusAction::RetryCheck);
+        assert!(!check_failed.show_download_progress);
+        assert!(!check_failed.show_delete);
 
         let available = model_status_presentation("available", "parakeet-tdt-0.6b-v3");
         assert!(!available.show_download_progress);

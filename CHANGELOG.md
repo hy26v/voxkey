@@ -14,6 +14,9 @@ from the user's perspective.
 - Settings now stays responsive while checking large local models. Repeated
   checks for the same model share one result, and integrity scans run one at a
   time instead of competing for disk access.
+- Slow model verification no longer fails on the ordinary five-second command
+  deadline. If a check still cannot finish, both model views now offer a clear
+  **Retry check** action instead of remaining disabled.
 - Custom Mistral Batch, Mistral Realtime, and Parakeet server endpoints are now
   checked before they are saved. Settings shows connection progress and keeps
   the address ready to correct or retry when the server cannot be reached.

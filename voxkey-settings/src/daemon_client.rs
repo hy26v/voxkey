@@ -10,6 +10,10 @@ use voxkey_ipc::DaemonProxy;
 const SERVICE_UNIT: &str = "voxkey.service";
 const SERVICE_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const DAEMON_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// A first integrity check may hash a model artifact larger than 650 MB. Give
+// that background-only lane enough time for slow disks without weakening the
+// short deadline used by interactive daemon commands.
+const MODEL_STATUS_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 // Secret Service may display an unlock prompt. Keep it bounded, but do not let
 // the ordinary five-second D-Bus timeout report failure while the daemon is
 // still legitimately completing the keyring operation.
@@ -102,6 +106,9 @@ pub enum DaemonUpdate {
         model_name: String,
         status: String,
     },
+    ModelStatusFailed {
+        model_name: String,
+    },
     /// Reply to HasApiKey with whether a keyring entry exists for this service.
     ApiKeyStatus {
         service: String,
@@ -125,42 +132,71 @@ struct CommandRequest {
 
 type CommandResponse = Option<voxkey_ipc::EndpointCheckResult>;
 
+struct PendingModelStatusRequest {
+    request_id: u64,
+    completions: Vec<tokio::sync::oneshot::Sender<Result<CommandResponse, String>>>,
+}
+
 #[derive(Default)]
 struct PendingModelStatusRequests {
-    completions:
-        HashMap<String, Vec<tokio::sync::oneshot::Sender<Result<CommandResponse, String>>>>,
+    requests: HashMap<String, PendingModelStatusRequest>,
+    next_request_id: u64,
 }
 
 impl PendingModelStatusRequests {
-    /// Register a status request. Returns true only when the caller must start
+    /// Register a status request. Returns an ID only when the caller must start
     /// a D-Bus query; duplicate requests share its eventual result.
     fn queue(
         &mut self,
         model_name: String,
         completion: tokio::sync::oneshot::Sender<Result<CommandResponse, String>>,
-    ) -> bool {
-        match self.completions.entry(model_name) {
-            std::collections::hash_map::Entry::Occupied(mut pending) => {
-                pending.get_mut().push(completion);
-                false
-            }
-            std::collections::hash_map::Entry::Vacant(pending) => {
-                pending.insert(vec![completion]);
-                true
-            }
+    ) -> Option<u64> {
+        if let Some(pending) = self.requests.get_mut(&model_name) {
+            pending.completions.push(completion);
+            return None;
+        }
+
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        let request_id = self.next_request_id;
+        self.requests.insert(
+            model_name,
+            PendingModelStatusRequest {
+                request_id,
+                completions: vec![completion],
+            },
+        );
+        Some(request_id)
+    }
+
+    fn invalidate(&mut self, model_name: &str) {
+        let Some(pending) = self.requests.remove(model_name) else {
+            return;
+        };
+        let message = "Model status check was superseded by a newer model operation".to_string();
+        for completion in pending.completions {
+            let _ = completion.send(Err(message.clone()));
         }
     }
 
     fn finish(
         &mut self,
+        request_id: u64,
         model_name: String,
         result: Result<String, String>,
         update_tx: &tokio::sync::mpsc::Sender<DaemonUpdate>,
     ) {
-        let Some(completions) = self.completions.remove(&model_name) else {
-            tracing::warn!("Received an untracked model status result for {model_name}");
+        let Some(pending) = self.requests.get(&model_name) else {
+            tracing::debug!("Ignoring a superseded model status result for {model_name}");
             return;
         };
+        if pending.request_id != request_id {
+            tracing::debug!("Ignoring an older model status result for {model_name}");
+            return;
+        }
+        let Some(pending) = self.requests.remove(&model_name) else {
+            return;
+        };
+        let completions = pending.completions;
 
         match result {
             Ok(status) => {
@@ -171,10 +207,7 @@ impl PendingModelStatusRequests {
             }
             Err(message) => {
                 tracing::error!("Check model status failed: {message}");
-                let _ = update_tx.try_send(DaemonUpdate::CommandFailed {
-                    operation: "Check model status".to_string(),
-                    message: message.clone(),
-                });
+                let _ = update_tx.try_send(DaemonUpdate::ModelStatusFailed { model_name });
                 for completion in completions {
                     let _ = completion.send(Err(message.clone()));
                 }
@@ -183,23 +216,38 @@ impl PendingModelStatusRequests {
     }
 }
 
+async fn connect_model_status_proxy() -> Result<DaemonProxy<'static>, String> {
+    let builder = zbus::connection::Builder::session()
+        .map_err(|error| error.to_string())?
+        .method_timeout(MODEL_STATUS_CALL_TIMEOUT);
+    let connection = tokio::time::timeout(DAEMON_CALL_TIMEOUT, builder.build())
+        .await
+        .map_err(|_| "Session bus connection for model checks timed out".to_string())?
+        .map_err(|error| error.to_string())?;
+    DaemonProxy::new(&connection)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 async fn query_model_status(
-    proxy: DaemonProxy<'_>,
+    proxy: Arc<tokio::sync::OnceCell<DaemonProxy<'static>>>,
     gate: Arc<tokio::sync::Semaphore>,
+    request_id: u64,
     model_name: String,
-) -> (String, Result<String, String>) {
+) -> (u64, String, Result<String, String>) {
     let result = async {
         let _permit = gate
             .acquire_owned()
             .await
             .map_err(|_| "Model status queue stopped before replying".to_string())?;
+        let proxy = proxy.get_or_try_init(connect_model_status_proxy).await?;
         proxy
             .model_status(&model_name)
             .await
             .map_err(|error| error.to_string())
     }
     .await;
-    (model_name, result)
+    (request_id, model_name, result)
 }
 
 /// Completion of a command submitted to the daemon background thread.
@@ -334,6 +382,15 @@ impl DaemonCommand {
             self,
             Self::SetShortcut(_) | Self::CheckEndpoint(_) | Self::SaveCheckedEndpoint(_)
         )
+    }
+
+    fn supersedes_model_status(&self) -> Option<&str> {
+        match self {
+            Self::DownloadModel(model_name)
+            | Self::CancelModelDownload(model_name)
+            | Self::DeleteModel(model_name) => Some(model_name),
+            _ => None,
+        }
     }
 }
 
@@ -783,6 +840,7 @@ async fn try_connect(
     let mut channels_stream = proxy.receive_channels_changed().await;
     let mut download_stream = proxy.receive_download_progress().await?;
     let model_status_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let model_status_proxy = Arc::new(tokio::sync::OnceCell::new());
     let mut model_status_tasks = FuturesUnordered::new();
     let mut pending_model_status = PendingModelStatusRequests::default();
 
@@ -899,16 +957,18 @@ async fn try_connect(
             }
             Some(signal) = download_stream.next() => {
                 if let Ok(args) = signal.args() {
+                    let model_name = args.model_name.to_string();
+                    pending_model_status.invalidate(&model_name);
                     let _ = update_tx.try_send(DaemonUpdate::DownloadProgress {
-                        model_name: args.model_name.to_string(),
+                        model_name,
                         percent: args.percent,
                     });
                 }
             }
-            Some((model_name, result)) = model_status_tasks.next(),
+            Some((request_id, model_name, result)) = model_status_tasks.next(),
                 if !model_status_tasks.is_empty() =>
             {
-                pending_model_status.finish(model_name, result, update_tx);
+                pending_model_status.finish(request_id, model_name, result, update_tx);
             }
             command = cmd_rx.recv() => {
                 match command {
@@ -916,15 +976,21 @@ async fn try_connect(
                         command: DaemonCommand::ModelStatus(model_name),
                         completion,
                     }) => {
-                        if pending_model_status.queue(model_name.clone(), completion) {
+                        if let Some(request_id) =
+                            pending_model_status.queue(model_name.clone(), completion)
+                        {
                             model_status_tasks.push(query_model_status(
-                                proxy.clone(),
+                                model_status_proxy.clone(),
                                 model_status_gate.clone(),
+                                request_id,
                                 model_name,
                             ));
                         }
                     }
                     Some(request) => {
+                        if let Some(model_name) = request.command.supersedes_model_status() {
+                            pending_model_status.invalidate(model_name);
+                        }
                         let operation = request.command.operation().to_string();
                         let rollback_property = request.command.rollback_property();
                         let reports_failure_inline = request.command.reports_failure_inline();
@@ -1239,9 +1305,16 @@ mod tests {
         let (second_tx, second_rx) = tokio::sync::oneshot::channel();
         let (update_tx, mut update_rx) = tokio::sync::mpsc::channel(2);
 
-        assert!(pending.queue("model".to_string(), first_tx));
-        assert!(!pending.queue("model".to_string(), second_tx));
-        pending.finish("model".to_string(), Ok("available".to_string()), &update_tx);
+        let request_id = pending
+            .queue("model".to_string(), first_tx)
+            .expect("the first request must start the shared query");
+        assert_eq!(pending.queue("model".to_string(), second_tx), None);
+        pending.finish(
+            request_id,
+            "model".to_string(),
+            Ok("available".to_string()),
+            &update_tx,
+        );
 
         assert!(matches!(first_rx.await.unwrap(), Ok(None)));
         assert!(matches!(second_rx.await.unwrap(), Ok(None)));
@@ -1260,9 +1333,12 @@ mod tests {
         let (second_tx, second_rx) = tokio::sync::oneshot::channel();
         let (update_tx, mut update_rx) = tokio::sync::mpsc::channel(2);
 
-        assert!(pending.queue("model".to_string(), first_tx));
-        assert!(!pending.queue("model".to_string(), second_tx));
+        let request_id = pending
+            .queue("model".to_string(), first_tx)
+            .expect("the first request must start the shared query");
+        assert_eq!(pending.queue("model".to_string(), second_tx), None);
         pending.finish(
+            request_id,
             "model".to_string(),
             Err("status unavailable".to_string()),
             &update_tx,
@@ -1272,10 +1348,74 @@ mod tests {
         assert_eq!(second_rx.await.unwrap().unwrap_err(), "status unavailable");
         assert!(matches!(
             update_rx.recv().await,
-            Some(DaemonUpdate::CommandFailed { operation, message })
-                if operation == "Check model status" && message == "status unavailable"
+            Some(DaemonUpdate::ModelStatusFailed { model_name }) if model_name == "model"
         ));
         assert!(update_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_superseded_model_status_result_cannot_complete_a_newer_request() {
+        let mut pending = PendingModelStatusRequests::default();
+        let (old_tx, old_rx) = tokio::sync::oneshot::channel();
+        let (update_tx, mut update_rx) = tokio::sync::mpsc::channel(2);
+        let old_request_id = pending
+            .queue("model".to_string(), old_tx)
+            .expect("the first request must start a query");
+
+        pending.invalidate("model");
+        assert!(old_rx.await.unwrap().is_err());
+        let (new_tx, mut new_rx) = tokio::sync::oneshot::channel();
+        let new_request_id = pending
+            .queue("model".to_string(), new_tx)
+            .expect("an invalidated request must be replaceable");
+        assert_ne!(old_request_id, new_request_id);
+
+        pending.finish(
+            old_request_id,
+            "model".to_string(),
+            Ok("available".to_string()),
+            &update_tx,
+        );
+        assert!(matches!(
+            new_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(update_rx.try_recv().is_err());
+
+        pending.finish(
+            new_request_id,
+            "model".to_string(),
+            Ok("downloading".to_string()),
+            &update_tx,
+        );
+        assert!(matches!(new_rx.await.unwrap(), Ok(None)));
+        assert!(matches!(
+            update_rx.recv().await,
+            Some(DaemonUpdate::ModelStatusResult { model_name, status })
+                if model_name == "model" && status == "downloading"
+        ));
+    }
+
+    #[test]
+    fn model_integrity_checks_have_a_separate_bounded_deadline() {
+        assert!(MODEL_STATUS_CALL_TIMEOUT > DAEMON_CALL_TIMEOUT);
+        assert!(MODEL_STATUS_CALL_TIMEOUT >= std::time::Duration::from_secs(60));
+        assert!(MODEL_STATUS_CALL_TIMEOUT <= std::time::Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn model_file_operations_supersede_pending_status_results() {
+        for command in [
+            DaemonCommand::DownloadModel("model".to_string()),
+            DaemonCommand::CancelModelDownload("model".to_string()),
+            DaemonCommand::DeleteModel("model".to_string()),
+        ] {
+            assert_eq!(command.supersedes_model_status(), Some("model"));
+        }
+        assert_eq!(
+            DaemonCommand::ModelStatus("model".to_string()).supersedes_model_status(),
+            None
+        );
     }
 
     #[tokio::test]

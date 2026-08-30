@@ -10,6 +10,8 @@ use libadwaita as adw;
 
 use crate::daemon_client::{DaemonCommand, DaemonHandle};
 
+const RETRY_MODEL_STATUS_LABEL: &str = "Retry check";
+
 #[derive(Clone)]
 struct ModelRow {
     selected: gtk4::Image,
@@ -24,6 +26,8 @@ impl ModelRow {
         self.progress.set_visible(false);
         self.action.remove_css_class("destructive-action");
         self.action.remove_css_class("suggested-action");
+        self.status_icon.remove_css_class("success");
+        self.status_icon.remove_css_class("warning");
         match status {
             "available" => {
                 self.status.set_title("Ready on this computer");
@@ -42,7 +46,6 @@ impl ModelRow {
                     .set_subtitle("Voxkey verifies each file before using it");
                 self.status_icon
                     .set_icon_name(Some("folder-download-symbolic"));
-                self.status_icon.remove_css_class("success");
                 self.progress.set_fraction(0.0);
                 self.progress.set_visible(true);
                 self.action.set_label("Cancel download");
@@ -54,7 +57,6 @@ impl ModelRow {
                     .set_subtitle("Removing the incomplete file safely");
                 self.status_icon
                     .set_icon_name(Some("process-stop-symbolic"));
-                self.status_icon.remove_css_class("success");
                 self.action.set_label("Cancelling");
                 self.action.set_sensitive(false);
             }
@@ -62,7 +64,6 @@ impl ModelRow {
                 self.status.set_title("Deleting model…");
                 self.status.set_subtitle("Removing downloaded files");
                 self.status_icon.set_icon_name(Some("user-trash-symbolic"));
-                self.status_icon.remove_css_class("success");
                 self.action.set_label("Deleting");
                 self.action.set_sensitive(false);
             }
@@ -72,9 +73,19 @@ impl ModelRow {
                     .set_subtitle("Verifying the downloaded model files");
                 self.status_icon
                     .set_icon_name(Some("content-loading-symbolic"));
-                self.status_icon.remove_css_class("success");
                 self.action.set_label("Checking");
                 self.action.set_sensitive(false);
+            }
+            "check_failed" => {
+                self.status.set_title("Couldn’t check installation");
+                self.status
+                    .set_subtitle("Try again to verify the downloaded model files");
+                self.status_icon
+                    .set_icon_name(Some("dialog-warning-symbolic"));
+                self.status_icon.add_css_class("warning");
+                self.action.set_label(RETRY_MODEL_STATUS_LABEL);
+                self.action.add_css_class("suggested-action");
+                self.action.set_sensitive(true);
             }
             _ => {
                 self.status.set_title("Not downloaded");
@@ -82,7 +93,6 @@ impl ModelRow {
                     .set_subtitle("Download once, then dictate without a network connection");
                 self.status_icon
                     .set_icon_name(Some("folder-download-symbolic"));
-                self.status_icon.remove_css_class("success");
                 self.action.set_label("Download");
                 self.action.add_css_class("suggested-action");
                 self.action.set_sensitive(true);
@@ -231,6 +241,9 @@ impl ModelLibrary {
                             )));
                         }
                     });
+                } else if button.label().as_deref() == Some(RETRY_MODEL_STATUS_LABEL) {
+                    action_widgets.set_status("checking");
+                    handle.send(DaemonCommand::ModelStatus(model.id.to_string()));
                 } else if button.label().as_deref() == Some("Delete") {
                     let dialog = adw::AlertDialog::builder()
                         .heading(format!("Delete {}?", model.name))
