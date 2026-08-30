@@ -29,8 +29,9 @@ replacement, or the GNOME IBus input path.
 - **Text injection** directly at the cursor in any focused application
 - **Multiple transcription backends:**
   - **Downloadable model library** with NVIDIA Nemotron 3.5, Parakeet Unified,
-    and Parakeet v2/v3. Voxkey pins and verifies every file, and the streaming
-    models show text while you speak without sending audio away.
+    and Parakeet v2/v3. Voxkey pins and verifies every file, lets you cancel a
+    large download safely, and uses the streaming models to show text while you
+    speak without sending audio away.
   - [whisper.cpp](https://github.com/ggerganov/whisper.cpp) - local, offline
   - [Mistral](https://docs.mistral.ai/) - cloud batch API
   - [Mistral Realtime](https://docs.mistral.ai/) - cloud streaming via WebSocket (text appears as you speak)

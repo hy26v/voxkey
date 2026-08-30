@@ -8,12 +8,14 @@ const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MODEL_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadStatus {
     /// Download in progress. Percent is 0-100 across all files.
     InProgress(u8),
     /// Download completed successfully.
     Complete,
+    /// Download was explicitly cancelled by the user.
+    Cancelled,
     /// Download failed.
     Failed(String),
 }
@@ -23,8 +25,29 @@ impl DownloadStatus {
         match self {
             Self::InProgress(percent) => Some((*percent).min(99)),
             Self::Complete => Some(100),
-            Self::Failed(_) => None,
+            Self::Cancelled | Self::Failed(_) => None,
         }
+    }
+}
+
+/// A running model transfer and the status channel observed by D-Bus clients.
+///
+/// Cancelling aborts only the transfer task. A separate monitor owns the
+/// terminal status sender, so even a task cancelled before its first poll is
+/// reported deterministically as `Cancelled`.
+#[derive(Clone)]
+pub struct DownloadHandle {
+    status: watch::Receiver<DownloadStatus>,
+    abort: tokio::task::AbortHandle,
+}
+
+impl DownloadHandle {
+    pub fn status(&self) -> watch::Receiver<DownloadStatus> {
+        self.status.clone()
+    }
+
+    pub fn cancel(&self) {
+        self.abort.abort();
     }
 }
 
@@ -110,27 +133,42 @@ impl Drop for PartialDownload {
     }
 }
 
-/// Start downloading a model. Returns a watch receiver for progress updates.
-/// The download runs on a tokio task.
-pub fn start_download(model_name: String) -> watch::Receiver<DownloadStatus> {
-    let (tx, rx) = watch::channel(DownloadStatus::InProgress(0));
+type DownloadError = Box<dyn std::error::Error + Send + Sync>;
+type DownloadResult = Result<(), DownloadError>;
+
+fn track_download(
+    transfer: tokio::task::JoinHandle<DownloadResult>,
+    tx: watch::Sender<DownloadStatus>,
+    status: watch::Receiver<DownloadStatus>,
+) -> DownloadHandle {
+    let abort = transfer.abort_handle();
     tokio::spawn(async move {
-        match download_model(&model_name, &tx).await {
-            Ok(()) => {
-                let _ = tx.send(DownloadStatus::Complete);
+        let terminal = match transfer.await {
+            Ok(Ok(())) => DownloadStatus::Complete,
+            Ok(Err(error)) => DownloadStatus::Failed(error.to_string()),
+            Err(error) if error.is_cancelled() => DownloadStatus::Cancelled,
+            Err(error) => {
+                DownloadStatus::Failed(format!("model download task stopped unexpectedly: {error}"))
             }
-            Err(e) => {
-                let _ = tx.send(DownloadStatus::Failed(e.to_string()));
-            }
-        }
+        };
+        let _ = tx.send(terminal);
     });
-    rx
+    DownloadHandle { status, abort }
+}
+
+/// Start downloading a model. Returns a cancellable handle whose watch
+/// receiver publishes progress and exactly one terminal state.
+pub fn start_download(model_name: String) -> DownloadHandle {
+    let (tx, rx) = watch::channel(DownloadStatus::InProgress(0));
+    let progress = tx.clone();
+    let transfer = tokio::spawn(async move { download_model(&model_name, &progress).await });
+    track_download(transfer, tx, rx)
 }
 
 async fn download_model(
     model_name: &str,
     progress: &watch::Sender<DownloadStatus>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> DownloadResult {
     let base = base_url(model_name)?;
     let manifest = crate::models::manifest(model_name)
         .ok_or_else(|| format!("Unknown model: {model_name}"))?;
@@ -149,8 +187,14 @@ async fn download_model(
         let url = format!("{base}/{file_name}");
         let dest_path = dest_dir.join(file_name);
 
-        // Skip already-downloaded files
-        if can_skip_download(&dest_path, Some(artifact)) {
+        // Hashing a large existing artifact is blocking work. Keep it off the
+        // async worker so D-Bus cancellation remains responsive while a retry
+        // checks which verified files it can reuse.
+        let path_to_verify = dest_path.clone();
+        let already_downloaded =
+            tokio::task::spawn_blocking(move || can_skip_download(&path_to_verify, Some(artifact)))
+                .await?;
+        if already_downloaded {
             completed_bytes = completed_bytes.saturating_add(artifact.size);
             if let Some(percent) = download_progress_percent(completed_bytes, total_bytes, 0) {
                 let _ = progress.send(DownloadStatus::InProgress(percent));
@@ -625,9 +669,39 @@ mod tests {
     fn only_completed_downloads_report_one_hundred_percent() {
         assert_eq!(DownloadStatus::InProgress(100).reported_percent(), Some(99));
         assert_eq!(DownloadStatus::Complete.reported_percent(), Some(100));
+        assert_eq!(DownloadStatus::Cancelled.reported_percent(), None);
         assert_eq!(
             DownloadStatus::Failed("network error".to_string()).reported_percent(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_running_transfer_reports_cancelled_after_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let partial_path = temp.path().join("encoder.int8.part");
+        let transfer_path = partial_path.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let transfer = tokio::spawn(async move {
+            std::fs::write(&transfer_path, b"incomplete model bytes").unwrap();
+            let _partial = PartialDownload::new(transfer_path);
+            let _ = entered_tx.send(());
+            std::future::pending::<DownloadResult>().await
+        });
+        let (tx, mut status) = watch::channel(DownloadStatus::InProgress(0));
+        let download = track_download(transfer, tx, status.clone());
+        entered_rx.await.unwrap();
+
+        download.cancel();
+        tokio::time::timeout(Duration::from_secs(1), status.changed())
+            .await
+            .expect("cancelled transfer did not publish a terminal status")
+            .unwrap();
+
+        assert_eq!(*status.borrow(), DownloadStatus::Cancelled);
+        assert!(
+            !partial_path.exists(),
+            "cancellation was reported before its partial file was removed"
         );
     }
 

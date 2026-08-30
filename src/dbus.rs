@@ -13,6 +13,7 @@ use crate::model_download::DownloadStatus;
 use crate::state::State;
 
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MODEL_DOWNLOAD_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// User actions accepted by the daemon's serialized session event loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,9 +96,31 @@ struct SharedStateInner {
     last_transcript_entry_id: Option<u64>,
     transcription_history: Vec<voxkey_ipc::HistoryEntry>,
     last_error: String,
-    download_watchers: HashMap<String, watch::Receiver<DownloadStatus>>,
+    model_downloads: HashMap<String, ActiveModelDownload>,
     settings_lifecycle_generation: u64,
     settings_lifecycle_attached: bool,
+}
+
+struct ActiveModelDownload {
+    status: watch::Receiver<DownloadStatus>,
+    handle: Option<crate::model_download::DownloadHandle>,
+}
+
+impl ActiveModelDownload {
+    fn managed(handle: crate::model_download::DownloadHandle) -> Self {
+        Self {
+            status: handle.status(),
+            handle: Some(handle),
+        }
+    }
+
+    #[cfg(test)]
+    fn unmanaged(status: watch::Receiver<DownloadStatus>) -> Self {
+        Self {
+            status,
+            handle: None,
+        }
+    }
 }
 
 impl SharedState {
@@ -125,7 +148,7 @@ impl SharedState {
                 last_transcript_entry_id,
                 transcription_history,
                 last_error: String::new(),
-                download_watchers: HashMap::new(),
+                model_downloads: HashMap::new(),
                 settings_lifecycle_generation: 0,
                 settings_lifecycle_attached: false,
             })),
@@ -567,7 +590,9 @@ impl SharedState {
         &self,
         model_name: String,
     ) -> (watch::Receiver<DownloadStatus>, bool) {
-        self.start_model_download_with(model_name, crate::model_download::start_download)
+        self.start_model_download_with(model_name, |model_name| {
+            ActiveModelDownload::managed(crate::model_download::start_download(model_name))
+        })
     }
 
     fn start_model_download_with<F>(
@@ -576,37 +601,58 @@ impl SharedState {
         start: F,
     ) -> (watch::Receiver<DownloadStatus>, bool)
     where
-        F: FnOnce(String) -> watch::Receiver<DownloadStatus>,
+        F: FnOnce(String) -> ActiveModelDownload,
     {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(running) = inner.download_watchers.get(&model_name)
-            && matches!(*running.borrow(), DownloadStatus::InProgress(_))
+        if let Some(running) = inner.model_downloads.get(&model_name)
+            && matches!(*running.status.borrow(), DownloadStatus::InProgress(_))
         {
             tracing::info!("Model {model_name} is already downloading; following that download");
-            return (running.clone(), false);
+            return (running.status.clone(), false);
         }
 
-        let rx = start(model_name.clone());
-        inner.download_watchers.insert(model_name, rx.clone());
-        (rx, true)
+        let download = start(model_name.clone());
+        let status = download.status.clone();
+        inner.model_downloads.insert(model_name, download);
+        (status, true)
     }
 
     pub fn model_download_status(&self, model_name: &str) -> Option<DownloadStatus> {
         let inner = self.inner.lock().unwrap();
         inner
-            .download_watchers
+            .model_downloads
             .get(model_name)
-            .map(|rx| rx.borrow().clone())
+            .map(|download| download.status.borrow().clone())
+    }
+
+    fn cancel_model_download(
+        &self,
+        model_name: &str,
+    ) -> Result<watch::Receiver<DownloadStatus>, String> {
+        let inner = self.inner.lock().unwrap();
+        let download = inner
+            .model_downloads
+            .get(model_name)
+            .ok_or_else(|| format!("No download is running for model '{model_name}'"))?;
+        if !matches!(*download.status.borrow(), DownloadStatus::InProgress(_)) {
+            return Err(format!("No download is running for model '{model_name}'"));
+        }
+        let handle = download
+            .handle
+            .as_ref()
+            .ok_or_else(|| format!("The download for model '{model_name}' cannot be cancelled"))?;
+        handle.cancel();
+        Ok(download.status.clone())
     }
 
     fn finish_model_download(&self, model_name: &str, finished: &watch::Receiver<DownloadStatus>) {
         let mut inner = self.inner.lock().unwrap();
         let is_current = inner
-            .download_watchers
+            .model_downloads
             .get(model_name)
-            .is_some_and(|current| current.same_channel(finished));
+            .is_some_and(|current| current.status.same_channel(finished));
         if is_current {
-            inner.download_watchers.remove(model_name);
+            inner.model_downloads.remove(model_name);
         }
     }
 
@@ -617,9 +663,9 @@ impl SharedState {
         let inner = self.inner.lock().unwrap();
         if matches!(
             inner
-                .download_watchers
+                .model_downloads
                 .get(model_name)
-                .map(|watcher| watcher.borrow().clone()),
+                .map(|download| download.status.borrow().clone()),
             Some(DownloadStatus::InProgress(_))
         ) {
             return Err(format!(
@@ -627,6 +673,30 @@ impl SharedState {
             ));
         }
         delete(model_name).map_err(|error| error.to_string())
+    }
+}
+
+async fn await_model_download_cancellation(
+    mut status: watch::Receiver<DownloadStatus>,
+) -> Result<(), String> {
+    loop {
+        match status.borrow().clone() {
+            DownloadStatus::InProgress(_) => {}
+            DownloadStatus::Cancelled => return Ok(()),
+            DownloadStatus::Complete => {
+                return Err("The model finished downloading before it could be cancelled".into());
+            }
+            DownloadStatus::Failed(message) => {
+                return Err(format!(
+                    "The model download stopped with an error before it could be cancelled: {message}"
+                ));
+            }
+        }
+
+        tokio::time::timeout(MODEL_DOWNLOAD_CANCEL_TIMEOUT, status.changed())
+            .await
+            .map_err(|_| "Timed out while waiting for the model download to stop".to_string())?
+            .map_err(|_| "The model download stopped without reporting its result".to_string())?;
     }
 }
 
@@ -1503,6 +1573,10 @@ impl DaemonInterface {
                         );
                         break;
                     }
+                    DownloadStatus::Cancelled => {
+                        tracing::info!("Model download cancelled: {model_name}");
+                        break;
+                    }
                     DownloadStatus::Failed(msg) => {
                         tracing::error!("Model download failed: {msg}");
                         shared.set_last_error(format!("Download failed: {msg}"));
@@ -1515,6 +1589,18 @@ impl DaemonInterface {
         });
 
         Ok(())
+    }
+
+    async fn cancel_model_download(&self, model_name: &str) -> zbus::fdo::Result<()> {
+        crate::model_download::validate_model_name(model_name)
+            .map_err(zbus::fdo::Error::InvalidArgs)?;
+        let status = self
+            .shared
+            .cancel_model_download(model_name)
+            .map_err(zbus::fdo::Error::Failed)?;
+        await_model_download_cancellation(status)
+            .await
+            .map_err(zbus::fdo::Error::Failed)
     }
 
     async fn delete_model(&self, model_name: &str) -> zbus::fdo::Result<()> {
@@ -1545,7 +1631,13 @@ impl DaemonInterface {
             return Ok(match status {
                 DownloadStatus::InProgress(_) => "downloading".to_string(),
                 DownloadStatus::Complete => "available".to_string(),
-                DownloadStatus::Failed(_) => "not_downloaded".to_string(),
+                DownloadStatus::Cancelled | DownloadStatus::Failed(_) => {
+                    if crate::models::is_model_available(model_name) {
+                        "available".to_string()
+                    } else {
+                        "not_downloaded".to_string()
+                    }
+                }
             });
         }
         if crate::models::is_model_available(model_name) {
@@ -1799,12 +1891,10 @@ mod tests {
     fn a_repeated_download_request_joins_the_one_already_running() {
         let state = SharedState::new(Config::default());
         let (progress, watcher) = watch::channel(DownloadStatus::InProgress(42));
-        state
-            .inner
-            .lock()
-            .unwrap()
-            .download_watchers
-            .insert("parakeet-tdt-0.6b-v3".to_string(), watcher);
+        state.inner.lock().unwrap().model_downloads.insert(
+            "parakeet-tdt-0.6b-v3".to_string(),
+            ActiveModelDownload::unmanaged(watcher),
+        );
 
         let (joined, _) = state.start_model_download("parakeet-tdt-0.6b-v3".to_string());
 
@@ -1816,17 +1906,48 @@ mod tests {
     fn a_joined_download_does_not_start_a_second_notification_monitor() {
         let state = SharedState::new(Config::default());
         let (_progress, watcher) = watch::channel(DownloadStatus::InProgress(42));
-        state
-            .inner
-            .lock()
-            .unwrap()
-            .download_watchers
-            .insert("parakeet-tdt-0.6b-v3".to_string(), watcher);
+        state.inner.lock().unwrap().model_downloads.insert(
+            "parakeet-tdt-0.6b-v3".to_string(),
+            ActiveModelDownload::unmanaged(watcher),
+        );
 
         let (_joined, starts_monitor) =
             state.start_model_download("parakeet-tdt-0.6b-v3".to_string());
 
         assert!(!starts_monitor);
+    }
+
+    #[test]
+    fn cancelling_requires_a_running_download() {
+        let state = SharedState::new(Config::default());
+
+        let error = state
+            .cancel_model_download("parakeet-tdt-0.6b-v3")
+            .expect_err("an idle cancellation request must be rejected");
+
+        assert!(error.contains("No download is running"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_the_transfer_terminal_state() {
+        let (progress, status) = watch::channel(DownloadStatus::InProgress(73));
+        let waiter = tokio::spawn(await_model_download_cancellation(status));
+
+        tokio::task::yield_now().await;
+        progress.send(DownloadStatus::Cancelled).unwrap();
+
+        assert_eq!(waiter.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_completed_transfer_is_not_reported_as_cancelled() {
+        let (_progress, status) = watch::channel(DownloadStatus::Complete);
+
+        let error = await_model_download_cancellation(status)
+            .await
+            .expect_err("completion won the cancellation race");
+
+        assert!(error.contains("finished downloading"), "{error}");
     }
 
     /// A download that already finished must not block a later attempt, so a
@@ -1839,10 +1960,13 @@ mod tests {
             .inner
             .lock()
             .unwrap()
-            .download_watchers
+            .model_downloads
             // Unknown to the downloader, so the retry fails immediately
             // instead of reaching the network.
-            .insert("voxkey-unknown-model".to_string(), watcher);
+            .insert(
+                "voxkey-unknown-model".to_string(),
+                ActiveModelDownload::unmanaged(watcher),
+            );
 
         let (restarted, _) = state.start_model_download("voxkey-unknown-model".to_string());
 
@@ -1859,12 +1983,10 @@ mod tests {
         let state = SharedState::new(Config::default());
         let (_old_tx, old_rx) = watch::channel(DownloadStatus::Complete);
         let (_new_tx, new_rx) = watch::channel(DownloadStatus::InProgress(0));
-        state
-            .inner
-            .lock()
-            .unwrap()
-            .download_watchers
-            .insert("model".to_string(), new_rx.clone());
+        state.inner.lock().unwrap().model_downloads.insert(
+            "model".to_string(),
+            ActiveModelDownload::unmanaged(new_rx.clone()),
+        );
 
         state.finish_model_download("model", &old_rx);
 
@@ -1872,10 +1994,10 @@ mod tests {
             .inner
             .lock()
             .unwrap()
-            .download_watchers
+            .model_downloads
             .get("model")
-            .cloned();
-        assert!(current.is_some_and(|watcher| watcher.same_channel(&new_rx)));
+            .map(|download| download.status.clone());
+        assert!(current.is_some_and(|status| status.same_channel(&new_rx)));
     }
 
     #[test]
@@ -1896,7 +2018,7 @@ mod tests {
                         open = wake.wait(open).unwrap();
                     }
                     let (_progress, watcher) = watch::channel(DownloadStatus::InProgress(0));
-                    watcher
+                    ActiveModelDownload::unmanaged(watcher)
                 })
             })
         };
@@ -2048,7 +2170,7 @@ mod tests {
             downloading_state.start_model_download_with("model".to_string(), move |_| {
                 download_tx.send(()).unwrap();
                 let (_progress, watcher) = watch::channel(DownloadStatus::InProgress(0));
-                watcher
+                ActiveModelDownload::unmanaged(watcher)
             })
         });
 

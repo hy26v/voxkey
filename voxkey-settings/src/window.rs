@@ -1174,12 +1174,15 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             insertion_group.set_visible(active);
             advanced_group.set_visible(active);
             recording_format_group.set_visible(active);
-            let model_name = transcriber_state.borrow().parakeet.model.clone();
-            open_folder_button.set_visible(parakeet_model_folder_icon_visible(
-                active,
-                &model_name,
-                download_button.is_visible(),
-            ));
+            let current_action = if download_button.is_visible()
+                && download_button.label().as_deref() == ModelStatusAction::OpenFolder.label()
+            {
+                ModelStatusAction::OpenFolder
+            } else {
+                ModelStatusAction::None
+            };
+            open_folder_button
+                .set_visible(parakeet_model_folder_icon_visible(active, current_action));
             apply_transcriber_visibility(
                 &transcriber_state.borrow(),
                 active,
@@ -2196,11 +2199,22 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                     percent,
                 } => {
                     model_library_update.set_progress(&model_name, percent);
-                    if model_name == transcriber_state_update.borrow().parakeet.model {
+                    if model_name == transcriber_state_update.borrow().parakeet.model
+                        && model_status_row_update.subtitle().as_deref()
+                            != Some("Cancelling download…")
+                    {
+                        apply_model_status(
+                            "downloading",
+                            &model_name,
+                            &model_status_row_update,
+                            &model_download_progress_update,
+                            &download_button_update,
+                            &delete_model_button_update,
+                            &open_folder_button_update,
+                            expert_mode_update.get(),
+                        );
                         model_status_row_update.set_subtitle(&format!("Downloading… {percent}%"));
                         update_model_download_progress(&model_download_progress_update, percent);
-                        download_button_update.set_visible(false);
-                        delete_model_button_update.set_visible(false);
                         if percent >= 100 {
                             apply_model_status(
                                 "available",
@@ -2266,7 +2280,10 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                     let detail = sanitize_command_failure(&message);
                     toast_overlay_update
                         .add_toast(adw::Toast::new(&format!("{operation} failed. {detail}")));
-                    if operation == "Download model" {
+                    if matches!(
+                        operation.as_str(),
+                        "Download model" | "Cancel model download"
+                    ) {
                         model_library_update.request_statuses(&handle_update);
                     }
                 }
@@ -2729,11 +2746,30 @@ fn audio_device_presentation(devices: &[String], selected_device: &str) -> Audio
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelStatusAction {
+    None,
+    Download,
+    CancelDownload,
+    OpenFolder,
+}
+
+impl ModelStatusAction {
+    fn label(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Download => Some("Download"),
+            Self::CancelDownload => Some("Cancel download"),
+            Self::OpenFolder => Some("Open model folder"),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ModelStatusPresentation {
     subtitle: String,
     show_download_progress: bool,
-    show_setup_action: bool,
+    action: ModelStatusAction,
     show_delete: bool,
 }
 
@@ -2742,32 +2778,42 @@ fn model_status_presentation(status: &str, model_name: &str) -> ModelStatusPrese
         "available" => ModelStatusPresentation {
             subtitle: "Available on this computer".to_string(),
             show_download_progress: false,
-            show_setup_action: false,
+            action: ModelStatusAction::None,
             show_delete: true,
         },
         "downloading" => ModelStatusPresentation {
             subtitle: "Downloading…".to_string(),
             show_download_progress: true,
-            show_setup_action: false,
+            action: ModelStatusAction::CancelDownload,
+            show_delete: false,
+        },
+        "cancelling" => ModelStatusPresentation {
+            subtitle: "Cancelling download…".to_string(),
+            show_download_progress: false,
+            action: ModelStatusAction::None,
             show_delete: false,
         },
         "deleting" => ModelStatusPresentation {
             subtitle: "Deleting model…".to_string(),
             show_download_progress: false,
-            show_setup_action: false,
+            action: ModelStatusAction::None,
             show_delete: false,
         },
         "checking" => ModelStatusPresentation {
             subtitle: "Checking model…".to_string(),
             show_download_progress: false,
-            show_setup_action: false,
+            action: ModelStatusAction::None,
             show_delete: false,
         },
         _ => ModelStatusPresentation {
             subtitle: parakeet_model_download_description(model_name)
                 .unwrap_or_else(|| "Custom model files not found".to_string()),
             show_download_progress: false,
-            show_setup_action: true,
+            action: if parakeet_model_can_download(model_name) {
+                ModelStatusAction::Download
+            } else {
+                ModelStatusAction::OpenFolder
+            },
             show_delete: false,
         },
     }
@@ -2790,18 +2836,14 @@ fn parakeet_model_download_description(model_name: &str) -> Option<String> {
 
 fn parakeet_model_action_label(model_name: &str) -> &'static str {
     if parakeet_model_can_download(model_name) {
-        "Download"
+        ModelStatusAction::Download.label().unwrap()
     } else {
-        "Open model folder"
+        ModelStatusAction::OpenFolder.label().unwrap()
     }
 }
 
-fn parakeet_model_folder_icon_visible(
-    expert_mode: bool,
-    model_name: &str,
-    setup_action_visible: bool,
-) -> bool {
-    expert_mode && !(setup_action_visible && !parakeet_model_can_download(model_name))
+fn parakeet_model_folder_icon_visible(expert_mode: bool, action: ModelStatusAction) -> bool {
+    expert_mode && action != ModelStatusAction::OpenFolder
 }
 
 fn parakeet_model_display_name(model_name: &str) -> &str {
@@ -2848,12 +2890,24 @@ fn apply_model_status(
         download_progress.set_tooltip_text(Some("Model download starting"));
     }
     download_progress.set_visible(presentation.show_download_progress);
-    download_button.set_visible(presentation.show_setup_action);
+    download_button.remove_css_class("suggested-action");
+    download_button.remove_css_class("destructive-action");
+    if let Some(label) = presentation.action.label() {
+        download_button.set_label(label);
+        download_button.set_visible(true);
+        if matches!(
+            presentation.action,
+            ModelStatusAction::Download | ModelStatusAction::OpenFolder
+        ) {
+            download_button.add_css_class("suggested-action");
+        }
+    } else {
+        download_button.set_visible(false);
+    }
     delete_button.set_visible(presentation.show_delete);
     open_folder_button.set_visible(parakeet_model_folder_icon_visible(
         expert_mode,
-        model_name,
-        presentation.show_setup_action,
+        presentation.action,
     ));
 }
 
@@ -4965,9 +5019,37 @@ fn wire_transcriber_actions(
         let delete_model_button = delete_model_button.clone();
         let open_folder_button = open_folder_button.clone();
         let expert_mode = expert_mode.clone();
+        let toast_overlay = toast_overlay.clone();
         download_button.connect_clicked(move |button| {
             let model_name = state.borrow().parakeet.model.clone();
-            if !parakeet_model_can_download(&model_name) {
+            if button.label().as_deref() == ModelStatusAction::CancelDownload.label() {
+                apply_model_status(
+                    "cancelling",
+                    &model_name,
+                    &model_status_row,
+                    &model_download_progress,
+                    button,
+                    &delete_model_button,
+                    &open_folder_button,
+                    expert_mode.get(),
+                );
+                let completion =
+                    handle.send(DaemonCommand::CancelModelDownload(model_name.clone()));
+                let handle = handle.clone();
+                let toast_overlay = toast_overlay.clone();
+                glib::spawn_future_local(async move {
+                    let cancelled = completion.wait().await.is_ok();
+                    handle.send(DaemonCommand::ModelStatus(model_name.clone()));
+                    if cancelled {
+                        toast_overlay.add_toast(adw::Toast::new(&format!(
+                            "{} download cancelled",
+                            parakeet_model_display_name(&model_name)
+                        )));
+                    }
+                });
+                return;
+            }
+            if button.label().as_deref() == ModelStatusAction::OpenFolder.label() {
                 handle.send(DaemonCommand::OpenModelsDir);
                 return;
             }
@@ -6072,43 +6154,39 @@ mod tests {
         assert_eq!(local_parakeet_model_name(&config), None);
 
         let missing = model_status_presentation("not_downloaded", "parakeet-tdt-0.6b-v3");
-        assert!(missing.show_setup_action);
+        assert_eq!(missing.action, ModelStatusAction::Download);
         assert!(!missing.show_delete);
         assert_eq!(missing.subtitle, "Not downloaded · 670 MB download");
 
         let custom_missing = model_status_presentation("not_downloaded", "my-custom-model");
-        assert!(custom_missing.show_setup_action);
+        assert_eq!(custom_missing.action, ModelStatusAction::OpenFolder);
         assert_eq!(custom_missing.subtitle, "Custom model files not found");
         assert!(!parakeet_model_folder_icon_visible(
             true,
-            "my-custom-model",
-            custom_missing.show_setup_action,
+            custom_missing.action,
         ));
-        assert!(parakeet_model_folder_icon_visible(
-            true,
-            "parakeet-tdt-0.6b-v3",
-            missing.show_setup_action,
-        ));
-        assert!(!parakeet_model_folder_icon_visible(
-            false,
-            "parakeet-tdt-0.6b-v3",
-            missing.show_setup_action,
-        ));
+        assert!(parakeet_model_folder_icon_visible(true, missing.action,));
+        assert!(!parakeet_model_folder_icon_visible(false, missing.action,));
 
         let downloading = model_status_presentation("downloading", "parakeet-tdt-0.6b-v3");
         assert!(downloading.show_download_progress);
-        assert!(!downloading.show_setup_action);
+        assert_eq!(downloading.action, ModelStatusAction::CancelDownload);
         assert!(!downloading.show_delete);
+
+        let cancelling = model_status_presentation("cancelling", "parakeet-tdt-0.6b-v3");
+        assert_eq!(cancelling.subtitle, "Cancelling download…");
+        assert_eq!(cancelling.action, ModelStatusAction::None);
+        assert!(!cancelling.show_download_progress);
 
         let deleting = model_status_presentation("deleting", "parakeet-tdt-0.6b-v3");
         assert_eq!(deleting.subtitle, "Deleting model…");
         assert!(!deleting.show_download_progress);
-        assert!(!deleting.show_setup_action);
+        assert_eq!(deleting.action, ModelStatusAction::None);
         assert!(!deleting.show_delete);
 
         let available = model_status_presentation("available", "parakeet-tdt-0.6b-v3");
         assert!(!available.show_download_progress);
-        assert!(!available.show_setup_action);
+        assert_eq!(available.action, ModelStatusAction::None);
         assert!(available.show_delete);
         assert!(available.subtitle.contains("this computer"));
     }

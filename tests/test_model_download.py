@@ -17,6 +17,7 @@ DAEMON_INTERFACE = "io.github.hy26v.Voxkey.Daemon1"
 # Not one of the models the daemon knows how to fetch, so the request fails
 # before any network access. Keeps the suite offline and fast.
 UNKNOWN_MODEL = "voxkey-integration-test-model"
+KNOWN_MODEL = "parakeet-tdt-0.6b-v3"
 
 
 async def _daemon_interface(dbus_session):
@@ -59,6 +60,22 @@ async def test_status_of_a_model_that_was_never_downloaded(
     daemon = await _daemon_interface(dbus_session)
 
     assert await daemon.call_model_status(UNKNOWN_MODEL) == "not_downloaded"
+
+
+@pytest.mark.asyncio
+async def test_cancel_requires_an_active_catalog_download(
+    daemon_process, dbus_session,
+):
+    """Cancellation is explicit, validated, and harmless when nothing runs."""
+    assert daemon_process.reached_idle, "Daemon did not reach Idle"
+    daemon = await _daemon_interface(dbus_session)
+
+    for model_name in (UNKNOWN_MODEL, KNOWN_MODEL):
+        with pytest.raises(DBusError):
+            await daemon.call_cancel_model_download(model_name)
+
+    assert daemon_process.poll() is None, "daemon exited on an idle cancel request"
+    assert await daemon.get_state() == "Idle"
 
 
 @pytest.mark.asyncio

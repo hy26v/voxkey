@@ -198,6 +198,7 @@ pub enum DaemonCommand {
         request_id: u64,
     },
     DownloadModel(String),
+    CancelModelDownload(String),
     DeleteModel(String),
     ModelStatus(String),
     OpenModelsDir,
@@ -227,6 +228,7 @@ impl DaemonCommand {
             Self::ClearApiKey { .. } => "Clear API key",
             Self::HasApiKey { .. } => "Check API key",
             Self::DownloadModel(_) => "Download model",
+            Self::CancelModelDownload(_) => "Cancel model download",
             Self::DeleteModel(_) => "Delete model",
             Self::ModelStatus(_) => "Check model status",
             Self::OpenModelsDir => "Open models folder",
@@ -292,6 +294,7 @@ impl std::fmt::Debug for DaemonCommand {
                 .field("request_id", request_id)
                 .finish(),
             Self::DownloadModel(s) => f.debug_tuple("DownloadModel").field(s).finish(),
+            Self::CancelModelDownload(s) => f.debug_tuple("CancelModelDownload").field(s).finish(),
             Self::DeleteModel(s) => f.debug_tuple("DeleteModel").field(s).finish(),
             Self::ModelStatus(s) => f.debug_tuple("ModelStatus").field(s).finish(),
             Self::OpenModelsDir => write!(f, "OpenModelsDir"),
@@ -1036,6 +1039,9 @@ async fn handle_command(
         }
         DaemonCommand::DownloadModel(name) => {
             proxy.download_model(&name).await?;
+        }
+        DaemonCommand::CancelModelDownload(name) => {
+            proxy.cancel_model_download(&name).await?;
         }
         DaemonCommand::DeleteModel(name) => {
             proxy.delete_model(&name).await?;

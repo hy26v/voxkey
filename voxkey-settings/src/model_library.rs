@@ -39,13 +39,23 @@ impl ModelRow {
             "downloading" => {
                 self.status.set_title("Downloading…");
                 self.status
-                    .set_subtitle("Voxkey will verify every file before using it");
+                    .set_subtitle("Voxkey verifies each file before using it");
                 self.status_icon
                     .set_icon_name(Some("folder-download-symbolic"));
                 self.status_icon.remove_css_class("success");
                 self.progress.set_fraction(0.0);
                 self.progress.set_visible(true);
-                self.action.set_label("Downloading");
+                self.action.set_label("Cancel download");
+                self.action.set_sensitive(true);
+            }
+            "cancelling" => {
+                self.status.set_title("Cancelling download…");
+                self.status
+                    .set_subtitle("Removing the incomplete file safely");
+                self.status_icon
+                    .set_icon_name(Some("process-stop-symbolic"));
+                self.status_icon.remove_css_class("success");
+                self.action.set_label("Cancelling");
                 self.action.set_sensitive(false);
             }
             "deleting" => {
@@ -81,6 +91,9 @@ impl ModelRow {
     }
 
     fn set_progress(&self, percent: u8) {
+        if self.action.label().as_deref() == Some("Cancelling") {
+            return;
+        }
         let percent = percent.min(100);
         self.set_status(if percent == 100 {
             "available"
@@ -199,7 +212,26 @@ impl ModelLibrary {
             let handle = handle.clone();
             let toast_overlay = toast_overlay.clone();
             action.connect_clicked(move |button| {
-                if button.label().as_deref() == Some("Delete") {
+                if button.label().as_deref() == Some("Cancel download") {
+                    action_widgets.set_status("cancelling");
+                    let completion = handle.send(DaemonCommand::CancelModelDownload(
+                        model.id.to_string(),
+                    ));
+                    let widgets = action_widgets.clone();
+                    let handle = handle.clone();
+                    let toast_overlay = toast_overlay.clone();
+                    glib::spawn_future_local(async move {
+                        let cancelled = completion.wait().await.is_ok();
+                        widgets.set_status("checking");
+                        handle.send(DaemonCommand::ModelStatus(model.id.to_string()));
+                        if cancelled {
+                            toast_overlay.add_toast(adw::Toast::new(&format!(
+                                "{} download cancelled",
+                                model.name
+                            )));
+                        }
+                    });
+                } else if button.label().as_deref() == Some("Delete") {
                     let dialog = adw::AlertDialog::builder()
                         .heading(format!("Delete {}?", model.name))
                         .heading_use_markup(false)

@@ -745,6 +745,9 @@ pub trait Daemon {
     /// Start downloading a Parakeet model by name.
     fn download_model(&self, model_name: &str) -> zbus::Result<()>;
 
+    /// Stop an active model download and remove its incomplete file.
+    fn cancel_model_download(&self, model_name: &str) -> zbus::Result<()>;
+
     /// Delete a downloaded Parakeet model.
     fn delete_model(&self, model_name: &str) -> zbus::Result<()>;
 

@@ -19,6 +19,11 @@ The first two models publish revisable text while the microphone is active.
 The v2 and v3 models decode the completed recording, with Voxkey's normal live
 preview option available before the final pass.
 
+Every model view in Settings offers **Cancel download** while a transfer is in
+progress. Cancelling removes the incomplete file currently being received but
+keeps already verified files, so starting the download again does not repeat
+finished work.
+
 “Downloadable” does not mean every model uses an OSI-approved open-source
 license. Parakeet v2/v3 use Creative Commons; Nemotron 3.5 and Parakeet Unified
 use publisher-specific open-weight licenses. The settings app always shows the
