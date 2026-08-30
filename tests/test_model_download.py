@@ -115,9 +115,15 @@ async def test_repeated_immediate_failures_emit_terminal_download_results(
     model_path.write_text("blocks the model directory")
 
     finished = asyncio.Queue()
+    changed = asyncio.Queue()
     daemon.on_model_download_finished(
         lambda model_name, outcome, message: finished.put_nowait(
             (model_name, outcome, message),
+        ),
+    )
+    daemon.on_model_download_changed(
+        lambda model_name, state, percent, message: changed.put_nowait(
+            (model_name, state, percent, message),
         ),
     )
 
@@ -125,9 +131,16 @@ async def test_repeated_immediate_failures_emit_terminal_download_results(
         first_error = None
         for attempt in range(2):
             await daemon.call_download_model(KNOWN_MODEL)
+            changed_model, state, percent, changed_message = await asyncio.wait_for(
+                changed.get(), timeout=2,
+            )
             model_name, outcome, message = await asyncio.wait_for(
                 finished.get(), timeout=2,
             )
+            assert changed_model == KNOWN_MODEL
+            assert state == "failed"
+            assert percent == 0
+            assert changed_message == message
             assert model_name == KNOWN_MODEL
             assert outcome == "failed"
             assert "real directory" in message

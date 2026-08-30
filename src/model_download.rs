@@ -29,6 +29,22 @@ impl DownloadStatus {
         }
     }
 
+    /// Return the ordered state, bounded progress, and optional failure detail
+    /// published to current D-Bus clients.
+    pub(crate) fn ordered_update(&self) -> (voxkey_ipc::ModelDownloadState, u8, &str) {
+        match self {
+            Self::InProgress(percent) if *percent >= 100 => {
+                (voxkey_ipc::ModelDownloadState::Verifying, 100, "")
+            }
+            Self::InProgress(percent) => {
+                (voxkey_ipc::ModelDownloadState::Downloading, *percent, "")
+            }
+            Self::Complete => (voxkey_ipc::ModelDownloadState::Complete, 100, ""),
+            Self::Cancelled => (voxkey_ipc::ModelDownloadState::Cancelled, 0, ""),
+            Self::Failed(message) => (voxkey_ipc::ModelDownloadState::Failed, 0, message),
+        }
+    }
+
     /// Return the stable D-Bus outcome and its optional failure details once
     /// this transfer can no longer make progress.
     pub(crate) fn terminal_outcome(&self) -> Option<(voxkey_ipc::ModelDownloadOutcome, &str)> {
@@ -686,6 +702,26 @@ mod tests {
         assert_eq!(
             DownloadStatus::Failed("network error".to_string()).reported_percent(),
             None
+        );
+    }
+
+    #[test]
+    fn ordered_updates_distinguish_received_bytes_from_terminal_success() {
+        assert_eq!(
+            DownloadStatus::InProgress(99).ordered_update(),
+            (voxkey_ipc::ModelDownloadState::Downloading, 99, "")
+        );
+        assert_eq!(
+            DownloadStatus::InProgress(100).ordered_update(),
+            (voxkey_ipc::ModelDownloadState::Verifying, 100, "")
+        );
+        assert_eq!(
+            DownloadStatus::Complete.ordered_update(),
+            (voxkey_ipc::ModelDownloadState::Complete, 100, "")
+        );
+        assert_eq!(
+            DownloadStatus::Failed("bad checksum".to_string()).ordered_update(),
+            (voxkey_ipc::ModelDownloadState::Failed, 0, "bad checksum")
         );
     }
 

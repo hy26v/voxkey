@@ -12,6 +12,23 @@ use crate::daemon_client::{DaemonCommand, DaemonHandle};
 
 const RETRY_MODEL_STATUS_LABEL: &str = "Retry check";
 
+pub(crate) fn download_progress_status(percent: u8) -> &'static str {
+    if percent >= 100 {
+        voxkey_ipc::MODEL_STATUS_VERIFYING_DOWNLOAD
+    } else {
+        "downloading"
+    }
+}
+
+pub(crate) fn download_progress_tooltip(percent: u8) -> String {
+    let percent = percent.min(100);
+    if percent == 100 {
+        "Download received; verifying model files".to_string()
+    } else {
+        format!("Model download: {percent}%")
+    }
+}
+
 pub(crate) fn download_failure_description(message: &str) -> &str {
     let message = message.trim();
     if message.is_empty() {
@@ -33,6 +50,7 @@ struct ModelRow {
 impl ModelRow {
     fn reset_status_style(&self) {
         self.progress.set_visible(false);
+        self.progress.set_tooltip_text(None);
         self.action.remove_css_class("destructive-action");
         self.action.remove_css_class("suggested-action");
         self.status_icon.remove_css_class("success");
@@ -61,6 +79,19 @@ impl ModelRow {
                     .set_icon_name(Some("folder-download-symbolic"));
                 self.progress.set_fraction(0.0);
                 self.progress.set_visible(true);
+                self.action.set_label("Cancel download");
+                self.action.set_sensitive(true);
+            }
+            voxkey_ipc::MODEL_STATUS_VERIFYING_DOWNLOAD => {
+                self.status.set_title("Verifying download…");
+                self.status
+                    .set_subtitle("Checking file integrity before making the model available");
+                self.status_icon
+                    .set_icon_name(Some("content-loading-symbolic"));
+                self.progress.set_fraction(1.0);
+                self.progress.set_visible(true);
+                self.progress
+                    .set_tooltip_text(Some("Download received; verifying model files"));
                 self.action.set_label("Cancel download");
                 self.action.set_sensitive(true);
             }
@@ -131,16 +162,10 @@ impl ModelRow {
             return;
         }
         let percent = percent.min(100);
-        self.set_status(if percent == 100 {
-            "available"
-        } else {
-            "downloading"
-        });
-        if percent < 100 {
-            self.progress.set_fraction(f64::from(percent) / 100.0);
-            self.progress
-                .set_tooltip_text(Some(&format!("Model download: {percent}%")));
-        }
+        self.set_status(download_progress_status(percent));
+        self.progress.set_fraction(f64::from(percent) / 100.0);
+        self.progress
+            .set_tooltip_text(Some(&download_progress_tooltip(percent)));
     }
 }
 
@@ -368,5 +393,20 @@ mod tests {
             "destination is read-only"
         );
         assert!(download_failure_description(" ").contains("Try again"));
+    }
+
+    #[test]
+    fn received_bytes_wait_for_terminal_verification_before_becoming_ready() {
+        assert_eq!(download_progress_status(0), "downloading");
+        assert_eq!(download_progress_status(99), "downloading");
+        assert_eq!(
+            download_progress_status(100),
+            voxkey_ipc::MODEL_STATUS_VERIFYING_DOWNLOAD
+        );
+        assert_eq!(
+            download_progress_status(u8::MAX),
+            voxkey_ipc::MODEL_STATUS_VERIFYING_DOWNLOAD
+        );
+        assert!(download_progress_tooltip(100).contains("verifying"));
     }
 }

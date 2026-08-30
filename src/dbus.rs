@@ -754,6 +754,9 @@ async fn await_model_download_cancellation(
 
 fn immediate_model_status(status: Option<&DownloadStatus>) -> Option<&'static str> {
     match status {
+        Some(DownloadStatus::InProgress(percent)) if *percent >= 100 => {
+            Some(voxkey_ipc::MODEL_STATUS_VERIFYING_DOWNLOAD)
+        }
         Some(DownloadStatus::InProgress(_)) => Some("downloading"),
         Some(DownloadStatus::Complete) => Some("available"),
         Some(DownloadStatus::Cancelled | DownloadStatus::Failed(_)) | None => None,
@@ -1698,6 +1701,25 @@ impl DaemonInterface {
         tokio::spawn(async move {
             while rx.changed().await.is_ok() {
                 let status = rx.borrow().clone();
+                let (state, percent, message) = status.ordered_update();
+                if let Ok(iface_ref) = connection
+                    .object_server()
+                    .interface::<_, DaemonInterface>(voxkey_ipc::OBJECT_PATH)
+                    .await
+                    && let Err(error) = DaemonInterface::model_download_changed(
+                        iface_ref.signal_emitter(),
+                        &model_name,
+                        state.as_wire_value(),
+                        percent,
+                        message,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to publish model download state for {model_name}: {error}"
+                    );
+                }
+
                 if let Some(percent) = status.reported_percent()
                     && let Ok(iface_ref) = connection
                         .object_server()
@@ -1829,6 +1851,15 @@ impl DaemonInterface {
         ctxt: &zbus::object_server::SignalEmitter<'_>,
         model_name: &str,
         outcome: &str,
+        message: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn model_download_changed(
+        ctxt: &zbus::object_server::SignalEmitter<'_>,
+        model_name: &str,
+        state: &str,
+        percent: u8,
         message: &str,
     ) -> zbus::Result<()>;
 }
@@ -2124,6 +2155,22 @@ mod tests {
             .expect_err("an idle cancellation request must be rejected");
 
         assert!(error.contains("No download is running"), "{error}");
+    }
+
+    #[test]
+    fn transferred_bytes_are_not_available_until_verification_finishes() {
+        assert_eq!(
+            immediate_model_status(Some(&DownloadStatus::InProgress(99))),
+            Some("downloading")
+        );
+        assert_eq!(
+            immediate_model_status(Some(&DownloadStatus::InProgress(100))),
+            Some("verifying_download")
+        );
+        assert_eq!(
+            immediate_model_status(Some(&DownloadStatus::Complete)),
+            Some("available")
+        );
     }
 
     #[tokio::test]

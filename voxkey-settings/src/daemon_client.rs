@@ -103,6 +103,9 @@ pub enum DaemonUpdate {
         model_name: String,
         percent: u8,
     },
+    ModelDownloadVerifying {
+        model_name: String,
+    },
     ModelDownloadFinished {
         model_name: String,
         outcome: String,
@@ -975,8 +978,10 @@ async fn try_connect(
     let mut audio_input_stream = proxy.receive_audio_input_device_changed().await;
     let mut sample_rate_stream = proxy.receive_sample_rate_changed().await;
     let mut channels_stream = proxy.receive_channels_changed().await;
-    let mut download_stream = proxy.receive_download_progress().await?;
-    let mut download_finished_stream = proxy.receive_model_download_finished().await?;
+    // All model-transfer states arrive on one signal stream. Separate progress
+    // and terminal streams can be selected out of bus order when both are
+    // buffered, allowing stale progress to overwrite a terminal result.
+    let mut model_download_stream = proxy.receive_model_download_changed().await?;
     let model_status_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let model_status_proxy = Arc::new(tokio::sync::OnceCell::new());
     let mut model_status_tasks = FuturesUnordered::new();
@@ -1095,28 +1100,51 @@ async fn try_connect(
                     });
                 }
             }
-            Some(signal) = download_stream.next() => {
+            Some(signal) = model_download_stream.next() => {
                 if let Ok(args) = signal.args() {
                     let model_name = args.model_name.to_string();
                     pending_model_status.invalidate(&model_name);
-                    let _ = update_tx.try_send(DaemonUpdate::DownloadProgress {
-                        model_name,
-                        percent: args.percent,
-                    });
-                }
-            }
-            Some(signal) = download_finished_stream.next() => {
-                if let Ok(args) = signal.args() {
-                    let model_name = args.model_name.to_string();
-                    pending_model_status.invalidate(&model_name);
-                    // Progress updates are intentionally lossy when GTK falls
-                    // behind; a terminal result is not. Waiting for capacity
-                    // guarantees a row cannot remain stuck on Downloading.
-                    let _ = update_tx.send(DaemonUpdate::ModelDownloadFinished {
-                        model_name,
-                        outcome: args.outcome.to_string(),
-                        message: args.message.to_string(),
-                    }).await;
+                    let state_wire = args.state.to_string();
+                    let message = args.message.to_string();
+                    match voxkey_ipc::ModelDownloadState::from_wire_value(&state_wire) {
+                        Some(voxkey_ipc::ModelDownloadState::Downloading) => {
+                            // Byte progress is intentionally lossy when GTK is
+                            // behind; a later update supersedes it.
+                            let _ = update_tx.try_send(DaemonUpdate::DownloadProgress {
+                                model_name,
+                                percent: args.percent,
+                            });
+                        }
+                        Some(voxkey_ipc::ModelDownloadState::Verifying) => {
+                            let _ = update_tx.send(DaemonUpdate::ModelDownloadVerifying {
+                                model_name,
+                            }).await;
+                        }
+                        Some(download_state) => {
+                            let Some(outcome) = download_state.terminal_outcome() else {
+                                tracing::warn!(
+                                    "Ignoring an unhandled non-terminal model download state"
+                                );
+                                continue;
+                            };
+                            // Terminal results are not lossy. Waiting for
+                            // capacity guarantees a row cannot remain busy.
+                            let _ = update_tx.send(DaemonUpdate::ModelDownloadFinished {
+                                model_name,
+                                outcome: outcome.as_wire_value().to_string(),
+                                message,
+                            }).await;
+                        }
+                        None => {
+                            // A future state triggers the same authoritative
+                            // scan fallback as a future terminal outcome.
+                            let _ = update_tx.send(DaemonUpdate::ModelDownloadFinished {
+                                model_name,
+                                outcome: state_wire,
+                                message,
+                            }).await;
+                        }
+                    }
                 }
             }
             Some((request_id, model_name, result)) = model_status_tasks.next(),

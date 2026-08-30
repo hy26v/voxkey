@@ -28,6 +28,9 @@ from the user's perspective.
 - Model downloads now leave their busy state reliably when they finish, are
   cancelled, or fail. Both model views show the failed attempt and an immediate
   retry action, even when the same download error happens more than once.
+- Settings now distinguishes the final integrity check from the network
+  transfer instead of appearing stuck at 99%. Both model views show when files
+  are being verified and become ready only after Voxkey confirms success.
 - Custom Mistral Batch, Mistral Realtime, and Parakeet server endpoints are now
   checked before they are saved. Settings shows connection progress and keeps
   the address ready to correct or retry when the server cannot be reached.

@@ -17,6 +17,55 @@ pub const SETTINGS_BUS_NAME: &str = "io.github.hy26v.Voxkey";
 /// Object path the daemon interface is served at.
 pub const OBJECT_PATH: &str = "/io/github/hy26v/Voxkey/Daemon";
 
+/// Model-status value returned after every byte has arrived but before the
+/// downloaded files have passed integrity checks and been published.
+pub const MODEL_STATUS_VERIFYING_DOWNLOAD: &str = "verifying_download";
+
+/// Ordered state carried by the consolidated model-download signal.
+///
+/// Progress and terminal results share one D-Bus stream so clients cannot
+/// process a buffered progress update after the corresponding terminal event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelDownloadState {
+    Downloading,
+    Verifying,
+    Complete,
+    Cancelled,
+    Failed,
+}
+
+impl ModelDownloadState {
+    pub const fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::Downloading => "downloading",
+            Self::Verifying => MODEL_STATUS_VERIFYING_DOWNLOAD,
+            Self::Complete => "complete",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_wire_value(value: &str) -> Option<Self> {
+        match value {
+            "downloading" => Some(Self::Downloading),
+            MODEL_STATUS_VERIFYING_DOWNLOAD => Some(Self::Verifying),
+            "complete" => Some(Self::Complete),
+            "cancelled" => Some(Self::Cancelled),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    pub const fn terminal_outcome(self) -> Option<ModelDownloadOutcome> {
+        match self {
+            Self::Complete => Some(ModelDownloadOutcome::Complete),
+            Self::Cancelled => Some(ModelDownloadOutcome::Cancelled),
+            Self::Failed => Some(ModelDownloadOutcome::Failed),
+            Self::Downloading | Self::Verifying => None,
+        }
+    }
+}
+
 /// Terminal result reported for a model download.
 ///
 /// D-Bus carries these values as strings so older clients can ignore the new
@@ -800,15 +849,28 @@ pub trait Daemon {
     #[zbus(signal)]
     fn error_occurred(message: &str) -> zbus::Result<()>;
 
-    /// Emitted during model download with progress percentage.
+    /// Emitted during model download with progress percentage. Retained for
+    /// compatibility; new clients should consume `ModelDownloadChanged`.
     #[zbus(signal)]
     fn download_progress(model_name: &str, percent: u8) -> zbus::Result<()>;
 
     /// Emitted exactly once when a model download completes, is cancelled, or
     /// fails. `outcome` is one of `complete`, `cancelled`, or `failed`;
-    /// `message` is populated for failures.
+    /// `message` is populated for failures. Retained for compatibility; new
+    /// clients should consume `ModelDownloadChanged`.
     #[zbus(signal)]
     fn model_download_finished(model_name: &str, outcome: &str, message: &str) -> zbus::Result<()>;
+
+    /// Ordered model-download transition. `state` is a `ModelDownloadState`
+    /// wire value; `percent` is meaningful while downloading or verifying,
+    /// and `message` is populated for failures.
+    #[zbus(signal)]
+    fn model_download_changed(
+        model_name: &str,
+        state: &str,
+        percent: u8,
+        message: &str,
+    ) -> zbus::Result<()>;
 }
 
 #[cfg(test)]
@@ -838,6 +900,29 @@ mod tests {
             );
         }
         assert_eq!(ModelDownloadOutcome::from_wire_value("downloading"), None);
+    }
+
+    #[test]
+    fn model_download_states_round_trip_and_only_terminal_states_have_outcomes() {
+        for state in [
+            ModelDownloadState::Downloading,
+            ModelDownloadState::Verifying,
+            ModelDownloadState::Complete,
+            ModelDownloadState::Cancelled,
+            ModelDownloadState::Failed,
+        ] {
+            assert_eq!(
+                ModelDownloadState::from_wire_value(state.as_wire_value()),
+                Some(state)
+            );
+        }
+        assert_eq!(ModelDownloadState::from_wire_value("future-state"), None);
+        assert_eq!(ModelDownloadState::Downloading.terminal_outcome(), None);
+        assert_eq!(ModelDownloadState::Verifying.terminal_outcome(), None);
+        assert_eq!(
+            ModelDownloadState::Complete.terminal_outcome(),
+            Some(ModelDownloadOutcome::Complete)
+        );
     }
 
     #[test]

@@ -2248,8 +2248,10 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                         && model_status_row_update.subtitle().as_deref()
                             != Some("Cancelling download…")
                     {
+                        let progress_status =
+                            crate::model_library::download_progress_status(percent);
                         apply_model_status(
-                            "downloading",
+                            progress_status,
                             &model_name,
                             &model_status_row_update,
                             &model_download_progress_update,
@@ -2258,20 +2260,27 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                             &open_folder_button_update,
                             expert_mode_update.get(),
                         );
-                        model_status_row_update.set_subtitle(&format!("Downloading… {percent}%"));
-                        update_model_download_progress(&model_download_progress_update, percent);
-                        if percent >= 100 {
-                            apply_model_status(
-                                "available",
-                                &model_name,
-                                &model_status_row_update,
-                                &model_download_progress_update,
-                                &download_button_update,
-                                &delete_model_button_update,
-                                &open_folder_button_update,
-                                expert_mode_update.get(),
-                            );
+                        if progress_status == "downloading" {
+                            model_status_row_update
+                                .set_subtitle(&format!("Downloading… {}%", percent.min(100)));
                         }
+                        update_model_download_progress(&model_download_progress_update, percent);
+                    }
+                }
+                DaemonUpdate::ModelDownloadVerifying { model_name } => {
+                    model_library_update
+                        .set_status(&model_name, voxkey_ipc::MODEL_STATUS_VERIFYING_DOWNLOAD);
+                    if model_name == transcriber_state_update.borrow().parakeet.model {
+                        apply_model_status(
+                            voxkey_ipc::MODEL_STATUS_VERIFYING_DOWNLOAD,
+                            &model_name,
+                            &model_status_row_update,
+                            &model_download_progress_update,
+                            &download_button_update,
+                            &delete_model_button_update,
+                            &open_folder_button_update,
+                            expert_mode_update.get(),
+                        );
                     }
                 }
                 DaemonUpdate::ModelDownloadFinished {
@@ -2900,6 +2909,12 @@ fn model_status_presentation(status: &str, model_name: &str) -> ModelStatusPrese
             action: ModelStatusAction::CancelDownload,
             show_delete: false,
         },
+        voxkey_ipc::MODEL_STATUS_VERIFYING_DOWNLOAD => ModelStatusPresentation {
+            subtitle: "Verifying downloaded files…".to_string(),
+            show_download_progress: true,
+            action: ModelStatusAction::CancelDownload,
+            show_delete: false,
+        },
         "cancelling" => ModelStatusPresentation {
             subtitle: "Cancelling download…".to_string(),
             show_download_progress: false,
@@ -3001,7 +3016,9 @@ fn update_model_download_progress(progress: &gtk4::ProgressBar, percent: u8) {
     let percent = percent.min(100);
     progress.set_visible(true);
     progress.set_fraction(model_download_fraction(percent));
-    progress.set_tooltip_text(Some(&format!("Model download: {percent}%")));
+    progress.set_tooltip_text(Some(&crate::model_library::download_progress_tooltip(
+        percent,
+    )));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3018,7 +3035,9 @@ fn apply_model_status(
     let presentation = model_status_presentation(status, model_name);
     row.set_title(&parakeet_model_status_title(model_name));
     row.set_subtitle(&presentation.subtitle);
-    if presentation.show_download_progress && !download_progress.is_visible() {
+    if status == voxkey_ipc::MODEL_STATUS_VERIFYING_DOWNLOAD {
+        update_model_download_progress(download_progress, 100);
+    } else if presentation.show_download_progress && !download_progress.is_visible() {
         download_progress.set_fraction(0.0);
         download_progress.set_tooltip_text(Some("Model download starting"));
     }
@@ -6321,6 +6340,12 @@ mod tests {
         assert!(downloading.show_download_progress);
         assert_eq!(downloading.action, ModelStatusAction::CancelDownload);
         assert!(!downloading.show_delete);
+
+        let verifying = model_status_presentation("verifying_download", "parakeet-tdt-0.6b-v3");
+        assert_eq!(verifying.subtitle, "Verifying downloaded files…");
+        assert!(verifying.show_download_progress);
+        assert_eq!(verifying.action, ModelStatusAction::CancelDownload);
+        assert!(!verifying.show_delete);
 
         let cancelling = model_status_presentation("cancelling", "parakeet-tdt-0.6b-v3");
         assert_eq!(cancelling.subtitle, "Cancelling download…");
