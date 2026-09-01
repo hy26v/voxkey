@@ -3,8 +3,8 @@
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use crate::audio_signal::{SignalMonitor, SignalSnapshot};
 use crate::config::AudioConfig;
@@ -13,6 +13,9 @@ use crate::config::AudioConfig;
 /// transcription running for several seconds does not starve the stream, small
 /// enough that a stalled consumer cannot grow memory without bound.
 const PREVIEW_CHANNEL_CAPACITY: usize = 512;
+/// Disk writes run on a dedicated worker. This queue absorbs normal storage
+/// jitter without allowing an unhealthy disk to consume unbounded memory.
+const WAV_WRITER_CHANNEL_CAPACITY: usize = 64;
 /// Bounded preroll retained while the realtime provider connects. At common
 /// CPAL chunk sizes this covers setup latency without accepting unbounded RAM.
 const REALTIME_CHANNEL_CAPACITY: usize = 1024;
@@ -241,12 +244,12 @@ fn report_streaming_capture_error(
 }
 
 fn publish_streaming_samples(
-    audio_tx: &tokio::sync::mpsc::Sender<Vec<i16>>,
+    audio_tx: &tokio::sync::mpsc::Sender<Arc<[i16]>>,
     capture_errors: &tokio::sync::watch::Sender<Option<String>>,
-    data: &[i16],
+    data: Vec<i16>,
 ) {
     match audio_tx.try_reserve() {
-        Ok(permit) => permit.send(data.to_vec()),
+        Ok(permit) => permit.send(data.into()),
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
             if capture_errors.borrow().is_none() {
                 report_streaming_capture_error(
@@ -267,45 +270,128 @@ fn report_batch_capture_error(errors: &tokio::sync::watch::Sender<Option<String>
     }
 }
 
-fn capture_samples<W: std::io::Write + std::io::Seek>(
-    writer: &Mutex<Option<hound::WavWriter<W>>>,
+fn queue_batch_samples(
+    writer: &std::sync::mpsc::SyncSender<Arc<[i16]>>,
     capture_errors: &tokio::sync::watch::Sender<Option<String>>,
     recorded_samples: &AtomicU64,
     max_samples: u64,
-    data: &[i16],
-) {
+    data: Vec<i16>,
+) -> Option<Arc<[i16]>> {
     let prior_samples = recorded_samples.load(Ordering::Relaxed);
     if data.len() as u64 > max_samples.saturating_sub(prior_samples) {
         report_batch_capture_error(
             capture_errors,
             "Recording reached its configured duration or 64 MiB file limit".to_string(),
         );
-        return;
+        return None;
     }
-    let write_error = match writer.lock() {
-        Ok(mut guard) => {
-            let Some(writer) = guard.as_mut() else {
-                // Finalization already took ownership of the writer. A
-                // callback that crossed the stream-stop boundary neither
-                // wrote nor counts these samples.
-                return;
-            };
-            let error = data
-                .iter()
-                .find_map(|sample| writer.write_sample(*sample).err())
-                .map(|error| error.to_string());
-            if error.is_none() {
-                // Update while holding the writer mutex. Finalization takes
-                // the same mutex before loading this counter, so the WAV and
-                // its microphone-sample count describe the same prefix.
-                recorded_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
-            }
-            error
+
+    let sample_count = data.len() as u64;
+    let chunk: Arc<[i16]> = data.into();
+    match writer.try_send(chunk.clone()) {
+        Ok(()) => {
+            recorded_samples.fetch_add(sample_count, Ordering::Relaxed);
+            Some(chunk)
         }
-        Err(_) => Some("WAV writer mutex poisoned".to_string()),
-    };
-    if let Some(error) = write_error {
-        report_batch_capture_error(capture_errors, error);
+        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+            report_batch_capture_error(
+                capture_errors,
+                "Recording storage fell behind the microphone; refusing incomplete audio"
+                    .to_string(),
+            );
+            None
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+            if capture_errors.borrow().is_none() {
+                report_batch_capture_error(
+                    capture_errors,
+                    "Recording storage worker stopped unexpectedly".to_string(),
+                );
+            }
+            None
+        }
+    }
+}
+
+fn write_i16_chunk<W: std::io::Write + std::io::Seek>(
+    writer: &mut hound::WavWriter<W>,
+    samples: &[i16],
+) -> Result<(), hound::Error> {
+    let count = u32::try_from(samples.len())
+        .map_err(|_| hound::Error::FormatError("audio callback chunk is too large"))?;
+    let mut output = writer.get_i16_writer(count);
+    for sample in samples {
+        output.write_sample(*sample);
+    }
+    output.flush()
+}
+
+fn run_wav_writer<W: std::io::Write + std::io::Seek>(
+    mut writer: hound::WavWriter<W>,
+    receiver: std::sync::mpsc::Receiver<Arc<[i16]>>,
+    padding_samples: u64,
+) -> Result<u64, String> {
+    let mut recorded_samples = 0_u64;
+    while let Ok(chunk) = receiver.recv() {
+        write_i16_chunk(&mut writer, &chunk).map_err(|error| error.to_string())?;
+        recorded_samples = recorded_samples.saturating_add(chunk.len() as u64);
+    }
+
+    let mut remaining = padding_samples;
+    const ZERO_BLOCK: [i16; 8 * 1024] = [0; 8 * 1024];
+    while remaining > 0 {
+        let count = remaining.min(ZERO_BLOCK.len() as u64) as usize;
+        write_i16_chunk(&mut writer, &ZERO_BLOCK[..count]).map_err(|error| error.to_string())?;
+        remaining -= count as u64;
+    }
+    writer.finalize().map_err(|error| error.to_string())?;
+    Ok(recorded_samples)
+}
+
+struct BatchWriter {
+    sender: Option<std::sync::mpsc::SyncSender<Arc<[i16]>>>,
+    thread: Option<std::thread::JoinHandle<Result<u64, String>>>,
+}
+
+impl BatchWriter {
+    fn start(
+        writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+        padding_samples: u64,
+        capture_errors: tokio::sync::watch::Sender<Option<String>>,
+    ) -> Result<Self, std::io::Error> {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<Arc<[i16]>>(WAV_WRITER_CHANNEL_CAPACITY);
+        let thread = std::thread::Builder::new()
+            .name("voxkey-wav-writer".to_string())
+            .spawn(move || {
+                let result = run_wav_writer(writer, receiver, padding_samples);
+                if let Err(error) = &result {
+                    report_batch_capture_error(&capture_errors, error.clone());
+                }
+                result
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        })
+    }
+
+    fn sender(&self) -> std::sync::mpsc::SyncSender<Arc<[i16]>> {
+        self.sender
+            .as_ref()
+            .expect("WAV writer sender already closed")
+            .clone()
+    }
+
+    async fn finish(mut self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        self.sender.take();
+        let thread = self.thread.take().ok_or("WAV writer task is missing")?;
+        tokio::task::spawn_blocking(move || thread.join())
+            .await
+            .map_err(|error| std::io::Error::other(format!("WAV writer join failed: {error}")))?
+            .map_err(|_| std::io::Error::other("WAV writer thread panicked"))?
+            .map_err(|error| std::io::Error::other(format!("Could not write recording: {error}")))
+            .map_err(Into::into)
     }
 }
 
@@ -328,23 +414,92 @@ fn transcription_padding_samples(sample_rate: u32, channels: u16) -> u64 {
     samples.min(u128::from(u64::MAX)) as u64
 }
 
-fn publish_preview_samples(
+fn publish_preview_chunk(
     preview_tx: Option<&tokio::sync::mpsc::Sender<Arc<[i16]>>>,
     dropped_preview_chunks: &AtomicU64,
-    data: &[i16],
+    chunk: Arc<[i16]>,
 ) {
     let Some(preview_tx) = preview_tx else {
         return;
     };
-    match preview_tx.try_reserve() {
-        // `Arc<[i16]>::from(&[i16])` allocates and copies once.
-        // Sending an owned Vec would copy again downstream.
-        Ok(permit) => permit.send(Arc::from(data)),
+    match preview_tx.try_send(chunk) {
+        Ok(()) => {}
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
             dropped_preview_chunks.fetch_add(1, Ordering::Relaxed);
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
     }
+}
+
+fn selected_input_config(
+    device: &cpal::Device,
+    target_rate: u32,
+    target_channels: u16,
+) -> Result<cpal::SupportedStreamConfig, Box<dyn std::error::Error + Send + Sync>> {
+    match device.supported_input_configs() {
+        Ok(configs) => {
+            crate::audio_adapter::select_input_config(configs, target_rate, target_channels)
+                .ok_or_else(|| "The selected microphone reports no supported input format".into())
+        }
+        Err(error) => {
+            tracing::warn!(
+                "Could not enumerate microphone formats ({error}); using its default format"
+            );
+            Ok(device.default_input_config()?)
+        }
+    }
+}
+
+fn build_adapted_input_stream<F, E>(
+    device: &cpal::Device,
+    target_rate: u32,
+    target_channels: u16,
+    recording: Arc<AtomicBool>,
+    mut consume: F,
+    report_error: E,
+) -> Result<cpal::Stream, Box<dyn std::error::Error + Send + Sync>>
+where
+    F: FnMut(Vec<i16>) + Send + 'static,
+    E: Fn(String) + Clone + Send + 'static,
+{
+    let native = selected_input_config(device, target_rate, target_channels)?;
+    let native_rate = native.sample_rate().0;
+    let native_channels = native.channels();
+    let native_format = native.sample_format();
+    let stream_config: cpal::StreamConfig = native.into();
+    tracing::info!(
+        native_rate,
+        native_channels,
+        native_format = %native_format,
+        target_rate,
+        target_channels,
+        "Configured microphone format adapter"
+    );
+
+    let mut adapter = crate::audio_adapter::AudioAdapter::new(
+        native_rate,
+        native_channels,
+        target_rate,
+        target_channels,
+    )?;
+    let callback_error = report_error.clone();
+    let stream = device.build_input_stream_raw(
+        &stream_config,
+        native_format,
+        move |data, _| {
+            if !recording.load(Ordering::Relaxed) {
+                return;
+            }
+            match adapter.process_data(data, native_format) {
+                Ok(samples) if !samples.is_empty() => consume(samples),
+                Ok(_) => {}
+                Err(error) => callback_error(error),
+            }
+        },
+        move |error| report_error(error.to_string()),
+        None,
+    )?;
+    Ok(stream)
 }
 
 /// Records audio from the default input device.
@@ -423,35 +578,27 @@ impl Recorder {
 
         tracing::info!("Streaming from: {}", device.name().unwrap_or_default());
 
-        let desired_config = cpal::StreamConfig {
-            channels: self.channels,
-            sample_rate: cpal::SampleRate(self.sample_rate),
-            buffer_size: cpal::BufferSize::Default,
-        };
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<i16>>(REALTIME_CHANNEL_CAPACITY);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Arc<[i16]>>(REALTIME_CHANNEL_CAPACITY);
         let (capture_error_tx, capture_error_rx) = tokio::sync::watch::channel(None);
         let buffer_errors = capture_error_tx.clone();
         let callback_errors = capture_error_tx.clone();
 
         let recording = Arc::new(AtomicBool::new(true));
-        let recording_clone = recording.clone();
         let signal = SignalMonitor::default();
         let callback_signal = signal.clone();
 
-        let stream = device.build_input_stream(
-            &desired_config,
-            move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                if !recording_clone.load(Ordering::Relaxed) {
-                    return;
-                }
-                callback_signal.observe(data);
+        let stream = build_adapted_input_stream(
+            &device,
+            self.sample_rate,
+            self.channels,
+            recording.clone(),
+            move |data| {
+                callback_signal.observe(&data);
                 publish_streaming_samples(&tx, &buffer_errors, data);
             },
-            move |err| {
-                report_streaming_capture_error(&callback_errors, err.to_string());
+            move |error| {
+                report_streaming_capture_error(&callback_errors, error);
             },
-            None,
         )?;
 
         stream.play()?;
@@ -491,12 +638,6 @@ impl Recorder {
 
         tracing::info!("Recording from: {}", device.name().unwrap_or_default());
 
-        let desired_config = cpal::StreamConfig {
-            channels: self.channels,
-            sample_rate: cpal::SampleRate(self.sample_rate),
-            buffer_size: cpal::BufferSize::Default,
-        };
-
         // Stays auto-deleting until the whole capture pipeline is running, so
         // a device that refuses to start leaves no orphaned file behind. The
         // handle owns it from then on and only `stop()` hands it onward.
@@ -514,7 +655,6 @@ impl Recorder {
             sample_format: hound::SampleFormat::Int,
         };
         let writer = hound::WavWriter::create(&wav_path, spec)?;
-        let writer = Arc::new(Mutex::new(Some(writer)));
         let (preview_tx, preview_rx) = match preview_capture {
             PreviewCapture::Enabled => {
                 let (tx, rx) = tokio::sync::mpsc::channel::<Arc<[i16]>>(PREVIEW_CHANNEL_CAPACITY);
@@ -526,11 +666,15 @@ impl Recorder {
         let dropped_preview_chunks_clone = dropped_preview_chunks.clone();
 
         let recording = Arc::new(AtomicBool::new(true));
-        let recording_clone = recording.clone();
         let signal = SignalMonitor::default();
         let callback_signal = signal.clone();
-        let writer_clone = writer.clone();
         let (capture_error_tx, capture_error_rx) = tokio::sync::watch::channel(None);
+        let writer = BatchWriter::start(
+            writer,
+            transcription_padding_samples(self.sample_rate, self.channels),
+            capture_error_tx.clone(),
+        )?;
+        let callback_writer = writer.sender();
         let sample_capture_errors = capture_error_tx.clone();
         let stream_capture_errors = capture_error_tx.clone();
         let recorded_samples = Arc::new(AtomicU64::new(0));
@@ -538,29 +682,30 @@ impl Recorder {
         let max_samples =
             max_batch_samples(self.sample_rate, self.channels, self.max_recording_seconds);
 
-        let stream = device.build_input_stream(
-            &desired_config,
-            move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                if !recording_clone.load(Ordering::Relaxed) {
-                    return;
-                }
-                callback_signal.observe(data);
-                capture_samples(
-                    &writer_clone,
+        let stream = build_adapted_input_stream(
+            &device,
+            self.sample_rate,
+            self.channels,
+            recording.clone(),
+            move |data| {
+                callback_signal.observe(&data);
+                let Some(chunk) = queue_batch_samples(
+                    &callback_writer,
                     &sample_capture_errors,
                     &callback_recorded_samples,
                     max_samples,
                     data,
-                );
+                ) else {
+                    return;
+                };
                 // Preview transcription is best-effort: it must never block the
                 // audio callback or compromise the final WAV. A full channel
                 // drops the chunk, which leaves a gap in preview audio only.
-                publish_preview_samples(preview_tx.as_ref(), &dropped_preview_chunks_clone, data);
+                publish_preview_chunk(preview_tx.as_ref(), &dropped_preview_chunks_clone, chunk);
             },
-            move |err| {
-                report_batch_capture_error(&stream_capture_errors, err.to_string());
+            move |error| {
+                report_batch_capture_error(&stream_capture_errors, error);
             },
-            None,
         )?;
 
         stream.play()?;
@@ -568,7 +713,7 @@ impl Recorder {
 
         Ok(RecordingHandle {
             stream: Some(stream),
-            writer,
+            writer: Some(writer),
             recording,
             signal,
             wav_path: Some(audio_file.keep()?),
@@ -578,10 +723,6 @@ impl Recorder {
             recorded_samples,
             capture_error_rx: Some(capture_error_rx),
             _capture_error_tx: capture_error_tx,
-            transcription_padding_samples: transcription_padding_samples(
-                self.sample_rate,
-                self.channels,
-            ),
             system_audio_mute: None,
         })
     }
@@ -623,7 +764,7 @@ pub struct StreamingRecordingHandle {
     stream: Option<cpal::Stream>,
     recording: Arc<AtomicBool>,
     signal: SignalMonitor,
-    rx: Option<tokio::sync::mpsc::Receiver<Vec<i16>>>,
+    rx: Option<tokio::sync::mpsc::Receiver<Arc<[i16]>>>,
     capture_error_rx: Option<tokio::sync::watch::Receiver<Option<String>>>,
     _capture_error_tx: tokio::sync::watch::Sender<Option<String>>,
     system_audio_mute: Option<SystemAudioMuteGuard>,
@@ -635,7 +776,7 @@ impl StreamingRecordingHandle {
     }
 
     /// Take the audio chunk receiver. Can only be called once.
-    pub fn take_rx(&mut self) -> Option<tokio::sync::mpsc::Receiver<Vec<i16>>> {
+    pub fn take_rx(&mut self) -> Option<tokio::sync::mpsc::Receiver<Arc<[i16]>>> {
         self.rx.take()
     }
 
@@ -665,7 +806,7 @@ impl StreamingRecordingHandle {
 /// Handle to an in-progress recording. Call `stop()` to finalize the WAV file.
 pub struct RecordingHandle {
     stream: Option<cpal::Stream>,
-    writer: Arc<Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>>,
+    writer: Option<BatchWriter>,
     recording: Arc<AtomicBool>,
     signal: SignalMonitor,
     /// The captured audio, owned by this handle until `stop()` succeeds and
@@ -678,7 +819,6 @@ pub struct RecordingHandle {
     recorded_samples: Arc<AtomicU64>,
     capture_error_rx: Option<tokio::sync::watch::Receiver<Option<String>>>,
     _capture_error_tx: tokio::sync::watch::Sender<Option<String>>,
-    transcription_padding_samples: u64,
     system_audio_mute: Option<SystemAudioMuteGuard>,
 }
 
@@ -743,26 +883,21 @@ impl RecordingHandle {
             guard.restore().await;
         }
 
+        // Closing the callback-owned sender lets the disk worker drain every
+        // accepted chunk, append transcription padding, and finalize off the
+        // async runtime. No storage operation runs on CPAL's realtime thread.
+        let writer = self.writer.take().ok_or("recording has no WAV writer")?;
+        let written_samples = writer.finish().await;
         let capture_error = self._capture_error_tx.borrow().clone();
         if let Some(error) = capture_error {
             return Err(format!("Audio capture failed: {error}").into());
         }
-
-        // Finalize the WAV file
-        {
-            let mut guard = self
-                .writer
-                .lock()
-                .map_err(|_| std::io::Error::other("WAV writer mutex poisoned"))?;
-            if let Some(writer) = guard.take() {
-                let mut writer = writer;
-                for _ in 0..self.transcription_padding_samples {
-                    writer.write_sample(0_i16)?;
-                }
-                writer.finalize()?;
-            }
-        }
-        let recorded_samples = self.recorded_samples.load(Ordering::Relaxed);
+        let recorded_samples = written_samples?;
+        debug_assert_eq!(
+            recorded_samples,
+            self.recorded_samples.load(Ordering::Relaxed),
+            "the callback admission count and WAV writer count diverged"
+        );
         let signal = self.signal.snapshot();
 
         let dropped = self.dropped_preview_chunks.load(Ordering::Relaxed);
@@ -814,8 +949,8 @@ impl Drop for RecordingHandle {
 
         self.recording.store(false, Ordering::Relaxed);
         drop(self.stream.take());
-        if let Ok(mut guard) = self.writer.lock() {
-            drop(guard.take());
+        if let Some(writer) = self.writer.as_mut() {
+            writer.sender.take();
         }
 
         match std::fs::remove_file(&wav_path) {
@@ -889,7 +1024,7 @@ mod tests {
 
     /// A handle over a real WAV file with no audio device attached, so the
     /// file-ownership rules can be exercised without a microphone.
-    fn handle_writing_to(path: &std::path::Path) -> RecordingHandle {
+    fn handle_writing_to(path: &std::path::Path, padding_samples: u64) -> RecordingHandle {
         let spec = hound::WavSpec {
             channels: 1,
             sample_rate: 16_000,
@@ -898,9 +1033,10 @@ mod tests {
         };
         let writer = hound::WavWriter::create(path, spec).unwrap();
         let (capture_error_tx, capture_error_rx) = tokio::sync::watch::channel(None);
+        let writer = BatchWriter::start(writer, padding_samples, capture_error_tx.clone()).unwrap();
         RecordingHandle {
             stream: None,
-            writer: Arc::new(Mutex::new(Some(writer))),
+            writer: Some(writer),
             recording: Arc::new(AtomicBool::new(true)),
             signal: SignalMonitor::default(),
             wav_path: Some(path.to_path_buf()),
@@ -910,7 +1046,6 @@ mod tests {
             recorded_samples: Arc::new(AtomicU64::new(0)),
             capture_error_rx: Some(capture_error_rx),
             _capture_error_tx: capture_error_tx,
-            transcription_padding_samples: 0,
             system_audio_mute: None,
         }
     }
@@ -923,7 +1058,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("voxkey_abandoned.wav");
 
-        drop(handle_writing_to(&path));
+        drop(handle_writing_to(&path, 0));
 
         assert!(!path.exists(), "abandoned recording left audio on disk");
     }
@@ -935,7 +1070,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("voxkey_finished.wav");
 
-        let audio_path = handle_writing_to(&path).stop().await.unwrap();
+        let audio_path = handle_writing_to(&path, 0).stop().await.unwrap();
 
         assert_eq!(audio_path, path);
         assert!(
@@ -952,15 +1087,19 @@ mod tests {
     async fn finalized_sample_count_excludes_synthetic_transcription_padding() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("voxkey_padded.wav");
-        let mut handle = handle_writing_to(&path);
-        capture_samples(
-            &handle.writer,
-            &handle._capture_error_tx,
-            &handle.recorded_samples,
-            u64::MAX,
-            &[1, 2, 3],
+        let handle = handle_writing_to(&path, 2);
+        let writer = handle.writer.as_ref().unwrap().sender();
+        assert!(
+            queue_batch_samples(
+                &writer,
+                &handle._capture_error_tx,
+                &handle.recorded_samples,
+                u64::MAX,
+                vec![1, 2, 3],
+            )
+            .is_some()
         );
-        handle.transcription_padding_samples = 2;
+        drop(writer);
 
         let (audio_path, captured_samples) = handle.stop_with_sample_count().await.unwrap();
         let reader = hound::WavReader::open(audio_path).unwrap();
@@ -970,29 +1109,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_poisoned_writer_cannot_be_reported_as_a_finished_recording() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("voxkey_unfinished.wav");
-        let handle = handle_writing_to(&path);
-        let writer = handle.writer.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = writer.lock().unwrap();
-            panic!("poison the WAV writer mutex");
-        })
-        .join();
+    async fn a_panicked_writer_worker_cannot_be_reported_as_finished() {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        let writer = BatchWriter {
+            sender: Some(sender),
+            thread: Some(std::thread::spawn(|| -> Result<u64, String> {
+                panic!("simulated WAV worker failure")
+            })),
+        };
 
-        assert!(handle.stop().await.is_err());
-        assert!(
-            !path.exists(),
-            "a failed recording must remain handle-owned and be removed"
-        );
+        let error = writer.finish().await.unwrap_err();
+        assert!(error.to_string().contains("panicked"), "{error}");
     }
 
     #[tokio::test]
     async fn a_capture_stream_error_cannot_be_reported_as_a_finished_recording() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("voxkey_truncated.wav");
-        let handle = handle_writing_to(&path);
+        let handle = handle_writing_to(&path, 0);
         handle
             ._capture_error_tx
             .send_replace(Some("input device disconnected".to_string()));
@@ -1023,19 +1157,91 @@ mod tests {
             spec,
         )
         .unwrap();
-        let writer = Mutex::new(Some(writer));
-        let (capture_error, observed_error) = tokio::sync::watch::channel(None);
-        let samples = AtomicU64::new(0);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
 
         fail.store(true, Ordering::Relaxed);
-        capture_samples(&writer, &capture_error, &samples, u64::MAX, &[1, 2, 3]);
+        sender.send(Arc::from([1_i16, 2, 3])).unwrap();
+        drop(sender);
+        let error = run_wav_writer(writer, receiver, 0).unwrap_err();
 
+        assert!(error.contains("simulated disk write failure"), "{error}");
+    }
+
+    #[test]
+    fn slow_storage_never_blocks_the_realtime_audio_callback() {
+        struct BlockingWriter {
+            inner: std::io::Cursor<Vec<u8>>,
+            block_next_write: Arc<AtomicBool>,
+            entered: std::sync::mpsc::Sender<()>,
+            gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        impl std::io::Write for BlockingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.block_next_write.swap(false, Ordering::Relaxed) {
+                    let _ = self.entered.send(());
+                    let (open, wake) = &*self.gate;
+                    let mut open = open.lock().unwrap();
+                    while !*open {
+                        open = wake.wait(open).unwrap();
+                    }
+                }
+                self.inner.write(bytes)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
+
+        impl std::io::Seek for BlockingWriter {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+
+        let block_next_write = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let writer = hound::WavWriter::new(
+            BlockingWriter {
+                inner: std::io::Cursor::new(Vec::new()),
+                block_next_write: block_next_write.clone(),
+                entered: entered_tx,
+                gate: gate.clone(),
+            },
+            spec,
+        )
+        .unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        let worker = std::thread::spawn(move || run_wav_writer(writer, receiver, 0));
+        let (errors, _observed) = tokio::sync::watch::channel(None);
+        let samples = AtomicU64::new(0);
+
+        block_next_write.store(true, Ordering::Relaxed);
+        assert!(queue_batch_samples(&sender, &errors, &samples, 100, vec![1, 2]).is_some());
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("storage worker never entered its simulated slow write");
+        let started = std::time::Instant::now();
+        assert!(queue_batch_samples(&sender, &errors, &samples, 100, vec![3, 4]).is_some());
         assert!(
-            observed_error
-                .borrow()
-                .as_deref()
-                .is_some_and(|error| error.contains("simulated disk write failure"))
+            started.elapsed() < std::time::Duration::from_millis(20),
+            "audio callback waited for storage for {:?}",
+            started.elapsed()
         );
+
+        let (open, wake) = &*gate;
+        *open.lock().unwrap() = true;
+        wake.notify_all();
+        drop(sender);
+        assert_eq!(worker.join().unwrap().unwrap(), 4);
     }
 
     #[test]
@@ -1087,19 +1293,11 @@ mod tests {
 
     #[test]
     fn batch_capture_limit_is_observable_without_waiting_for_stop() {
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 16_000,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let writer = Mutex::new(Some(
-            hound::WavWriter::new(std::io::Cursor::new(Vec::new()), spec).unwrap(),
-        ));
+        let (writer, _receiver) = std::sync::mpsc::sync_channel(1);
         let (errors, observed) = tokio::sync::watch::channel(None);
         let samples = AtomicU64::new(3);
 
-        capture_samples(&writer, &errors, &samples, 4, &[4, 5]);
+        assert!(queue_batch_samples(&writer, &errors, &samples, 4, vec![4, 5]).is_none());
 
         assert!(
             observed
@@ -1118,11 +1316,11 @@ mod tests {
 
     #[test]
     fn a_full_streaming_buffer_is_reported_as_a_capture_error() {
-        let (audio_tx, _audio_rx) = tokio::sync::mpsc::channel(1);
-        audio_tx.try_send(vec![1, 2, 3]).unwrap();
+        let (audio_tx, _audio_rx) = tokio::sync::mpsc::channel::<Arc<[i16]>>(1);
+        audio_tx.try_send(Arc::from([1_i16, 2, 3])).unwrap();
         let (error_tx, error_rx) = tokio::sync::watch::channel(None);
 
-        publish_streaming_samples(&audio_tx, &error_tx, &[4, 5, 6]);
+        publish_streaming_samples(&audio_tx, &error_tx, vec![4, 5, 6]);
 
         let error = error_rx
             .borrow()
@@ -1148,7 +1346,7 @@ mod tests {
         drop(preview_rx);
         let dropped = AtomicU64::new(0);
 
-        publish_preview_samples(Some(&preview_tx), &dropped, &[1, 2, 3]);
+        publish_preview_chunk(Some(&preview_tx), &dropped, Arc::from([1_i16, 2, 3]));
 
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
     }

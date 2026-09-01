@@ -2,6 +2,8 @@
 // ABOUTME: Wires portal sessions, audio recording, transcription, and text injection into an event loop.
 
 mod agreement;
+mod audio_adapter;
+mod audio_batch;
 mod audio_signal;
 mod config;
 mod dbus;

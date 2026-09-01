@@ -1015,6 +1015,92 @@ async fn run_client(
     }
 }
 
+/// Fetch independent daemon properties together. A slow keyring, device scan,
+/// or history read should not serialize every other value needed to show the
+/// settings window.
+async fn read_initial_snapshot(proxy: &DaemonProxy<'_>) -> zbus::Result<DaemonSnapshot> {
+    let (
+        state,
+        shortcut_trigger,
+        shortcut_description,
+        shortcut_mode,
+        transcriber_config,
+        injection_config,
+        preview_config,
+        dictionary_config,
+        audio_behavior_config,
+        history_retention_config,
+        audio_signal,
+        audio_level,
+        transcription_history,
+        audio_input_devices,
+        audio_input_device,
+        sample_rate,
+        channels,
+        portal_connected,
+        last_transcript,
+        last_error,
+    ) = tokio::try_join!(
+        proxy.state(),
+        proxy.shortcut_trigger(),
+        async { Ok::<_, zbus::Error>(proxy.shortcut_description().await.ok()) },
+        proxy.shortcut_mode(),
+        proxy.transcriber_config(),
+        proxy.injection_config(),
+        proxy.preview_config(),
+        proxy.dictionary_config(),
+        proxy.audio_behavior_config(),
+        proxy.history_retention_config(),
+        proxy.audio_signal(),
+        proxy.audio_level(),
+        async {
+            Ok::<_, zbus::Error>(
+                proxy
+                    .transcription_history()
+                    .await
+                    .unwrap_or_else(|_| "[]".to_string()),
+            )
+        },
+        async {
+            Ok::<_, zbus::Error>(
+                proxy
+                    .audio_input_devices()
+                    .await
+                    .unwrap_or_else(|_| "[]".to_string()),
+            )
+        },
+        async { Ok::<_, zbus::Error>(proxy.audio_input_device().await.unwrap_or_default()) },
+        proxy.sample_rate(),
+        proxy.channels(),
+        proxy.portal_connected(),
+        proxy.last_transcript(),
+        proxy.last_error(),
+    )?;
+
+    Ok(DaemonSnapshot {
+        state,
+        shortcut_description: shortcut_description.unwrap_or_else(|| shortcut_trigger.clone()),
+        shortcut_trigger,
+        shortcut_mode,
+        transcriber_config,
+        injection_config,
+        preview_config,
+        dictionary_config,
+        audio_behavior_config,
+        history_retention_config,
+        audio_signal,
+        audio_level,
+        transcription_history,
+        audio_input_devices,
+        audio_input_device,
+        sample_rate,
+        channels,
+        portal_connected,
+        last_transcript,
+        last_error,
+    })
+}
+
 async fn try_connect(
     update_tx: &tokio::sync::mpsc::Sender<DaemonUpdate>,
     cmd_rx: &mut tokio::sync::mpsc::Receiver<CommandRequest>,
@@ -1085,64 +1171,9 @@ async fn try_connect(
         return Ok(ConnectionOutcome::Retry(restart_service(update_tx).await));
     }
 
-    // Read initial state
-    let state = proxy.state().await?;
-    let shortcut_trigger = proxy.shortcut_trigger().await?;
-    let shortcut_description = proxy
-        .shortcut_description()
-        .await
-        .unwrap_or_else(|_| shortcut_trigger.clone());
-    let shortcut_mode = proxy.shortcut_mode().await?;
-    let transcriber_config = proxy.transcriber_config().await?;
-    let injection_config = proxy.injection_config().await?;
-    let preview_config = proxy.preview_config().await?;
-    let dictionary_config = proxy.dictionary_config().await?;
-    let audio_behavior_config = proxy.audio_behavior_config().await?;
-    let history_retention_config = proxy.history_retention_config().await?;
-    let audio_signal = proxy.audio_signal().await?;
-    let audio_level = proxy.audio_level().await?;
-    // Keep optional display-only properties tolerant for third-party clients
-    // and forward compatibility. The protocol handshake above has already
-    // replaced an older packaged daemon before authoritative state is read.
-    let transcription_history = proxy
-        .transcription_history()
-        .await
-        .unwrap_or_else(|_| "[]".to_string());
-    let audio_input_devices = proxy
-        .audio_input_devices()
-        .await
-        .unwrap_or_else(|_| "[]".to_string());
-    let audio_input_device = proxy.audio_input_device().await.unwrap_or_default();
-    let sample_rate = proxy.sample_rate().await?;
-    let channels = proxy.channels().await?;
-    let portal_connected = proxy.portal_connected().await?;
-    let last_transcript = proxy.last_transcript().await?;
-    let last_error = proxy.last_error().await?;
-
-    update_tx.try_send(DaemonUpdate::Connected(Box::new(DaemonSnapshot {
-        state,
-        shortcut_trigger,
-        shortcut_description,
-        shortcut_mode,
-        transcriber_config,
-        injection_config,
-        preview_config,
-        dictionary_config,
-        audio_behavior_config,
-        history_retention_config,
-        audio_signal,
-        audio_level,
-        transcription_history,
-        audio_input_devices,
-        audio_input_device,
-        sample_rate,
-        channels,
-        portal_connected,
-        last_transcript,
-        last_error,
-    })))?;
-
-    // Subscribe to property change streams
+    // Subscribe before reading the snapshot. Any property change during the
+    // concurrent reads remains queued and is applied after Connected, so the
+    // GUI cannot silently miss state during startup.
     let mut state_stream = proxy.receive_state_changed().await;
     let mut transcript_stream = proxy.receive_last_transcript_changed().await;
     let mut portal_stream = proxy.receive_portal_connected_changed().await;
@@ -1166,6 +1197,10 @@ async fn try_connect(
     // and terminal streams can be selected out of bus order when both are
     // buffered, allowing stale progress to overwrite a terminal result.
     let mut model_download_stream = proxy.receive_model_download_changed().await?;
+
+    let snapshot = read_initial_snapshot(&proxy).await?;
+    update_tx.try_send(DaemonUpdate::Connected(Box::new(snapshot)))?;
+
     let model_status_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let model_status_proxy = Arc::new(tokio::sync::OnceCell::new());
     let mut model_status_tasks = FuturesUnordered::new();

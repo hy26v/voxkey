@@ -30,7 +30,6 @@ class _BoundedParakeetHandler(BaseHTTPRequestHandler):
             duration = recording.getnframes() / recording.getframerate()
 
         with self.server.result_lock:
-            index = len(self.server.durations)
             self.server.durations.append(duration)
 
         if duration > 120:
@@ -40,7 +39,7 @@ class _BoundedParakeetHandler(BaseHTTPRequestHandler):
             }
         else:
             status = 200
-            response = {"text": self.server.transcripts[index]}
+            response = {"text": self.server.transcript_for_duration(duration)}
         payload = json.dumps(response).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -206,10 +205,11 @@ async def test_long_saved_recording_is_chunked_without_losing_its_ends(
     server = ThreadingHTTPServer(("127.0.0.1", 0), _BoundedParakeetHandler)
     server.durations = []
     server.result_lock = threading.Lock()
-    server.transcripts = [
-        "the opening paragraph boundary words",
-        "boundary words the closing paragraph",
-    ]
+    server.transcript_for_duration = lambda duration: (
+        "the opening paragraph boundary words"
+        if duration > 100
+        else "boundary words the closing paragraph"
+    )
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 

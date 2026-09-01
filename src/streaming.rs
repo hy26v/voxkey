@@ -18,6 +18,8 @@ type DynError = Box<dyn std::error::Error + Send + Sync>;
 const REALTIME_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const REALTIME_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const REALTIME_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const REALTIME_AUDIO_BATCH_DURATION: std::time::Duration = std::time::Duration::from_millis(100);
+const REALTIME_PREVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const MAX_REALTIME_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 const MAX_REALTIME_ERROR_BYTES: usize = 4 * 1024;
 
@@ -25,7 +27,7 @@ pub struct StreamingSession {
     pub config: MistralRealtimeConfig,
     pub sample_rate: u32,
     pub channels: u16,
-    pub audio_rx: mpsc::Receiver<Vec<i16>>,
+    pub audio_rx: mpsc::Receiver<Arc<[i16]>>,
     pub capture_error_rx: tokio::sync::watch::Receiver<Option<String>>,
     pub desktop: Arc<DesktopInput>,
     pub state_tx: mpsc::Sender<Event>,
@@ -238,6 +240,25 @@ where
     }
 }
 
+async fn send_audio_append<S>(
+    sink: &mut S,
+    samples: &[i16],
+    channels: u16,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<bool, DynError>
+where
+    S: futures_util::Sink<tungstenite::Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let encoded = encode_pcm_samples(samples, channels)?;
+    let message = AudioAppend {
+        r#type: "input_audio.append",
+        audio: &encoded,
+    };
+    let json = serde_json::to_string(&message)?;
+    send_with_deadline(sink, tungstenite::Message::Text(json.into()), cancel).await
+}
+
 async fn wait_for_drain_deadline(
     deadline: Option<tokio::time::Instant>,
     limit: std::time::Duration,
@@ -251,6 +272,13 @@ async fn wait_for_drain_deadline(
         limit.as_secs_f32()
     )
     .into())
+}
+
+async fn wait_for_preview_deadline(deadline: Option<tokio::time::Instant>) {
+    let Some(deadline) = deadline else {
+        return std::future::pending().await;
+    };
+    tokio::time::sleep_until(deadline).await;
 }
 
 pub(crate) fn streaming_url(
@@ -425,11 +453,10 @@ pub async fn run_streaming_session(
     let mut draining = false;
     let mut drain_deadline = None;
     let mut stop_rx = Some(stop_rx);
-    let mut preview_dirty = false;
+    let mut preview_deadline = None;
     let mut capture_errors_open = true;
-    let mut preview_tick = tokio::time::interval(std::time::Duration::from_millis(100));
-    preview_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    preview_tick.tick().await;
+    let mut audio_batcher =
+        crate::audio_batch::PcmBatcher::new(sample_rate, channels, REALTIME_AUDIO_BATCH_DURATION)?;
     let live_transcript = LiveTranscriptTarget {
         shared: &shared,
         connection: &connection,
@@ -477,29 +504,43 @@ pub async fn run_streaming_session(
             chunk = audio_rx.recv(), if !draining => {
                 match chunk {
                     Some(samples) => {
-                        let encoded = encode_pcm_samples(&samples, channels)?;
-                        let msg = AudioAppend {
-                            r#type: "input_audio.append",
-                            audio: &encoded,
-                        };
-                        let json = serde_json::to_string(&msg)?;
-                        if !send_with_deadline(
-                            &mut ws_sink,
-                            tungstenite::Message::Text(json.into()),
-                            &mut cancel_watch,
-                        )
-                        .await
-                        .inspect_err(|_| {
-                            terminal_outcome =
-                                voxkey_ipc::TranscriptOutcome::PartialTransportClose;
-                        })?
+                        for batch in audio_batcher.push(&samples)? {
+                            if !send_audio_append(
+                                &mut ws_sink,
+                                &batch,
+                                channels,
+                                &mut cancel_watch,
+                            )
+                            .await
+                            .inspect_err(|_| {
+                                terminal_outcome =
+                                    voxkey_ipc::TranscriptOutcome::PartialTransportClose;
+                            })?
+                            {
+                                terminal_outcome = voxkey_ipc::TranscriptOutcome::Cancelled;
+                                let _ = state_tx.send(Event::StreamingDone).await;
+                                return Ok(());
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(batch) = audio_batcher.flush()
+                            && !send_audio_append(
+                                &mut ws_sink,
+                                &batch,
+                                channels,
+                                &mut cancel_watch,
+                            )
+                            .await
+                            .inspect_err(|_| {
+                                terminal_outcome =
+                                    voxkey_ipc::TranscriptOutcome::PartialTransportClose;
+                            })?
                         {
                             terminal_outcome = voxkey_ipc::TranscriptOutcome::Cancelled;
                             let _ = state_tx.send(Event::StreamingDone).await;
                             return Ok(());
                         }
-                    }
-                    None => {
                         // Audio channel closed — treat as stop
                         if should_send_audio_end(AudioEndEvent::ChannelClosed) {
                             tracing::info!("Audio channel closed, sending input_audio.end");
@@ -572,7 +613,9 @@ pub async fn run_streaming_session(
                                         &mut pending,
                                         &delta,
                                     )?;
-                                    preview_dirty = true;
+                                    preview_deadline.get_or_insert_with(|| {
+                                        tokio::time::Instant::now() + REALTIME_PREVIEW_INTERVAL
+                                    });
                                     let (ready, rest) = crate::dictionary::split_ready(&pending, &replacement_rules);
                                     let rest = rest.to_string();
                                     if !ready.is_empty() {
@@ -679,14 +722,14 @@ pub async fn run_streaming_session(
                 }
             }
 
-            _ = preview_tick.tick(), if preview_dirty => {
+            _ = wait_for_preview_deadline(preview_deadline), if preview_deadline.is_some() => {
                 publish_live_preview(
                     &accumulated_transcript,
                     &replacement_rules,
                     &live_transcript,
                 )
                 .await;
-                preview_dirty = false;
+                preview_deadline = None;
             }
             }
         }
@@ -930,6 +973,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(decoded, 0_i16.to_le_bytes());
+    }
+
+    #[test]
+    fn realtime_callbacks_are_coalesced_into_tenth_second_messages() {
+        let mut batcher =
+            crate::audio_batch::PcmBatcher::new(16_000, 1, REALTIME_AUDIO_BATCH_DURATION).unwrap();
+        let mut messages = Vec::new();
+        for _ in 0..20 {
+            messages.extend(batcher.push(&[1_i16; 80]).unwrap());
+        }
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].len(), 1_600);
+        assert_eq!(batcher.flush(), None);
     }
 
     #[test]

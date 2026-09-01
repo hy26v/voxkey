@@ -1,7 +1,7 @@
 // ABOUTME: Dispatches transcription to local engines, cloud APIs, or model-specific HTTP servers.
 // ABOUTME: Captures transcript text from either stdout or JSON response.
 
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -77,6 +77,9 @@ const MAX_BATCH_AUDIO_BYTES: u64 = 64 * 1024 * 1024;
 /// split is heard in full by at least one request.
 const PARAKEET_HTTP_CHUNK_DURATION: Duration = Duration::from_secs(115);
 const PARAKEET_HTTP_CHUNK_OVERLAP: Duration = Duration::from_secs(5);
+/// Upload a few independent chunks at once so long recordings do not take the
+/// sum of every server round trip. `buffered` keeps the results in source order.
+const PARAKEET_HTTP_CHUNK_CONCURRENCY: usize = 3;
 const MAX_TRANSCRIPT_OVERLAP_WORDS: usize = 64;
 /// Maximum transcript bytes retained from a whisper.cpp subprocess.
 const MAX_WHISPER_STDOUT_BYTES: usize = 1024 * 1024;
@@ -1086,9 +1089,20 @@ async fn transcribe_parakeet_http(
         "Transcribing a long recording as {} overlapping server chunks",
         chunks.len()
     );
+    let chunk_paths = chunks
+        .iter()
+        .map(|chunk| chunk.path().to_path_buf())
+        .collect::<Vec<_>>();
+    let chunk_results =
+        futures_util::stream::iter(chunk_paths.into_iter().map(|audio_path| async move {
+            transcribe_parakeet_http_chunk(server, purpose, &audio_path).await
+        }))
+        .buffered(PARAKEET_HTTP_CHUNK_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+
     let mut transcript = String::new();
-    for chunk in &chunks {
-        let next = transcribe_parakeet_http_chunk(server, purpose, chunk.path()).await?;
+    for next in chunk_results {
         transcript = merge_overlapping_transcripts(&transcript, &next);
     }
     Ok(transcript)
@@ -3320,11 +3334,24 @@ mod tests {
         let durations = Arc::new(Mutex::new(Vec::new()));
         let server_durations = durations.clone();
         tokio::spawn(async move {
-            for successful_text in ["alpha boundary words", "boundary words omega"] {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut socket).await;
                 let duration = uploaded_wav_duration(&request);
                 server_durations.lock().unwrap().push(duration);
+                requests.push((socket, duration));
+            }
+
+            // Wait for both uploads before answering either one. This models a
+            // server that processes independent chunks concurrently and makes
+            // a sequential client hit the timeout below.
+            for (mut socket, duration) in requests {
+                let successful_text = if duration > 100.0 {
+                    "alpha boundary words"
+                } else {
+                    "boundary words omega"
+                };
                 let (status, body) = if duration > 120.0 {
                     (
                         "422 Unprocessable Entity",
@@ -3360,19 +3387,23 @@ mod tests {
 
         let client = reqwest::Client::new();
         let endpoint = format!("http://{address}/v1/audio/transcriptions");
-        let result = transcribe_parakeet_http(ModelServerTranscription {
-            server: ModelServer {
-                client: &client,
-                api_key: "",
-                model: "parakeet-tdt-0.6b-v3",
-                endpoint: &endpoint,
-                allow_insecure_http: false,
-                prompt: None,
-            },
-            purpose: Purpose::Final,
-            audio_path: wav.path(),
-        })
-        .await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            transcribe_parakeet_http(ModelServerTranscription {
+                server: ModelServer {
+                    client: &client,
+                    api_key: "",
+                    model: "parakeet-tdt-0.6b-v3",
+                    endpoint: &endpoint,
+                    allow_insecure_http: false,
+                    prompt: None,
+                },
+                purpose: Purpose::Final,
+                audio_path: wav.path(),
+            }),
+        )
+        .await
+        .expect("chunk uploads did not run concurrently");
         let transcript =
             result.unwrap_or_else(|error| panic!("long recording was not transcribed: {error}"));
 

@@ -48,22 +48,25 @@ pub fn load() -> Vec<HistoryEntry> {
     load_from(&history_path())
 }
 
-pub fn append_with_policy(
-    entries: &mut Vec<HistoryEntry>,
+/// Persist a candidate history by ownership. Shared state already made the one
+/// isolation copy needed to keep its mutex available during disk I/O, so this
+/// path avoids cloning every entry a second time.
+pub(crate) fn append_owned_with_policy(
+    mut entries: Vec<HistoryEntry>,
     text: String,
     config: &TranscriberConfig,
     outcome: TranscriptOutcome,
     pending_insertion: Option<String>,
     metrics: HistoryMetrics,
     retention: &HistoryRetentionConfig,
-) -> std::io::Result<u64> {
+) -> std::io::Result<(Vec<HistoryEntry>, u64)> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let now_ms = now.as_millis().min(i64::MAX as u128) as i64;
     let timestamp_id = now.as_nanos().min(u64::MAX as u128) as u64;
     let entry = HistoryEntry {
-        id: next_entry_id(entries, timestamp_id),
+        id: next_entry_id(&entries, timestamp_id),
         recorded_at_unix_ms: now_ms,
         text,
         provider: provider_label(config),
@@ -78,23 +81,44 @@ pub fn append_with_policy(
     };
 
     let id = entry.id;
-    let mut updated = entries.clone();
-    let removed = push_entry(&mut updated, entry, retention, now_ms);
-    persist(&updated)?;
-    *entries = updated;
+    let removed = push_entry(&mut entries, entry, retention, now_ms);
+    persist(&entries)?;
     remove_managed_recordings(&removed, &history_path());
-    Ok(id)
+    Ok((entries, id))
 }
 
-pub fn append_failed_recording_with_policy(
+#[cfg(test)]
+fn append_failed_recording_to(
     entries: &mut Vec<HistoryEntry>,
     source_audio: &Path,
     config: &TranscriberConfig,
     error: String,
     metrics: HistoryMetrics,
     retention: &HistoryRetentionConfig,
+    history_path: &Path,
 ) -> Result<u64, PreserveFailedRecordingError> {
-    append_failed_recording_to(
+    let (updated, id) = append_failed_recording_owned_to(
+        entries.clone(),
+        source_audio,
+        config,
+        error,
+        metrics,
+        retention,
+        history_path,
+    )?;
+    *entries = updated;
+    Ok(id)
+}
+
+pub(crate) fn append_failed_recording_owned_with_policy(
+    entries: Vec<HistoryEntry>,
+    source_audio: &Path,
+    config: &TranscriberConfig,
+    error: String,
+    metrics: HistoryMetrics,
+    retention: &HistoryRetentionConfig,
+) -> Result<(Vec<HistoryEntry>, u64), PreserveFailedRecordingError> {
+    append_failed_recording_owned_to(
         entries,
         source_audio,
         config,
@@ -105,21 +129,21 @@ pub fn append_failed_recording_with_policy(
     )
 }
 
-fn append_failed_recording_to(
-    entries: &mut Vec<HistoryEntry>,
+fn append_failed_recording_owned_to(
+    mut entries: Vec<HistoryEntry>,
     source_audio: &Path,
     config: &TranscriberConfig,
     error: String,
     metrics: HistoryMetrics,
     retention: &HistoryRetentionConfig,
     history_path: &Path,
-) -> Result<u64, PreserveFailedRecordingError> {
+) -> Result<(Vec<HistoryEntry>, u64), PreserveFailedRecordingError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let timestamp_id = now.as_nanos().min(u64::MAX as u128) as u64;
     let now_ms = now.as_millis().min(i64::MAX as u128) as i64;
-    let id = next_recording_id(entries, timestamp_id, history_path);
+    let id = next_recording_id(&entries, timestamp_id, history_path);
     let saved_audio = managed_recording_path(history_path, id);
 
     crate::persistence::copy_private(source_audio, &saved_audio).map_err(|error| {
@@ -143,17 +167,15 @@ fn append_failed_recording_to(
         audio_duration_ms: metrics.audio_duration_ms,
         processing_duration_ms: metrics.processing_duration_ms,
     };
-    let mut updated = entries.clone();
-    let removed = push_entry(&mut updated, entry, retention, now_ms);
-    if let Err(error) = persist_to(history_path, &updated) {
+    let removed = push_entry(&mut entries, entry, retention, now_ms);
+    if let Err(error) = persist_to(history_path, &entries) {
         return Err(PreserveFailedRecordingError {
             error,
             saved_path: Some(saved_audio),
         });
     }
-    *entries = updated;
     remove_managed_recordings(&removed, history_path);
-    Ok(id)
+    Ok((entries, id))
 }
 
 fn next_entry_id(entries: &[HistoryEntry], timestamp_id: u64) -> u64 {
@@ -217,34 +239,41 @@ pub fn enforce_retention(
     entries: &mut Vec<HistoryEntry>,
     retention: &HistoryRetentionConfig,
 ) -> std::io::Result<usize> {
+    let (updated, removed) = enforce_retention_owned(entries.clone(), retention)?;
+    *entries = updated;
+    Ok(removed)
+}
+
+pub(crate) fn enforce_retention_owned(
+    mut entries: Vec<HistoryEntry>,
+    retention: &HistoryRetentionConfig,
+) -> std::io::Result<(Vec<HistoryEntry>, usize)> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64;
-    let mut updated = entries.clone();
-    let removed = prune_entries_at(&mut updated, retention, now_ms);
+    let removed = prune_entries_at(&mut entries, retention, now_ms);
     if removed.is_empty() {
-        return Ok(0);
+        return Ok((entries, 0));
     }
-    persist(&updated)?;
-    *entries = updated;
+    persist(&entries)?;
+    let removed_count = removed.len();
     remove_managed_recordings(&removed, &history_path());
-    Ok(removed.len())
+    Ok((entries, removed_count))
 }
 
-pub fn set_pinned(
-    entries: &mut Vec<HistoryEntry>,
+pub(crate) fn set_pinned_owned(
+    mut entries: Vec<HistoryEntry>,
     id: u64,
     pinned: bool,
     retention: &HistoryRetentionConfig,
-) -> std::io::Result<bool> {
-    let mut updated = entries.clone();
-    let Some(entry) = updated.iter_mut().find(|entry| entry.id == id) else {
-        return Ok(false);
+) -> std::io::Result<(Vec<HistoryEntry>, bool)> {
+    let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+        return Ok((entries, false));
     };
     if entry.pinned == pinned {
-        return Ok(true);
+        return Ok((entries, true));
     }
     entry.pinned = pinned;
     let removed = if pinned {
@@ -255,23 +284,27 @@ pub fn set_pinned(
             .unwrap_or_default()
             .as_millis()
             .min(i64::MAX as u128) as i64;
-        prune_entries_at(&mut updated, retention, now_ms)
+        prune_entries_at(&mut entries, retention, now_ms)
     };
-    persist(&updated)?;
-    *entries = updated;
+    persist(&entries)?;
     remove_managed_recordings(&removed, &history_path());
-    Ok(true)
+    Ok((entries, true))
 }
 
-pub fn update_text(entries: &mut Vec<HistoryEntry>, id: u64, text: &str) -> Result<bool, String> {
+pub(crate) fn update_text_owned(
+    entries: Vec<HistoryEntry>,
+    id: u64,
+    text: &str,
+) -> Result<(Vec<HistoryEntry>, bool), String> {
     let edited_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64;
-    update_text_at_with(entries, id, text, edited_at_unix_ms, persist)
+    update_text_owned_at_with(entries, id, text, edited_at_unix_ms, persist)
 }
 
+#[cfg(test)]
 fn update_text_at_with<F>(
     entries: &mut Vec<HistoryEntry>,
     id: u64,
@@ -279,6 +312,22 @@ fn update_text_at_with<F>(
     edited_at_unix_ms: i64,
     persist: F,
 ) -> Result<bool, String>
+where
+    F: FnOnce(&[HistoryEntry]) -> std::io::Result<()>,
+{
+    let (updated, changed) =
+        update_text_owned_at_with(entries.clone(), id, text, edited_at_unix_ms, persist)?;
+    *entries = updated;
+    Ok(changed)
+}
+
+fn update_text_owned_at_with<F>(
+    mut entries: Vec<HistoryEntry>,
+    id: u64,
+    text: &str,
+    edited_at_unix_ms: i64,
+    persist: F,
+) -> Result<(Vec<HistoryEntry>, bool), String>
 where
     F: FnOnce(&[HistoryEntry]) -> std::io::Result<()>,
 {
@@ -291,55 +340,66 @@ where
             "A saved transcription cannot exceed {MAX_HISTORY_TEXT_BYTES} bytes"
         ));
     }
-    let mut updated = entries.clone();
-    let Some(entry) = updated.iter_mut().find(|entry| entry.id == id) else {
-        return Ok(false);
+    let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+        return Ok((entries, false));
     };
     entry.text = text.to_string();
     entry.edited_at_unix_ms = Some(edited_at_unix_ms);
     // A correction becomes the authoritative content for the next explicit
     // insertion, replacing any stale suffix from the original text.
     entry.pending_insertion = None;
-    persist(&updated).map_err(|error| error.to_string())?;
-    *entries = updated;
-    Ok(true)
+    persist(&entries).map_err(|error| error.to_string())?;
+    Ok((entries, true))
 }
 
-pub fn set_pending_insertion(
-    entries: &mut Vec<HistoryEntry>,
+pub(crate) fn set_pending_insertion_owned(
+    mut entries: Vec<HistoryEntry>,
     id: u64,
     pending_insertion: Option<String>,
-) -> std::io::Result<bool> {
-    let mut updated = entries.clone();
-    let Some(entry) = updated.iter_mut().find(|entry| entry.id == id) else {
-        return Ok(false);
+) -> std::io::Result<(Vec<HistoryEntry>, bool)> {
+    let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+        return Ok((entries, false));
     };
     entry.pending_insertion = pending_insertion;
-    persist(&updated)?;
-    *entries = updated;
-    Ok(true)
+    persist(&entries)?;
+    Ok((entries, true))
 }
 
-pub fn delete(entries: &mut Vec<HistoryEntry>, id: u64) -> std::io::Result<bool> {
+pub(crate) fn delete_owned(
+    entries: Vec<HistoryEntry>,
+    id: u64,
+) -> std::io::Result<(Vec<HistoryEntry>, bool)> {
     let removed = entries.iter().find(|entry| entry.id == id).cloned();
-    let changed = delete_with(entries, id, persist)?;
+    let (updated, changed) = delete_owned_with(entries, id, persist)?;
     if changed && let Some(entry) = removed {
         remove_managed_recordings(&[entry], &history_path());
     }
-    Ok(changed)
+    Ok((updated, changed))
 }
 
+#[cfg(test)]
 fn delete_with<F>(entries: &mut Vec<HistoryEntry>, id: u64, persist: F) -> std::io::Result<bool>
 where
     F: FnOnce(&[HistoryEntry]) -> std::io::Result<()>,
 {
-    let mut updated = entries.clone();
-    if !remove_entry(&mut updated, id) {
-        return Ok(false);
-    }
-    persist(&updated)?;
+    let (updated, changed) = delete_owned_with(entries.clone(), id, persist)?;
     *entries = updated;
-    Ok(true)
+    Ok(changed)
+}
+
+fn delete_owned_with<F>(
+    mut entries: Vec<HistoryEntry>,
+    id: u64,
+    persist: F,
+) -> std::io::Result<(Vec<HistoryEntry>, bool)>
+where
+    F: FnOnce(&[HistoryEntry]) -> std::io::Result<()>,
+{
+    if !remove_entry(&mut entries, id) {
+        return Ok((entries, false));
+    }
+    persist(&entries)?;
+    Ok((entries, true))
 }
 
 fn remove_entry(entries: &mut Vec<HistoryEntry>, id: u64) -> bool {
@@ -348,18 +408,25 @@ fn remove_entry(entries: &mut Vec<HistoryEntry>, id: u64) -> bool {
     old_len != entries.len()
 }
 
-pub fn clear(entries: &mut Vec<HistoryEntry>) -> std::io::Result<()> {
-    let removed = entries
-        .iter()
-        .filter(|entry| !entry.pinned)
-        .cloned()
-        .collect::<Vec<_>>();
-    clear_with(entries, persist)?;
+pub(crate) fn clear_owned(entries: Vec<HistoryEntry>) -> std::io::Result<Vec<HistoryEntry>> {
+    let (kept, removed): (Vec<_>, Vec<_>) = entries.into_iter().partition(|entry| entry.pinned);
+    persist(&kept)?;
     remove_managed_recordings(&removed, &history_path());
+    Ok(kept)
+}
+
+#[cfg(test)]
+fn clear_with<F>(entries: &mut Vec<HistoryEntry>, persist: F) -> std::io::Result<()>
+where
+    F: FnOnce(&[HistoryEntry]) -> std::io::Result<()>,
+{
+    let kept = clear_owned_with(entries.clone(), persist)?;
+    *entries = kept;
     Ok(())
 }
 
-fn clear_with<F>(entries: &mut Vec<HistoryEntry>, persist: F) -> std::io::Result<()>
+#[cfg(test)]
+fn clear_owned_with<F>(entries: Vec<HistoryEntry>, persist: F) -> std::io::Result<Vec<HistoryEntry>>
 where
     F: FnOnce(&[HistoryEntry]) -> std::io::Result<()>,
 {
@@ -369,8 +436,7 @@ where
         .cloned()
         .collect::<Vec<_>>();
     persist(&kept)?;
-    *entries = kept;
-    Ok(())
+    Ok(kept)
 }
 
 fn provider_label(config: &TranscriberConfig) -> String {

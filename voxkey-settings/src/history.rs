@@ -13,6 +13,9 @@ use crate::{
     gui_settings,
 };
 
+const HISTORY_PAGE_SIZE: usize = 100;
+const HISTORY_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HistoryOutcomePresentation {
     icon: &'static str,
@@ -94,6 +97,8 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
     let initial_filter =
         HistoryFilter::from_key(&gui_settings::load_history_filter()).unwrap_or(HistoryFilter::All);
     let active_filter = Rc::new(Cell::new(initial_filter));
+    let visible_limit = Rc::new(Cell::new(HISTORY_PAGE_SIZE));
+    let pending_search_rebuild = Rc::new(RefCell::new(None::<gtk4::glib::SourceId>));
     let latest_copy_text = Rc::new(RefCell::new(None::<String>));
     let copy_latest_action = gtk4::gio::SimpleAction::new("copy-latest", None);
     copy_latest_action.set_enabled(false);
@@ -285,7 +290,16 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
         .title("Recent dictations")
         .description("Saved locally on this computer")
         .build();
-    clamp.set_child(Some(&group));
+    let load_more = gtk4::Button::with_label("Load more");
+    load_more.add_css_class("pill");
+    load_more.set_halign(gtk4::Align::Center);
+    load_more.set_margin_top(6);
+    load_more.set_visible(false);
+    load_more.update_property(&[gtk4::accessible::Property::Label("Load more dictations")]);
+    let list_content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    list_content.append(&group);
+    list_content.append(&load_more);
+    clamp.set_child(Some(&list_content));
     scrolled.set_child(Some(&clamp));
     view_stack.add_named(&scrolled, Some("list"));
     page.append(&view_stack);
@@ -297,6 +311,7 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
         let mutable_buttons = mutable_buttons.clone();
         let actions_available = actions_available.clone();
         let active_filter = active_filter.clone();
+        let visible_limit = visible_limit.clone();
         let latest_copy_text = latest_copy_text.clone();
         let copy_latest_action = copy_latest_action.clone();
         let export_text_action = export_text_action.clone();
@@ -309,6 +324,7 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
         let empty_action = empty_action.clone();
         let clear_search_action = clear_search_action.clone();
         let clear_button = clear_button.clone();
+        let load_more = load_more.clone();
         let handle = handle.clone();
         let toast_overlay = toast_overlay.clone();
         Rc::new(move || {
@@ -320,24 +336,17 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
 
             let query = search.text().trim().to_lowercase();
             let filter = active_filter.get();
-            let filtered: Vec<_> = entries
-                .borrow()
-                .iter()
-                .filter(|entry| {
-                    history_matches_filter(entry, filter) && history_matches_query(entry, &query)
-                })
-                .cloned()
-                .collect();
+            let entries = entries.borrow();
+            let total = entries.len();
+            let clearable = entries.iter().filter(|entry| !entry.pinned).count();
+            let (filtered_count, visible_entries) =
+                select_visible_history(&entries, filter, &query, visible_limit.get());
+            let rendered = visible_entries.into_iter().cloned().collect::<Vec<_>>();
+            let latest_text = latest_history_text(&entries);
+            drop(entries);
 
-            let total = entries.borrow().len();
-            let clearable = entries
-                .borrow()
-                .iter()
-                .filter(|entry| !entry.pinned)
-                .count();
             export_text_action.set_enabled(total > 0);
             export_json_action.set_enabled(total > 0);
-            let latest_text = latest_history_text(&entries.borrow());
             copy_latest_action.set_enabled(latest_text.is_some());
             *latest_copy_text.borrow_mut() = latest_text;
             let clear_label = clear_history_action_label(clearable);
@@ -348,13 +357,16 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
             group.set_title(history_group_title(&query, filter));
             group.set_description(Some(&history_count_description(
                 total,
-                filtered.len(),
+                filtered_count,
                 filtering,
             )));
+            let remaining = filtered_count.saturating_sub(rendered.len());
+            load_more.set_label(&history_load_more_label(remaining));
+            load_more.set_visible(remaining > 0);
 
             clear_button.set_sensitive(clearable > 0 && actions_available.get());
-            if filtered.is_empty() {
-                if entries.borrow().is_empty() {
+            if rendered.is_empty() {
+                if total == 0 {
                     empty.set_title("No saved dictations");
                     empty.set_description(Some(
                         "Use your keyboard shortcut to dictate in any app. Completed transcripts and recoverable failures will appear here.",
@@ -373,7 +385,7 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
             }
 
             view_stack.set_visible_child_name("list");
-            for entry in filtered {
+            for entry in rendered {
                 let row = adw::ActionRow::builder()
                     .title(history_title(&entry))
                     .subtitle(format_history_subtitle(&entry))
@@ -526,6 +538,8 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
         let active_filter = active_filter.clone();
         let filter_button = filter_button.clone();
         let rebuild = rebuild.clone();
+        let visible_limit = visible_limit.clone();
+        let pending_search_rebuild = pending_search_rebuild.clone();
         filter_action.connect_activate(move |action, parameter| {
             let Some(filter) = parameter
                 .and_then(gtk4::glib::Variant::str)
@@ -537,12 +551,38 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
             action.set_state(&filter.key().to_variant());
             gui_settings::save_history_filter(filter.key());
             update_history_filter_button(&filter_button, filter);
+            visible_limit.set(HISTORY_PAGE_SIZE);
+            if let Some(source) = pending_search_rebuild.borrow_mut().take() {
+                source.remove();
+            }
             rebuild();
         });
     }
     {
         let rebuild = rebuild.clone();
-        search.connect_search_changed(move |_| rebuild());
+        let visible_limit = visible_limit.clone();
+        let pending_search_rebuild = pending_search_rebuild.clone();
+        search.connect_search_changed(move |_| {
+            visible_limit.set(HISTORY_PAGE_SIZE);
+            if let Some(source) = pending_search_rebuild.borrow_mut().take() {
+                source.remove();
+            }
+            let rebuild = rebuild.clone();
+            let completed = pending_search_rebuild.clone();
+            let source = gtk4::glib::timeout_add_local_once(HISTORY_SEARCH_DEBOUNCE, move || {
+                completed.borrow_mut().take();
+                rebuild();
+            });
+            *pending_search_rebuild.borrow_mut() = Some(source);
+        });
+    }
+    {
+        let visible_limit = visible_limit.clone();
+        let rebuild = rebuild.clone();
+        load_more.connect_clicked(move |_| {
+            visible_limit.set(visible_limit.get().saturating_add(HISTORY_PAGE_SIZE));
+            rebuild();
+        });
     }
 
     {
@@ -585,9 +625,15 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
     let apply_json: Rc<dyn Fn(&str)> = {
         let entries = entries.clone();
         let rebuild = rebuild.clone();
+        let visible_limit = visible_limit.clone();
+        let pending_search_rebuild = pending_search_rebuild.clone();
         Rc::new(move |json| {
             if let Ok(parsed) = serde_json::from_str::<Vec<voxkey_ipc::HistoryEntry>>(json) {
                 *entries.borrow_mut() = parsed;
+                visible_limit.set(HISTORY_PAGE_SIZE);
+                if let Some(source) = pending_search_rebuild.borrow_mut().take() {
+                    source.remove();
+                }
                 rebuild();
             }
         })
@@ -687,8 +733,15 @@ fn history_group_title(query: &str, filter: HistoryFilter) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn history_matches_query(entry: &voxkey_ipc::HistoryEntry, query: &str) -> bool {
     let query = query.trim().to_lowercase();
+    history_matches_normalized_query(entry, &query)
+}
+
+/// Match a query normalized once by the caller. Rebuilding a large History
+/// should not allocate and lowercase the same search string for every entry.
+fn history_matches_normalized_query(entry: &voxkey_ipc::HistoryEntry, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
@@ -700,16 +753,41 @@ fn history_matches_query(entry: &voxkey_ipc::HistoryEntry, query: &str) -> bool 
         history_outcome_label(entry.outcome).unwrap_or_default(),
     ]
     .into_iter()
-    .any(|value| value.to_lowercase().contains(&query))
+    .any(|value| value.to_lowercase().contains(query))
         || history_provider_name(&entry.provider)
             .to_lowercase()
-            .contains(&query)
+            .contains(query)
         || format_timestamp(entry.recorded_at_unix_ms)
             .to_lowercase()
-            .contains(&query)
-        || (entry.pinned && "pinned".contains(&query))
-        || (entry.edited_at_unix_ms.is_some() && "edited".contains(&query))
-        || (entry.text.is_empty() && history_title(entry).to_lowercase().contains(&query))
+            .contains(query)
+        || (entry.pinned && "pinned".contains(query))
+        || (entry.edited_at_unix_ms.is_some() && "edited".contains(query))
+        || (entry.text.is_empty() && history_title(entry).to_lowercase().contains(query))
+}
+
+fn select_visible_history<'a>(
+    entries: &'a [voxkey_ipc::HistoryEntry],
+    filter: HistoryFilter,
+    normalized_query: &str,
+    limit: usize,
+) -> (usize, Vec<&'a voxkey_ipc::HistoryEntry>) {
+    let mut matching = 0_usize;
+    let mut visible = Vec::with_capacity(limit.min(entries.len()));
+    for entry in entries {
+        if history_matches_filter(entry, filter)
+            && history_matches_normalized_query(entry, normalized_query)
+        {
+            matching += 1;
+            if visible.len() < limit {
+                visible.push(entry);
+            }
+        }
+    }
+    (matching, visible)
+}
+
+fn history_load_more_label(remaining: usize) -> String {
+    format!("Load {} more", remaining.min(HISTORY_PAGE_SIZE))
 }
 
 fn history_action_label(action: &str, entry: &voxkey_ipc::HistoryEntry) -> String {
@@ -1503,6 +1581,33 @@ mod tests {
     }
 
     #[test]
+    fn large_histories_render_in_bounded_progressive_pages() {
+        let entries = (0..5_000_u64)
+            .map(|id| voxkey_ipc::HistoryEntry {
+                id,
+                recorded_at_unix_ms: id as i64,
+                text: format!("Dictation {id}"),
+                provider: "Test".to_string(),
+                outcome: voxkey_ipc::TranscriptOutcome::Completed,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        let (matching, first_page) =
+            select_visible_history(&entries, HistoryFilter::All, "", HISTORY_PAGE_SIZE);
+        assert_eq!(matching, 5_000);
+        assert_eq!(first_page.len(), 100);
+        assert_eq!(first_page.first().unwrap().id, 0);
+        assert_eq!(first_page.last().unwrap().id, 99);
+
+        let (_, second_page) =
+            select_visible_history(&entries, HistoryFilter::All, "", HISTORY_PAGE_SIZE * 2);
+        assert_eq!(second_page.len(), 200);
+        assert_eq!(history_load_more_label(4_900), "Load 100 more");
+        assert_eq!(history_load_more_label(37), "Load 37 more");
+    }
+
+    #[test]
     fn history_search_matches_the_metadata_people_see() {
         let entry = voxkey_ipc::HistoryEntry {
             id: 1,
@@ -1517,6 +1622,7 @@ mod tests {
         };
 
         assert!(history_matches_query(&entry, "parakeet v3 server"));
+        assert!(history_matches_query(&entry, "PARAKEET V3 SERVER"));
         assert!(history_matches_query(&entry, "recording saved"));
         assert!(history_matches_query(&entry, "transcription failed"));
         assert!(history_matches_query(&entry, "remaining words"));

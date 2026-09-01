@@ -456,8 +456,9 @@ struct SegmentedPreview {
     estimated_agreement_lookback_frames: u64,
     open_start: u64,
     retain_start: u64,
-    tail: AudioSnapshot,
+    tail: VecDeque<Arc<[i16]>>,
     tail_base_frame: u64,
+    tail_end_frame: u64,
     commit_queue: VecDeque<Range<u64>>,
     tail_preview: String,
     min_tail_samples: usize,
@@ -492,8 +493,9 @@ impl SegmentedPreview {
             estimated_agreement_lookback_frames,
             open_start: 0,
             retain_start: 0,
-            tail: Vec::new(),
+            tail: VecDeque::new(),
             tail_base_frame: 0,
+            tail_end_frame: 0,
             commit_queue: VecDeque::new(),
             tail_preview: String::new(),
             min_tail_samples,
@@ -551,12 +553,7 @@ impl SegmentedPreview {
     }
 
     fn total_frames(&self) -> u64 {
-        self.tail_base_frame
-            + self
-                .tail
-                .iter()
-                .map(|chunk| (chunk.len() / self.channels) as u64)
-                .sum::<u64>()
+        self.tail_end_frame
     }
 
     fn samples_from(&self, start: u64) -> usize {
@@ -567,7 +564,10 @@ impl SegmentedPreview {
         if chunk.is_empty() {
             return;
         }
-        self.tail.push(chunk);
+        self.tail_end_frame = self
+            .tail_end_frame
+            .saturating_add((chunk.len() / self.channels) as u64);
+        self.tail.push_back(chunk);
         self.trim();
     }
 
@@ -575,14 +575,14 @@ impl SegmentedPreview {
     /// previews retain their configured left lookback; segmented previews
     /// retain from the silence/commit cursor.
     fn trim(&mut self) {
-        while let Some(first) = self.tail.first() {
+        while let Some(first) = self.tail.front() {
             let frames = (first.len() / self.channels) as u64;
             let chunk_end = self.tail_base_frame + frames;
             if chunk_end > self.retain_start {
                 break;
             }
             self.tail_base_frame = chunk_end;
-            self.tail.remove(0);
+            self.tail.pop_front();
         }
     }
 
@@ -592,11 +592,11 @@ impl SegmentedPreview {
         }
     }
 
-    /// Pop the next queued segment and copy its exact audio from the tail.
+    /// Pop the next queued segment and share every fully covered audio chunk.
     fn pop_commit(&mut self) -> Option<(Range<u64>, AudioSnapshot)> {
         let range = self.commit_queue.pop_front()?;
-        let audio = self.slice_frames(range.start, range.end);
-        Some((range, vec![audio]))
+        let audio = self.snapshot_frames(range.start, range.end);
+        Some((range, audio))
     }
 
     fn commit_succeeded(&mut self, range: &Range<u64>, text: String) {
@@ -640,7 +640,7 @@ impl SegmentedPreview {
         }
         let end = self.total_frames();
         Some(RangedSnapshot {
-            audio: vec![self.slice_frames(start, end)],
+            audio: self.snapshot_frames(start, end),
             frames: start..end,
         })
     }
@@ -677,12 +677,12 @@ impl SegmentedPreview {
         self.tail_preview = text;
     }
 
-    /// Copy the frames in [start, end) across chunk boundaries into one buffer.
-    fn slice_frames(&self, start: u64, end: u64) -> Arc<[i16]> {
+    /// Share complete chunks in [start, end), copying only partial boundaries.
+    fn snapshot_frames(&self, start: u64, end: u64) -> AudioSnapshot {
         let start = start.max(self.tail_base_frame);
         let end = end.min(self.total_frames());
         if end <= start {
-            return Arc::from(Vec::<i16>::new());
+            return Vec::new();
         }
         let mut out = Vec::new();
         let mut cursor = self.tail_base_frame;
@@ -696,9 +696,13 @@ impl SegmentedPreview {
             }
             let from = (start.max(chunk_start) - chunk_start) as usize * self.channels;
             let to = (end.min(chunk_end) - chunk_start) as usize * self.channels;
-            out.extend_from_slice(&chunk[from..to]);
+            if from == 0 && to == chunk.len() {
+                out.push(chunk.clone());
+            } else {
+                out.push(Arc::from(chunk[from..to].to_vec()));
+            }
         }
-        Arc::from(out)
+        out
     }
 
     /// Raw live text before dictionary correction: committed utterances followed
@@ -1130,6 +1134,49 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_reuse_complete_chunks_and_copy_only_boundaries() {
+        let first = chunk(&[1, 2, 3, 4]);
+        let middle = chunk(&[5, 6, 7, 8]);
+        let last = chunk(&[9, 10, 11, 12]);
+        let mut sp = state(usize::MAX);
+        sp.push_chunk(first.clone());
+        sp.push_chunk(middle.clone());
+        sp.push_chunk(last.clone());
+
+        let whole = sp.snapshot_frames(0, 12);
+        assert_eq!(whole.len(), 3);
+        assert!(Arc::ptr_eq(&whole[0], &first));
+        assert!(Arc::ptr_eq(&whole[1], &middle));
+        assert!(Arc::ptr_eq(&whole[2], &last));
+
+        let partial = sp.snapshot_frames(2, 10);
+        assert_eq!(partial.len(), 3);
+        assert_eq!(&*partial[0], &[3, 4]);
+        assert!(Arc::ptr_eq(&partial[1], &middle));
+        assert_eq!(&*partial[2], &[9, 10]);
+        assert!(!Arc::ptr_eq(&partial[0], &first));
+        assert!(!Arc::ptr_eq(&partial[2], &last));
+    }
+
+    #[test]
+    fn cached_frame_count_survives_large_constant_time_trim() {
+        let mut sp = state(usize::MAX);
+        for sample in 0..10_000_i16 {
+            sp.push_chunk(chunk(&[sample]));
+        }
+        assert_eq!(sp.total_frames(), 10_000);
+
+        sp.retain_start = 9_999;
+        sp.trim();
+
+        assert_eq!(sp.tail_base_frame, 9_999);
+        assert_eq!(sp.tail.len(), 1);
+        assert_eq!(sp.total_frames(), 10_000);
+        sp.push_chunk(chunk(&[10_000]));
+        assert_eq!(sp.total_frames(), 10_001);
+    }
+
+    #[test]
     fn whole_previews_resume_at_the_first_hypothesis_with_left_context() {
         let mut sp = SegmentedPreview::with_strategy(1, 1, usize::MAX, true, 15, 30);
         for block in 0_i16..12 {
@@ -1148,7 +1195,11 @@ mod tests {
         }
 
         let snapshot = sp.take_preview_audio().unwrap();
-        let flat = snapshot.audio[0].iter().copied().collect::<Vec<_>>();
+        let flat = snapshot
+            .audio
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect::<Vec<_>>();
         assert_eq!(snapshot.frames, 35..120);
         assert_eq!(flat, (35_i16..120).collect::<Vec<_>>());
         assert_eq!(

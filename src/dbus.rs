@@ -106,11 +106,49 @@ struct SharedStateInner {
     last_transcript: String,
     last_transcript_entry_id: Option<u64>,
     transcription_history: Vec<voxkey_ipc::HistoryEntry>,
+    transcription_history_json: String,
     last_error: String,
     model_downloads: HashMap<String, ActiveModelDownload>,
     model_generations: HashMap<String, u64>,
     settings_lifecycle_generation: u64,
     settings_lifecycle_attached: bool,
+}
+
+/// History prepared outside the shared-state mutex. Serialization can walk
+/// thousands of entries, so readers should not wait behind that CPU work.
+struct PreparedHistory {
+    entries: Vec<voxkey_ipc::HistoryEntry>,
+    json: String,
+    latest: Option<(u64, String)>,
+}
+
+impl PreparedHistory {
+    fn new(entries: Vec<voxkey_ipc::HistoryEntry>) -> Self {
+        let json = serde_json::to_string(&entries).unwrap_or_else(|error| {
+            tracing::error!("Could not serialize transcription history: {error}");
+            "[]".to_string()
+        });
+        let latest = entries
+            .iter()
+            .find(|entry| !entry.text.is_empty())
+            .map(|entry| (entry.id, entry.text.clone()));
+        Self {
+            entries,
+            json,
+            latest,
+        }
+    }
+
+    fn install(self, inner: &mut SharedStateInner) {
+        inner.last_transcript = self
+            .latest
+            .as_ref()
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default();
+        inner.last_transcript_entry_id = self.latest.map(|(id, _)| id);
+        inner.transcription_history = self.entries;
+        inner.transcription_history_json = self.json;
+    }
 }
 
 struct ActiveModelDownload {
@@ -150,6 +188,8 @@ impl SharedState {
             .map(|entry| entry.text.clone())
             .unwrap_or_default();
         let last_transcript_entry_id = latest_transcript.map(|entry| entry.id);
+        let transcription_history_json =
+            serde_json::to_string(&transcription_history).unwrap_or_else(|_| "[]".to_string());
         Self {
             inner: Arc::new(Mutex::new(SharedStateInner {
                 state: State::Idle,
@@ -165,6 +205,7 @@ impl SharedState {
                 last_transcript,
                 last_transcript_entry_id,
                 transcription_history,
+                transcription_history_json,
                 last_error: String::new(),
                 model_downloads: HashMap::new(),
                 model_generations: HashMap::new(),
@@ -339,7 +380,7 @@ impl SharedState {
             outcome,
             pending_insertion,
             move |entries, text, config, outcome, pending, retention| {
-                crate::history::append_with_policy(
+                crate::history::append_owned_with_policy(
                     entries, text, config, outcome, pending, metrics, retention,
                 )
             },
@@ -354,22 +395,23 @@ impl SharedState {
         metrics: voxkey_ipc::HistoryMetrics,
     ) -> Result<u64, crate::history::PreserveFailedRecordingError> {
         let _serial = self.persistence_lock.lock().unwrap();
-        let (mut history, retention) = {
+        let (history, retention) = {
             let inner = self.inner.lock().unwrap();
             (
                 inner.transcription_history.clone(),
                 inner.config.history.clone(),
             )
         };
-        let id = crate::history::append_failed_recording_with_policy(
-            &mut history,
+        let (history, id) = crate::history::append_failed_recording_owned_with_policy(
+            history,
             audio_path,
             completed_with,
             error,
             metrics,
             &retention,
         )?;
-        self.inner.lock().unwrap().transcription_history = history;
+        let history = PreparedHistory::new(history);
+        history.install(&mut self.inner.lock().unwrap());
         Ok(id)
     }
 
@@ -383,34 +425,33 @@ impl SharedState {
     ) -> std::io::Result<u64>
     where
         F: FnOnce(
-            &mut Vec<voxkey_ipc::HistoryEntry>,
+            Vec<voxkey_ipc::HistoryEntry>,
             String,
             &voxkey_ipc::TranscriberConfig,
             voxkey_ipc::TranscriptOutcome,
             Option<String>,
             &voxkey_ipc::HistoryRetentionConfig,
-        ) -> std::io::Result<u64>,
+        ) -> std::io::Result<(Vec<voxkey_ipc::HistoryEntry>, u64)>,
     {
         let _serial = self.persistence_lock.lock().unwrap();
-        let (mut history, retention) = {
+        let (history, retention) = {
             let inner = self.inner.lock().unwrap();
             (
                 inner.transcription_history.clone(),
                 inner.config.history.clone(),
             )
         };
-        let id = append(
-            &mut history,
-            text.clone(),
+        let (history, id) = append(
+            history,
+            text,
             completed_with,
             outcome,
             pending_insertion,
             &retention,
         )?;
+        let history = PreparedHistory::new(history);
         let mut inner = self.inner.lock().unwrap();
-        inner.transcription_history = history;
-        inner.last_transcript = text;
-        inner.last_transcript_entry_id = Some(id);
+        history.install(&mut inner);
         Ok(id)
     }
 
@@ -508,22 +549,19 @@ impl SharedState {
     /// transcriber, and injector are rebuilt from the new values.
     fn apply_reloaded_config(&self, config: Config) {
         let _serial = self.persistence_lock.lock().unwrap();
-        let mut history = self.inner.lock().unwrap().transcription_history.clone();
-        if let Err(error) = crate::history::enforce_retention(&mut history, &config.history) {
-            tracing::warn!("Could not apply reloaded History retention: {error}");
-        }
-        let latest = history
-            .iter()
-            .find(|entry| !entry.text.is_empty())
-            .map(|entry| (entry.id, entry.text.clone()));
+        let history = self.inner.lock().unwrap().transcription_history.clone();
+        let history = match crate::history::enforce_retention_owned(history, &config.history) {
+            Ok((history, _)) => Some(PreparedHistory::new(history)),
+            Err(error) => {
+                tracing::warn!("Could not apply reloaded History retention: {error}");
+                None
+            }
+        };
         let mut inner = self.inner.lock().unwrap();
         inner.config = config;
-        inner.transcription_history = history;
-        inner.last_transcript = latest
-            .as_ref()
-            .map(|(_, text)| text.clone())
-            .unwrap_or_default();
-        inner.last_transcript_entry_id = latest.map(|(id, _)| id);
+        if let Some(history) = history {
+            history.install(&mut inner);
+        }
         drop(inner);
         self.request_session_restart();
     }
@@ -567,11 +605,11 @@ impl SharedState {
         pending_insertion: Option<String>,
     ) -> std::io::Result<bool> {
         let _serial = self.persistence_lock.lock().unwrap();
-        let mut history = self.inner.lock().unwrap().transcription_history.clone();
-        let changed =
-            crate::history::set_pending_insertion(&mut history, history_id, pending_insertion)?;
+        let history = self.inner.lock().unwrap().transcription_history.clone();
+        let (history, changed) =
+            crate::history::set_pending_insertion_owned(history, history_id, pending_insertion)?;
         if changed {
-            self.inner.lock().unwrap().transcription_history = history;
+            PreparedHistory::new(history).install(&mut self.inner.lock().unwrap());
         }
         Ok(changed)
     }
@@ -580,8 +618,12 @@ impl SharedState {
         self.inner.lock().unwrap().live_transcript.clone()
     }
 
-    fn transcription_history(&self) -> Vec<voxkey_ipc::HistoryEntry> {
-        self.inner.lock().unwrap().transcription_history.clone()
+    fn transcription_history_json(&self) -> String {
+        self.inner
+            .lock()
+            .unwrap()
+            .transcription_history_json
+            .clone()
     }
 
     pub fn failed_recording_path(&self, id: u64) -> Result<std::path::PathBuf, String> {
@@ -604,36 +646,28 @@ impl SharedState {
 
     fn set_history_entry_pinned(&self, id: u64, pinned: bool) -> std::io::Result<bool> {
         let _serial = self.persistence_lock.lock().unwrap();
-        let (mut history, retention) = {
+        let (history, retention) = {
             let inner = self.inner.lock().unwrap();
             (
                 inner.transcription_history.clone(),
                 inner.config.history.clone(),
             )
         };
-        let changed = crate::history::set_pinned(&mut history, id, pinned, &retention)?;
+        let (history, changed) = crate::history::set_pinned_owned(history, id, pinned, &retention)?;
         if changed {
-            self.inner.lock().unwrap().transcription_history = history;
+            PreparedHistory::new(history).install(&mut self.inner.lock().unwrap());
         }
         Ok(changed)
     }
 
     fn update_history_entry_text(&self, id: u64, text: &str) -> Result<bool, String> {
         let _serial = self.persistence_lock.lock().unwrap();
-        let mut history = self.inner.lock().unwrap().transcription_history.clone();
-        let changed = crate::history::update_text(&mut history, id, text)?;
+        let history = self.inner.lock().unwrap().transcription_history.clone();
+        let (history, changed) = crate::history::update_text_owned(history, id, text)?;
         if changed {
-            let latest = history
-                .iter()
-                .find(|entry| !entry.text.is_empty())
-                .map(|entry| (entry.id, entry.text.clone()));
+            let history = PreparedHistory::new(history);
             let mut inner = self.inner.lock().unwrap();
-            inner.transcription_history = history;
-            inner.last_transcript = latest
-                .as_ref()
-                .map(|(_, text)| text.clone())
-                .unwrap_or_default();
-            inner.last_transcript_entry_id = latest.map(|(id, _)| id);
+            history.install(&mut inner);
         }
         Ok(changed)
     }
@@ -650,75 +684,56 @@ impl SharedState {
         Config::save_delta(&previous, &config)
             .map_err(|error| format!("Failed to save config: {error}"))?;
 
-        let mut history = self.inner.lock().unwrap().transcription_history.clone();
-        let removed = crate::history::enforce_retention(&mut history, &retention)
+        let history = self.inner.lock().unwrap().transcription_history.clone();
+        let retained = crate::history::enforce_retention_owned(history, &retention)
+            .map(|(history, removed)| (PreparedHistory::new(history), removed))
             .map_err(|error| format!("Failed to clean up History: {error}"));
         let mut inner = self.inner.lock().unwrap();
         inner.config = config;
-        if removed.is_ok() {
-            let latest = history
-                .iter()
-                .find(|entry| !entry.text.is_empty())
-                .map(|entry| (entry.id, entry.text.clone()));
-            inner.transcription_history = history;
-            inner.last_transcript = latest
-                .as_ref()
-                .map(|(_, text)| text.clone())
-                .unwrap_or_default();
-            inner.last_transcript_entry_id = latest.map(|(id, _)| id);
+        match retained {
+            Ok((history, removed)) => {
+                history.install(&mut inner);
+                Ok(removed)
+            }
+            Err(error) => Err(error),
         }
-        removed
     }
 
     fn delete_history_entry(&self, id: u64) -> std::io::Result<bool> {
-        self.delete_history_entry_with(id, crate::history::delete)
+        self.delete_history_entry_with(id, crate::history::delete_owned)
     }
 
     fn clear_transcription_history(&self) -> std::io::Result<()> {
-        self.clear_transcription_history_with(crate::history::clear)
+        self.clear_transcription_history_with(crate::history::clear_owned)
     }
 
     fn delete_history_entry_with<F>(&self, id: u64, delete: F) -> std::io::Result<bool>
     where
-        F: FnOnce(&mut Vec<voxkey_ipc::HistoryEntry>, u64) -> std::io::Result<bool>,
+        F: FnOnce(
+            Vec<voxkey_ipc::HistoryEntry>,
+            u64,
+        ) -> std::io::Result<(Vec<voxkey_ipc::HistoryEntry>, bool)>,
     {
         let _serial = self.persistence_lock.lock().unwrap();
-        let mut history = self.inner.lock().unwrap().transcription_history.clone();
-        let changed = delete(&mut history, id)?;
+        let history = self.inner.lock().unwrap().transcription_history.clone();
+        let (history, changed) = delete(history, id)?;
         if changed {
-            let latest = history
-                .iter()
-                .find(|entry| !entry.text.is_empty())
-                .map(|entry| (entry.id, entry.text.clone()));
+            let history = PreparedHistory::new(history);
             let mut inner = self.inner.lock().unwrap();
-            inner.transcription_history = history;
-            inner.last_transcript = latest
-                .as_ref()
-                .map(|(_, text)| text.clone())
-                .unwrap_or_default();
-            inner.last_transcript_entry_id = latest.map(|(id, _)| id);
+            history.install(&mut inner);
         }
         Ok(changed)
     }
 
     fn clear_transcription_history_with<F>(&self, clear: F) -> std::io::Result<()>
     where
-        F: FnOnce(&mut Vec<voxkey_ipc::HistoryEntry>) -> std::io::Result<()>,
+        F: FnOnce(Vec<voxkey_ipc::HistoryEntry>) -> std::io::Result<Vec<voxkey_ipc::HistoryEntry>>,
     {
         let _serial = self.persistence_lock.lock().unwrap();
-        let mut history = self.inner.lock().unwrap().transcription_history.clone();
-        clear(&mut history)?;
-        let latest = history
-            .iter()
-            .find(|entry| !entry.text.is_empty())
-            .map(|entry| (entry.id, entry.text.clone()));
+        let history = self.inner.lock().unwrap().transcription_history.clone();
+        let history = PreparedHistory::new(clear(history)?);
         let mut inner = self.inner.lock().unwrap();
-        inner.transcription_history = history;
-        inner.last_transcript = latest
-            .as_ref()
-            .map(|(_, text)| text.clone())
-            .unwrap_or_default();
-        inner.last_transcript_entry_id = latest.map(|(id, _)| id);
+        history.install(&mut inner);
         Ok(())
     }
 
@@ -1434,7 +1449,7 @@ impl DaemonInterface {
 
     #[zbus(property)]
     fn transcription_history(&self) -> String {
-        serde_json::to_string(&self.shared.transcription_history()).unwrap_or_default()
+        self.shared.transcription_history_json()
     }
 
     #[zbus(property)]
@@ -2552,7 +2567,7 @@ mod tests {
                 &voxkey_ipc::TranscriberConfig::default(),
                 voxkey_ipc::TranscriptOutcome::Completed,
                 None,
-                |entries, text, config, outcome, pending, _retention| {
+                |mut entries, text, config, outcome, pending, _retention| {
                     entered_tx.send(()).unwrap();
                     let (open, wake) = &*writer_gate;
                     let mut open = open.lock().unwrap();
@@ -2573,7 +2588,7 @@ mod tests {
                             ..Default::default()
                         },
                     );
-                    Ok(7)
+                    Ok((entries, 7))
                 },
             )
         });
@@ -2963,13 +2978,41 @@ mod tests {
         state.inner.lock().unwrap().last_transcript = "private words".to_string();
 
         state
-            .clear_transcription_history_with(|entries| {
+            .clear_transcription_history_with(|mut entries| {
                 entries.clear();
-                Ok(())
+                Ok(entries)
             })
             .unwrap();
 
         assert_eq!(state.last_transcript(), "");
+    }
+
+    #[test]
+    fn cached_history_json_is_refreshed_with_committed_mutations() {
+        let state = SharedState::new(Config::default());
+        let entry = voxkey_ipc::HistoryEntry {
+            id: 41,
+            recorded_at_unix_ms: 1,
+            text: "cached once".to_string(),
+            provider: "test".to_string(),
+            outcome: voxkey_ipc::TranscriptOutcome::Completed,
+            ..Default::default()
+        };
+        PreparedHistory::new(vec![entry]).install(&mut state.inner.lock().unwrap());
+
+        let first = state.transcription_history_json();
+        let parsed: Vec<voxkey_ipc::HistoryEntry> = serde_json::from_str(&first).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].text, "cached once");
+        assert_eq!(state.transcription_history_json(), first);
+
+        state
+            .delete_history_entry_with(41, |mut entries, id| {
+                entries.retain(|entry| entry.id != id);
+                Ok((entries, true))
+            })
+            .unwrap();
+        assert_eq!(state.transcription_history_json(), "[]");
     }
 
     #[test]
@@ -3006,9 +3049,9 @@ mod tests {
         }
 
         state
-            .delete_history_entry_with(2, |entries, id| {
+            .delete_history_entry_with(2, |mut entries, id| {
                 entries.retain(|entry| entry.id != id);
-                Ok(true)
+                Ok((entries, true))
             })
             .unwrap();
 
@@ -3031,9 +3074,9 @@ mod tests {
                 &completed_with,
                 voxkey_ipc::TranscriptOutcome::Completed,
                 None,
-                |_, _, recorded_config, _, _, _retention| {
+                |entries, _, recorded_config, _, _, _retention| {
                     assert_eq!(recorded_config.provider, completed_with.provider);
-                    Ok(1)
+                    Ok((entries, 1))
                 },
             )
             .unwrap();

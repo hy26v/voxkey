@@ -13,6 +13,7 @@ use crate::transcriber::LocalStreamingModel;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 const LOCAL_STREAM_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const LOCAL_DECODE_BATCH_DURATION: std::time::Duration = std::time::Duration::from_millis(100);
 const MAX_LOCAL_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_SETUP_AUDIO_BYTES: usize = 32 * 1024 * 1024;
 
@@ -21,7 +22,7 @@ pub struct LocalStreamingSession {
     pub transcriber_config: voxkey_ipc::TranscriberConfig,
     pub sample_rate: u32,
     pub channels: u16,
-    pub audio_rx: mpsc::Receiver<Vec<i16>>,
+    pub audio_rx: mpsc::Receiver<Arc<[i16]>>,
     pub capture_error_rx: tokio::sync::watch::Receiver<Option<String>>,
     pub desktop: Arc<DesktopInput>,
     pub state_tx: mpsc::Sender<Event>,
@@ -98,7 +99,7 @@ fn normalized_mono(samples: &[i16], channels: u16) -> Result<Vec<f32>, String> {
         .collect())
 }
 
-fn buffer_setup_audio(buffer: &mut Vec<i16>, samples: Vec<i16>) -> Result<(), String> {
+fn buffer_setup_audio(buffer: &mut Vec<i16>, samples: &[i16]) -> Result<(), String> {
     let max_samples = MAX_LOCAL_SETUP_AUDIO_BYTES / std::mem::size_of::<i16>();
     if buffer.len().saturating_add(samples.len()) > max_samples {
         return Err(format!(
@@ -106,7 +107,7 @@ fn buffer_setup_audio(buffer: &mut Vec<i16>, samples: Vec<i16>) -> Result<(), St
             MAX_LOCAL_SETUP_AUDIO_BYTES / (1024 * 1024)
         ));
     }
-    buffer.extend(samples);
+    buffer.extend_from_slice(samples);
     Ok(())
 }
 
@@ -254,6 +255,31 @@ async fn decode_and_publish(
     Ok(())
 }
 
+async fn decode_batched_audio(
+    batcher: &mut crate::audio_batch::PcmBatcher,
+    samples: &[i16],
+    decoder: &Arc<Mutex<DecodeState>>,
+    session: &LocalStreamingSession,
+    last_raw: &mut String,
+) -> Result<(), DynError> {
+    for batch in batcher.push(samples)? {
+        decode_and_publish(decoder.clone(), batch, session, last_raw).await?;
+    }
+    Ok(())
+}
+
+async fn flush_batched_audio(
+    batcher: &mut crate::audio_batch::PcmBatcher,
+    decoder: &Arc<Mutex<DecodeState>>,
+    session: &LocalStreamingSession,
+    last_raw: &mut String,
+) -> Result<(), DynError> {
+    if let Some(batch) = batcher.flush() {
+        decode_and_publish(decoder.clone(), batch, session, last_raw).await?;
+    }
+    Ok(())
+}
+
 /// Run one live dictation with an installed online model.
 pub async fn run_local_streaming_session(
     mut session: LocalStreamingSession,
@@ -304,7 +330,7 @@ pub async fn run_local_streaming_session(
 
                 chunk = session.audio_rx.recv(), if audio_open => {
                     match chunk {
-                        Some(samples) => buffer_setup_audio(&mut setup_audio, samples)?,
+                        Some(samples) => buffer_setup_audio(&mut setup_audio, &samples)?,
                         None => audio_open = false,
                     }
                 }
@@ -318,6 +344,11 @@ pub async fn run_local_streaming_session(
         stream.set_option("language", "auto");
     }
     let decoder = Arc::new(Mutex::new(DecodeState { recognizer, stream }));
+    let mut audio_batcher = crate::audio_batch::PcmBatcher::new(
+        session.sample_rate,
+        session.channels,
+        LOCAL_DECODE_BATCH_DURATION,
+    )?;
     if !stop_requested {
         let _ = session.state_tx.send(Event::StreamingReady).await;
     }
@@ -371,9 +402,23 @@ pub async fn run_local_streaming_session(
             chunk = session.audio_rx.recv() => {
                 match chunk {
                     Some(samples) => {
-                        decode_and_publish(decoder.clone(), samples, &session, &mut last_raw).await?;
+                        decode_batched_audio(
+                            &mut audio_batcher,
+                            &samples,
+                            &decoder,
+                            &session,
+                            &mut last_raw,
+                        ).await?;
                     }
-                    None => audio_open = false,
+                    None => {
+                        audio_open = false;
+                        flush_batched_audio(
+                            &mut audio_batcher,
+                            &decoder,
+                            &session,
+                            &mut last_raw,
+                        ).await?;
+                    }
                 }
             }
         }
@@ -428,9 +473,23 @@ pub async fn run_local_streaming_session(
             chunk = session.audio_rx.recv() => {
                 match chunk {
                     Some(samples) => {
-                        decode_and_publish(decoder.clone(), samples, &session, &mut last_raw).await?;
+                        decode_batched_audio(
+                            &mut audio_batcher,
+                            &samples,
+                            &decoder,
+                            &session,
+                            &mut last_raw,
+                        ).await?;
                     }
-                    None => audio_open = false,
+                    None => {
+                        audio_open = false;
+                        flush_batched_audio(
+                            &mut audio_batcher,
+                            &decoder,
+                            &session,
+                            &mut last_raw,
+                        ).await?;
+                    }
                 }
             }
         }
@@ -461,9 +520,23 @@ mod tests {
     #[test]
     fn model_setup_audio_buffer_is_bounded() {
         let mut buffer = vec![0_i16; MAX_LOCAL_SETUP_AUDIO_BYTES / 2];
-        assert!(buffer_setup_audio(&mut buffer, vec![1]).is_err());
+        assert!(buffer_setup_audio(&mut buffer, &[1]).is_err());
         let mut small = Vec::new();
-        buffer_setup_audio(&mut small, vec![1, 2, 3]).unwrap();
+        buffer_setup_audio(&mut small, &[1, 2, 3]).unwrap();
         assert_eq!(small, [1, 2, 3]);
+    }
+
+    #[test]
+    fn local_callbacks_are_coalesced_before_inference() {
+        let mut batcher =
+            crate::audio_batch::PcmBatcher::new(16_000, 1, LOCAL_DECODE_BATCH_DURATION).unwrap();
+        let mut inference_batches = Vec::new();
+        for _ in 0..20 {
+            inference_batches.extend(batcher.push(&[1_i16; 80]).unwrap());
+        }
+
+        assert_eq!(inference_batches.len(), 1);
+        assert_eq!(inference_batches[0].len(), 1_600);
+        assert!(batcher.flush().is_none());
     }
 }
