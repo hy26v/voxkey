@@ -6,8 +6,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub use voxkey_ipc::{
-    DictionaryConfig, InjectionConfig, PreviewConfig, PreviewStrategy, TranscriberConfig,
-    validate_shortcut_trigger,
+    AudioBehaviorConfig, DictionaryConfig, HistoryRetentionConfig, InjectionConfig, PreviewConfig,
+    PreviewStrategy, ShortcutMode, TranscriberConfig, validate_shortcut_trigger,
 };
 #[cfg(test)]
 use voxkey_ipc::{PreviewMode, conflicts_with_gnome_input_source};
@@ -28,6 +28,8 @@ pub struct Config {
     pub audio: AudioConfig,
     #[serde(default)]
     pub preview: PreviewConfig,
+    #[serde(default)]
+    pub history: HistoryRetentionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +40,8 @@ pub struct ShortcutConfig {
     pub description: String,
     #[serde(default = "default_shortcut_trigger")]
     pub trigger: String,
+    #[serde(default)]
+    pub mode: ShortcutMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +70,8 @@ pub struct AudioConfig {
     /// it changed an originally-unmuted sink itself.
     #[serde(default)]
     pub mute_output_while_recording: bool,
+    #[serde(flatten)]
+    pub behavior: AudioBehaviorConfig,
 }
 
 fn default_shortcut_id() -> String {
@@ -187,6 +193,7 @@ impl Default for ShortcutConfig {
             id: default_shortcut_id(),
             description: default_shortcut_description(),
             trigger: default_shortcut_trigger(),
+            mode: ShortcutMode::default(),
         }
     }
 }
@@ -208,6 +215,7 @@ impl Default for AudioConfig {
             max_recording_seconds: default_max_recording_seconds(),
             input_device: String::new(),
             mute_output_while_recording: false,
+            behavior: AudioBehaviorConfig::default(),
         }
     }
 }
@@ -302,6 +310,8 @@ impl Config {
         }
 
         normalize_transcriber_config(&mut config.transcriber);
+        config.audio.behavior = config.audio.behavior.normalized();
+        config.history = config.history.normalized();
 
         // Older releases represented every OpenAI-compatible batch server as
         // "mistral", even when that server actually hosted a Parakeet model.
@@ -663,6 +673,40 @@ endpoint = "http://192.168.1.132:8000/v1/audio/transcriptions"
         let config = Config::load_from_str("").unwrap();
         assert_eq!(config.transcriber.provider, TranscriberProvider::WhisperCpp);
         assert_eq!(config.transcriber.whisper_cpp.command, "whisper-cpp");
+        assert_eq!(config.shortcut.mode, ShortcutMode::Toggle);
+        assert_eq!(config.history, HistoryRetentionConfig::default());
+    }
+
+    #[test]
+    fn shortcut_mode_history_retention_and_preload_round_trip() {
+        let mut config = Config::default();
+        config.shortcut.mode = ShortcutMode::PushToTalk;
+        config.history = HistoryRetentionConfig {
+            max_entries: 275,
+            max_age_days: 45,
+        };
+        config.transcriber.parakeet.preload_model = true;
+
+        let parsed = Config::load_from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+
+        assert_eq!(parsed.shortcut.mode, ShortcutMode::PushToTalk);
+        assert_eq!(parsed.history, config.history);
+        assert!(parsed.transcriber.parakeet.preload_model);
+    }
+
+    #[test]
+    fn history_retention_from_toml_is_clamped_to_supported_limits() {
+        let config = Config::load_from_str(
+            "[history]\nmax_entries = 4294967295\nmax_age_days = 4294967295\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.history,
+            HistoryRetentionConfig {
+                max_entries: HistoryRetentionConfig::MAX_ENTRIES,
+                max_age_days: HistoryRetentionConfig::MAX_AGE_DAYS,
+            }
+        );
     }
 
     #[test]

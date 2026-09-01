@@ -22,7 +22,7 @@ pub const OBJECT_PATH: &str = "/io/github/hy26v/Voxkey/Daemon";
 /// Increment this when Settings starts depending on a method, property, or
 /// signal that an older packaged daemon does not provide. Settings accepts a
 /// newer daemon, but replaces a missing or older revision after an RPM update.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
 
 /// Model-status value returned after every byte has arrived but before the
 /// downloaded files have passed integrity checks and been published.
@@ -115,6 +115,34 @@ pub const API_KEY_SERVICE_MODEL_SERVER: &str = "model-server";
 
 /// Default global shortcut offered by Voxkey on GNOME.
 pub const DEFAULT_SHORTCUT_TRIGGER: &str = "<Super><Alt>d";
+
+/// How the global shortcut controls an active dictation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShortcutMode {
+    /// Press once to start and once more to finish.
+    #[default]
+    Toggle,
+    /// Record only while the shortcut remains held.
+    PushToTalk,
+}
+
+impl ShortcutMode {
+    pub const fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::Toggle => "toggle",
+            Self::PushToTalk => "push-to-talk",
+        }
+    }
+
+    pub fn from_wire_value(value: &str) -> Option<Self> {
+        match value {
+            "toggle" => Some(Self::Toggle),
+            "push-to-talk" => Some(Self::PushToTalk),
+            _ => None,
+        }
+    }
+}
 
 /// Return whether a shortcut collides with GNOME's input-source switcher.
 ///
@@ -380,6 +408,10 @@ pub struct ParakeetConfig {
     pub allow_insecure_http: bool,
     #[serde(default)]
     pub execution_provider: ExecutionProviderChoice,
+    /// Initialize an installed local model in the background when the daemon
+    /// starts, reducing latency before the first dictation.
+    #[serde(default)]
+    pub preload_model: bool,
 }
 
 impl Default for ParakeetConfig {
@@ -391,6 +423,7 @@ impl Default for ParakeetConfig {
             api_key: String::new(),
             allow_insecure_http: false,
             execution_provider: ExecutionProviderChoice::Auto,
+            preload_model: false,
         }
     }
 }
@@ -432,6 +465,84 @@ pub struct TranscriberConfig {
 pub struct EndpointCheckResult {
     pub status: EndpointCheckStatus,
     pub message: String,
+}
+
+/// User-facing interpretation of a microphone capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioSignalQuality {
+    #[default]
+    Silent,
+    Quiet,
+    Good,
+    Clipping,
+}
+
+impl AudioSignalQuality {
+    pub const fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::Silent => "silent",
+            Self::Quiet => "quiet",
+            Self::Good => "good",
+            Self::Clipping => "clipping",
+        }
+    }
+
+    pub fn from_wire_value(value: &str) -> Option<Self> {
+        match value {
+            "silent" => Some(Self::Silent),
+            "quiet" => Some(Self::Quiet),
+            "good" => Some(Self::Good),
+            "clipping" => Some(Self::Clipping),
+            _ => None,
+        }
+    }
+}
+
+/// Result returned by the guided microphone signal test.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicrophoneTestResult {
+    pub quality: AudioSignalQuality,
+    pub peak: f64,
+    pub average_rms: f64,
+    pub duration_ms: u32,
+    pub device_name: String,
+}
+
+/// Voice-aware capture behavior shared by the daemon and Settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioBehaviorConfig {
+    /// Stop after this much quiet time once speech has begun. Zero disables
+    /// automatic stopping.
+    pub auto_stop_silence_ms: u32,
+    /// Refuse to upload or decode a batch recording that contains no
+    /// meaningful microphone signal.
+    pub no_speech_guard: bool,
+}
+
+impl AudioBehaviorConfig {
+    pub const MIN_AUTO_STOP_SILENCE_MS: u32 = 1_500;
+    pub const MAX_AUTO_STOP_SILENCE_MS: u32 = 30_000;
+
+    pub fn normalized(mut self) -> Self {
+        if self.auto_stop_silence_ms != 0 {
+            self.auto_stop_silence_ms = self.auto_stop_silence_ms.clamp(
+                Self::MIN_AUTO_STOP_SILENCE_MS,
+                Self::MAX_AUTO_STOP_SILENCE_MS,
+            );
+        }
+        self
+    }
+}
+
+impl Default for AudioBehaviorConfig {
+    fn default() -> Self {
+        Self {
+            auto_stop_silence_ms: 0,
+            no_speech_guard: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -631,11 +742,53 @@ pub enum TranscriptOutcome {
     Failed,
 }
 
+/// Automatic cleanup policy for unpinned History entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryRetentionConfig {
+    /// Maximum number of recent unpinned entries. Pinned entries are never
+    /// counted against this limit.
+    pub max_entries: u32,
+    /// Remove unpinned entries older than this many days. Zero disables the
+    /// age limit.
+    pub max_age_days: u32,
+}
+
+impl HistoryRetentionConfig {
+    pub const MIN_ENTRIES: u32 = 25;
+    pub const MAX_ENTRIES: u32 = 5_000;
+    pub const MAX_AGE_DAYS: u32 = 3_650;
+
+    pub fn normalized(mut self) -> Self {
+        self.max_entries = self.max_entries.clamp(Self::MIN_ENTRIES, Self::MAX_ENTRIES);
+        self.max_age_days = self.max_age_days.min(Self::MAX_AGE_DAYS);
+        self
+    }
+}
+
+impl Default for HistoryRetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 500,
+            max_age_days: 0,
+        }
+    }
+}
+
+/// Capture and transcription timing retained with a History entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct HistoryMetrics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_duration_ms: Option<u64>,
+}
+
 /// A transcription saved by the daemon for the History screen.
 ///
 /// The history is exchanged as JSON over D-Bus so the schema can evolve
 /// without exposing a complex D-Bus container type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HistoryEntry {
     /// Unique-enough identifier derived from the Unix timestamp in
     /// nanoseconds. It is used for row actions such as deletion.
@@ -661,6 +814,18 @@ pub struct HistoryEntry {
     /// User-facing failure reported by the provider for a retained recording.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Pinned entries survive automatic retention and bulk cleanup.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Last manual correction time, absent for an untouched transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_at_unix_ms: Option<i64>,
+    /// Duration of captured speech audio when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_duration_ms: Option<u64>,
+    /// Time spent producing the final transcript after capture ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_duration_ms: Option<u64>,
 }
 
 impl HistoryEntry {
@@ -701,9 +866,25 @@ pub trait Daemon {
     #[zbus(property)]
     fn shortcut_description(&self) -> zbus::Result<String>;
 
+    /// Whether the shortcut toggles dictation or records while held.
+    #[zbus(property)]
+    fn shortcut_mode(&self) -> zbus::Result<String>;
+
     /// Current normalized microphone level, from 0.0 (silence) to 1.0.
     #[zbus(property)]
     fn audio_level(&self) -> zbus::Result<f64>;
+
+    /// Current microphone quality classification.
+    #[zbus(property)]
+    fn audio_signal(&self) -> zbus::Result<String>;
+
+    /// Voice-aware capture behavior as serialized JSON.
+    #[zbus(property)]
+    fn audio_behavior_config(&self) -> zbus::Result<String>;
+
+    /// History cleanup policy as serialized JSON.
+    #[zbus(property)]
+    fn history_retention_config(&self) -> zbus::Result<String>;
 
     /// Transcriber configuration as serialized JSON.
     #[zbus(property)]
@@ -781,6 +962,9 @@ pub trait Daemon {
     /// Update the shortcut trigger. Takes effect on next session recovery.
     fn set_shortcut(&self, trigger: &str) -> zbus::Result<()>;
 
+    /// Update how shortcut press and release events control dictation.
+    fn set_shortcut_mode(&self, mode: &str) -> zbus::Result<()>;
+
     /// Update the transcriber configuration from JSON.
     fn set_transcriber_config(&self, config_json: &str) -> zbus::Result<()>;
 
@@ -801,11 +985,27 @@ pub trait Daemon {
     /// Update audio settings. Takes effect on next recording.
     fn set_audio(&self, sample_rate: u32, channels: u16) -> zbus::Result<()>;
 
+    /// Update voice-aware capture behavior from JSON.
+    fn set_audio_behavior_config(&self, config_json: &str) -> zbus::Result<()>;
+
+    /// Update automatic History cleanup and apply it immediately.
+    fn set_history_retention_config(&self, config_json: &str) -> zbus::Result<()>;
+
     /// Select an audio input device by name. Empty selects the system default.
     fn set_audio_input_device(&self, device_name: &str) -> zbus::Result<()>;
 
+    /// Capture a short private sample and return signal quality diagnostics.
+    /// The temporary WAV is always deleted and is never transcribed.
+    fn test_microphone(&self, duration_ms: u32) -> zbus::Result<String>;
+
     /// Delete one entry from transcription history.
     fn delete_history_entry(&self, id: u64) -> zbus::Result<()>;
+
+    /// Protect or unprotect a History entry from automatic and bulk cleanup.
+    fn set_history_entry_pinned(&self, id: u64, pinned: bool) -> zbus::Result<()>;
+
+    /// Replace the saved transcript with a manual correction.
+    fn update_history_entry_text(&self, id: u64, text: &str) -> zbus::Result<()>;
 
     /// Delete all saved transcription history.
     fn clear_transcription_history(&self) -> zbus::Result<()>;
@@ -900,7 +1100,7 @@ mod tests {
 
     #[test]
     fn daemon_protocol_version_is_an_explicit_nonzero_contract() {
-        assert_eq!(DAEMON_PROTOCOL_VERSION, 1);
+        assert_eq!(DAEMON_PROTOCOL_VERSION, 2);
     }
 
     #[test]
@@ -1066,6 +1266,10 @@ endpoint = "http://parakeet.example.test/v1"
             pending_insertion: Some("Voxkey".to_string()),
             audio_path: None,
             error: None,
+            pinned: true,
+            edited_at_unix_ms: Some(1_720_000_000_100),
+            audio_duration_ms: Some(2_450),
+            processing_duration_ms: Some(380),
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -1084,6 +1288,10 @@ endpoint = "http://parakeet.example.test/v1"
         assert_eq!(entry.audio_path, None);
         assert_eq!(entry.error, None);
         assert_eq!(entry.text_for_insertion(), Some("legacy"));
+        assert!(!entry.pinned);
+        assert_eq!(entry.edited_at_unix_ms, None);
+        assert_eq!(entry.audio_duration_ms, None);
+        assert_eq!(entry.processing_duration_ms, None);
     }
 
     #[test]
@@ -1097,12 +1305,55 @@ endpoint = "http://parakeet.example.test/v1"
             pending_insertion: None,
             audio_path: Some("/state/voxkey/recordings/43.wav".to_string()),
             error: Some("422 Unprocessable Entity".to_string()),
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&entry).unwrap();
 
         assert_eq!(serde_json::from_str::<HistoryEntry>(&json).unwrap(), entry);
         assert_eq!(entry.text_for_insertion(), None);
+    }
+
+    #[test]
+    fn shortcut_modes_have_stable_wire_values() {
+        for (mode, wire) in [
+            (ShortcutMode::Toggle, "toggle"),
+            (ShortcutMode::PushToTalk, "push-to-talk"),
+        ] {
+            assert_eq!(mode.as_wire_value(), wire);
+            assert_eq!(ShortcutMode::from_wire_value(wire), Some(mode));
+        }
+        assert_eq!(ShortcutMode::from_wire_value("unknown"), None);
+    }
+
+    #[test]
+    fn history_retention_is_bounded_and_backward_compatible() {
+        assert_eq!(HistoryRetentionConfig::default().max_entries, 500);
+        assert_eq!(HistoryRetentionConfig::default().max_age_days, 0);
+        assert_eq!(
+            HistoryRetentionConfig {
+                max_entries: 0,
+                max_age_days: u32::MAX,
+            }
+            .normalized(),
+            HistoryRetentionConfig {
+                max_entries: HistoryRetentionConfig::MIN_ENTRIES,
+                max_age_days: HistoryRetentionConfig::MAX_AGE_DAYS,
+            }
+        );
+        assert_eq!(
+            HistoryRetentionConfig {
+                max_entries: u32::MAX,
+                max_age_days: 0,
+            }
+            .normalized()
+            .max_entries,
+            HistoryRetentionConfig::MAX_ENTRIES
+        );
+        assert_eq!(
+            serde_json::from_str::<HistoryRetentionConfig>("{}").unwrap(),
+            HistoryRetentionConfig::default()
+        );
     }
 
     #[test]
@@ -1245,6 +1496,7 @@ endpoint = "http://parakeet.example.test/v1"
                 api_key: "server-secret".to_string(),
                 allow_insecure_http: true,
                 execution_provider: ExecutionProviderChoice::Cuda,
+                preload_model: true,
             },
         };
         let json = serde_json::to_string(&config).unwrap();

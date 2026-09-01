@@ -2,6 +2,7 @@
 // ABOUTME: Wires portal sessions, audio recording, transcription, and text injection into an event loop.
 
 mod agreement;
+mod audio_signal;
 mod config;
 mod dbus;
 mod deadline;
@@ -242,6 +243,26 @@ async fn run_session(
     ));
 
     tracing::info!("Transcription backend: {}", transcriber.describe());
+    let mut preload_task = if config.transcriber.provider
+        == voxkey_ipc::TranscriberProvider::Parakeet
+        && config.transcriber.parakeet.backend == voxkey_ipc::ParakeetBackend::Local
+        && config.transcriber.parakeet.preload_model
+    {
+        let transcriber = transcriber.clone();
+        Some(tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match transcriber.preload_local_model().await {
+                Ok(true) => tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "Local transcription model is ready"
+                ),
+                Ok(false) => {}
+                Err(error) => tracing::warn!("Could not preload the local model: {error}"),
+            }
+        }))
+    } else {
+        None
+    };
 
     // Previews repeatedly re-decode the growing recording (the open tail or
     // the whole stream, per the configured strategy). That is cheap on this
@@ -334,7 +355,6 @@ async fn run_session(
 
     let shortcut_id = config.shortcut.id.clone();
 
-    // Toggle mode: press shortcut once to start, press again to stop.
     // The compositor may repeat Activated for as long as the shortcut is
     // held, so only a press after Deactivated counts as a new press.
     let mut shortcut_presses = ShortcutPressTracker::default();
@@ -485,20 +505,65 @@ async fn run_session(
             }
 
             _ = audio_level_tick.tick() => {
-                let level = batch_recording
-                    .as_ref()
-                    .map(|batch| batch.recording.audio_level())
-                    .or_else(|| {
-                        streaming_handle
-                            .as_ref()
-                            .filter(|_| {
-                                matches!(current_state, State::Connecting | State::Streaming)
-                            })
-                            .map(|streaming| streaming.recording.audio_level())
-                    })
-                    .unwrap_or(0.0);
+                let (signal, should_auto_stop) = if let Some(batch) = batch_recording.as_mut() {
+                    let signal = batch.recording.signal_snapshot();
+                    let should_stop = current_state == State::Recording
+                        && batch.auto_stop.observe(
+                            signal,
+                            config.audio.sample_rate,
+                            config.audio.channels,
+                            batch.capture_started.elapsed(),
+                        );
+                    (Some(signal), should_stop)
+                } else if let Some(streaming) = streaming_handle.as_mut().filter(|_| {
+                    matches!(current_state, State::Connecting | State::Streaming)
+                }) {
+                    let signal = streaming.recording.signal_snapshot();
+                    let should_stop = streaming.auto_stop.observe(
+                        signal,
+                        config.audio.sample_rate,
+                        config.audio.channels,
+                        streaming.capture_started.elapsed(),
+                    );
+                    (Some(signal), should_stop)
+                } else {
+                    (None, false)
+                };
+                let level = signal.map(|signal| signal.latest_peak).unwrap_or(0.0);
                 if shared.set_audio_level(level) {
                     DaemonInterface::notify_audio_level(&connection).await;
+                }
+                let quality = signal
+                    .map(|signal| {
+                        signal.quality(config.audio.sample_rate, config.audio.channels)
+                    })
+                    .unwrap_or(voxkey_ipc::AudioSignalQuality::Silent);
+                if shared.set_audio_signal(quality) {
+                    DaemonInterface::notify_audio_signal(&connection).await;
+                }
+                if should_auto_stop {
+                    tracing::info!(
+                        silence_ms = config.audio.behavior.auto_stop_silence_ms,
+                        "Stopping dictation after the configured quiet interval"
+                    );
+                    if current_state == State::Recording {
+                        stop_recording(
+                            &mut current_state,
+                            &mut batch_recording,
+                            &mut batch_transcription,
+                            transcriber.clone(),
+                            batch_result_tx.clone(),
+                            shared,
+                            &connection,
+                        ).await;
+                    } else if matches!(current_state, State::Connecting | State::Streaming) {
+                        stop_streaming(
+                            &mut current_state,
+                            &mut streaming_handle,
+                            shared,
+                            &connection,
+                        ).await;
+                    }
                 }
             }
 
@@ -525,7 +590,33 @@ async fn run_session(
                     } => (shortcut_id, timestamp),
                     ShortcutEvent::Deactivated { shortcut_id: event_id, .. } => {
                         if event_id == shortcut_id {
-                            shortcut_presses.deactivated();
+                            let ended_press = shortcut_presses.deactivated();
+                            if ended_press
+                                && config.shortcut.mode == voxkey_ipc::ShortcutMode::PushToTalk
+                                && matches!(
+                                    current_state,
+                                    State::Recording | State::Connecting | State::Streaming
+                                )
+                            {
+                                if current_state == State::Recording {
+                                    stop_recording(
+                                        &mut current_state,
+                                        &mut batch_recording,
+                                        &mut batch_transcription,
+                                        transcriber.clone(),
+                                        batch_result_tx.clone(),
+                                        shared,
+                                        &connection,
+                                    ).await;
+                                } else {
+                                    stop_streaming(
+                                        &mut current_state,
+                                        &mut streaming_handle,
+                                        shared,
+                                        &connection,
+                                    ).await;
+                                }
+                            }
                         }
                         continue;
                     }
@@ -544,19 +635,25 @@ async fn run_session(
                     current_state,
                     State::Recording | State::Connecting | State::Streaming
                 ) {
-                    // New press detected → stop
-                    if current_state == State::Recording {
-                        stop_recording(
-                            &mut current_state,
-                            &mut batch_recording,
-                            &mut batch_transcription,
-                            transcriber.clone(),
-                            batch_result_tx.clone(),
-                            shared,
-                            &connection,
-                        ).await;
-                    } else {
-                        stop_streaming(&mut current_state, &mut streaming_handle, shared, &connection).await;
+                    if config.shortcut.mode == voxkey_ipc::ShortcutMode::Toggle {
+                        if current_state == State::Recording {
+                            stop_recording(
+                                &mut current_state,
+                                &mut batch_recording,
+                                &mut batch_transcription,
+                                transcriber.clone(),
+                                batch_result_tx.clone(),
+                                shared,
+                                &connection,
+                            ).await;
+                        } else {
+                            stop_streaming(
+                                &mut current_state,
+                                &mut streaming_handle,
+                                shared,
+                                &connection,
+                            ).await;
+                        }
                     }
                     continue;
                 }
@@ -677,6 +774,7 @@ async fn run_session(
                 preview,
                 transcript_generation,
                 capture_monitor,
+                ..
             } = batch;
             capture_monitor.abort();
             recording.discard().await;
@@ -715,6 +813,14 @@ async fn run_session(
                 && error.is_panic()
             {
                 tracing::error!("Batch transcription task panicked during teardown: {error}");
+            }
+        }
+        if let Some(preload) = preload_task.take() {
+            preload.abort();
+            if let Err(error) = preload.await
+                && error.is_panic()
+            {
+                tracing::error!("Local model preload task panicked: {error}");
             }
         }
         injector.shutdown().await;
@@ -772,8 +878,10 @@ impl ShortcutPressTracker {
         repeat
     }
 
-    fn deactivated(&mut self) {
+    fn deactivated(&mut self) -> bool {
+        let was_pressed = self.pressed;
         self.pressed = false;
+        was_pressed
     }
 }
 
@@ -906,6 +1014,10 @@ async fn start_dictation(
             transcript_generation,
             deliberate_teardown,
             task,
+            capture_started: std::time::Instant::now(),
+            auto_stop: crate::audio_signal::VoiceActivityStopwatch::new(
+                context.config.audio.behavior.auto_stop_silence_ms,
+            ),
         });
         update_state(*current_state, context.shared, context.connection).await;
     } else {
@@ -968,6 +1080,10 @@ async fn start_dictation(
             preview,
             transcript_generation,
             capture_monitor,
+            capture_started: std::time::Instant::now(),
+            auto_stop: crate::audio_signal::VoiceActivityStopwatch::new(
+                context.config.audio.behavior.auto_stop_silence_ms,
+            ),
         });
     }
 
@@ -984,6 +1100,8 @@ struct StreamingState {
     transcript_generation: u64,
     deliberate_teardown: Arc<AtomicBool>,
     task: JoinHandle<()>,
+    capture_started: std::time::Instant,
+    auto_stop: crate::audio_signal::VoiceActivityStopwatch,
 }
 
 fn should_publish_streaming_error(deliberate_teardown: bool) -> bool {
@@ -997,6 +1115,8 @@ struct BatchRecordingState {
     preview: Option<preview::PreviewHandle>,
     transcript_generation: u64,
     capture_monitor: JoinHandle<()>,
+    capture_started: std::time::Instant,
+    auto_stop: crate::audio_signal::VoiceActivityStopwatch,
 }
 
 /// Owns the cancellable final-transcription task for one stopped recording.
@@ -1011,6 +1131,22 @@ struct BatchTranscriptionResult {
     /// Present only for a newly captured recording whose transcription
     /// failed. Ownership keeps cancellation and stale completions private.
     failed_recording: Option<TemporaryRecording>,
+    metrics: voxkey_ipc::HistoryMetrics,
+}
+
+fn audio_duration_millis(recorded_samples: u64, sample_rate: u32, channels: u16) -> Option<u64> {
+    if sample_rate == 0 || channels == 0 {
+        return None;
+    }
+    let samples_per_second = u128::from(sample_rate) * u128::from(channels);
+    Some(
+        ((u128::from(recorded_samples) * 1_000) / samples_per_second).min(u128::from(u64::MAX))
+            as u64,
+    )
+}
+
+fn duration_millis_u64(duration: std::time::Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 struct TemporaryRecording {
@@ -1213,6 +1349,7 @@ async fn retry_history_entry(
         );
     }
     let audio_path = shared.failed_recording_path(id)?;
+    let prior_metrics = shared.history_metrics(id);
     shared.try_begin_transcription()?;
     let transcript_generation = shared.begin_live_transcript();
     *current_state = State::Transcribing;
@@ -1221,6 +1358,7 @@ async fn retry_history_entry(
     DaemonInterface::notify_last_error(connection).await;
 
     let task = tokio::spawn(async move {
+        let processing_started = std::time::Instant::now();
         let result = transcriber
             .transcribe_recording(&audio_path)
             .await
@@ -1232,6 +1370,10 @@ async fn retry_history_entry(
                 // The source is already the durable History recording. A
                 // failed retry must leave it available for another attempt.
                 failed_recording: None,
+                metrics: voxkey_ipc::HistoryMetrics {
+                    audio_duration_ms: prior_metrics.audio_duration_ms,
+                    processing_duration_ms: Some(duration_millis_u64(processing_started.elapsed())),
+                },
             })
             .await;
     });
@@ -1261,6 +1403,7 @@ async fn stop_recording(
             preview,
             transcript_generation,
             capture_monitor,
+            ..
         } = batch;
         capture_monitor.abort();
 
@@ -1268,8 +1411,45 @@ async fn stop_recording(
         // final chunks; its newest decode may then cover all captured audio
         // and serve as the transcript the user already sees.
         let dropped_chunks = recording.preview_chunks_dropped();
-        match recording.stop_with_sample_count().await {
-            Ok((audio_path, recorded_samples)) => {
+        match recording.stop_with_summary().await {
+            Ok(recording) => {
+                let recorder::FinalizedRecording {
+                    path: audio_path,
+                    recorded_samples,
+                    signal,
+                } = recording;
+                if shared.config().audio.behavior.no_speech_guard
+                    && !signal.has_meaningful_audio(
+                        shared.config().audio.sample_rate,
+                        shared.config().audio.channels,
+                    )
+                {
+                    if let Some(preview) = preview {
+                        preview.stop().await;
+                    }
+                    let _recording_cleanup = TemporaryRecording::new(audio_path);
+                    clear_live_transcript(transcript_generation, shared, connection).await;
+                    let message = "No speech was detected. Check the selected microphone or run the signal test in Settings.";
+                    tracing::info!(
+                        max_peak = signal.max_peak,
+                        active_samples = signal.active_samples,
+                        "Skipping transcription for a silent recording"
+                    );
+                    shared.set_last_error(message.to_string());
+                    DaemonInterface::notify_last_error(connection).await;
+                    *current_state = State::Idle;
+                    update_state(*current_state, shared, connection).await;
+                    return;
+                }
+                let metrics = voxkey_ipc::HistoryMetrics {
+                    audio_duration_ms: audio_duration_millis(
+                        recorded_samples,
+                        shared.config().audio.sample_rate,
+                        shared.config().audio.channels,
+                    ),
+                    processing_duration_ms: None,
+                };
+                let processing_started = std::time::Instant::now();
                 let finalization = match preview {
                     Some(preview) => preview.finish().await,
                     None => None,
@@ -1320,6 +1500,12 @@ async fn stop_recording(
                             transcript_generation,
                             result,
                             failed_recording,
+                            metrics: voxkey_ipc::HistoryMetrics {
+                                processing_duration_ms: Some(duration_millis_u64(
+                                    processing_started.elapsed(),
+                                )),
+                                ..metrics
+                            },
                         })
                         .await;
                 });
@@ -1359,6 +1545,7 @@ async fn finish_batch_transcription(
         transcript_generation,
         result,
         failed_recording,
+        metrics,
     } = completion;
     match result {
         Ok(transcript) => {
@@ -1379,16 +1566,18 @@ async fn finish_batch_transcription(
                         transcript.clone(),
                         transcriber_config.clone(),
                         voxkey_ipc::TranscriptOutcome::Completed,
+                        metrics,
                     )
                     .await
                 {
                     tracing::error!("Failed to enqueue text: {e}");
                     let persistence_error = shared
-                        .record_transcript(
+                        .record_transcript_with_metrics(
                             transcript.clone(),
                             transcriber_config,
                             voxkey_ipc::TranscriptOutcome::Completed,
                             Some(transcript.clone()),
+                            metrics,
                         )
                         .err();
                     DaemonInterface::notify_transcription_complete(connection, &transcript).await;
@@ -1409,10 +1598,11 @@ async fn finish_batch_transcription(
         Err(error) => {
             tracing::error!("Transcription failed: {error}");
             let message = match failed_recording {
-                Some(recording) => match shared.record_failed_transcription(
+                Some(recording) => match shared.record_failed_transcription_with_metrics(
                     recording.path(),
                     transcriber_config,
                     error.clone(),
+                    metrics,
                 ) {
                     Ok(_) => {
                         DaemonInterface::notify_last_transcript(connection).await;
@@ -1482,12 +1672,17 @@ where
 /// Log state change, update shared D-Bus state, and emit PropertiesChanged.
 async fn update_state(state: State, shared: &SharedState, connection: &zbus::Connection) {
     shared.set_state(state);
-    if !matches!(
+    let capture_is_active = matches!(
         state,
         State::Recording | State::Connecting | State::Streaming
-    ) && shared.set_audio_level(0.0)
-    {
-        DaemonInterface::notify_audio_level(connection).await;
+    );
+    if !capture_is_active {
+        if shared.set_audio_level(0.0) {
+            DaemonInterface::notify_audio_level(connection).await;
+        }
+        if shared.set_audio_signal(voxkey_ipc::AudioSignalQuality::Silent) {
+            DaemonInterface::notify_audio_signal(connection).await;
+        }
     }
     eprintln!("STATE: {state}");
     DaemonInterface::notify_state(connection).await;
@@ -1676,6 +1871,24 @@ mod tests {
         presses.deactivated();
 
         assert!(!presses.activated(at(1_050)));
+    }
+
+    #[test]
+    fn release_reports_whether_a_real_press_ended() {
+        let mut presses = ShortcutPressTracker::default();
+        assert!(!presses.deactivated());
+        assert!(!presses.activated(at(10)));
+        assert!(presses.deactivated());
+        assert!(!presses.deactivated());
+    }
+
+    #[test]
+    fn history_audio_duration_uses_frames_not_interleaved_samples() {
+        assert_eq!(audio_duration_millis(16_000, 16_000, 1), Some(1_000));
+        assert_eq!(audio_duration_millis(96_000, 48_000, 2), Some(1_000));
+        assert_eq!(audio_duration_millis(8_000, 16_000, 1), Some(500));
+        assert_eq!(audio_duration_millis(1, 0, 1), None);
+        assert_eq!(audio_duration_millis(1, 16_000, 0), None);
     }
 
     #[test]

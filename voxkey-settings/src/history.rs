@@ -22,6 +22,7 @@ struct HistoryOutcomePresentation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HistoryFilter {
     All,
+    Pinned,
     Completed,
     NeedsAttention,
     Cancelled,
@@ -31,6 +32,7 @@ impl HistoryFilter {
     fn key(self) -> &'static str {
         match self {
             Self::All => "all",
+            Self::Pinned => "pinned",
             Self::Completed => "completed",
             Self::NeedsAttention => "needs-attention",
             Self::Cancelled => "cancelled",
@@ -40,6 +42,7 @@ impl HistoryFilter {
     fn label(self) -> &'static str {
         match self {
             Self::All => "All dictations",
+            Self::Pinned => "Pinned",
             Self::Completed => "Completed",
             Self::NeedsAttention => "Needs attention",
             Self::Cancelled => "Cancelled",
@@ -49,6 +52,7 @@ impl HistoryFilter {
     fn from_key(key: &str) -> Option<Self> {
         match key {
             "all" => Some(Self::All),
+            "pinned" => Some(Self::Pinned),
             "completed" => Some(Self::Completed),
             "needs-attention" => Some(Self::NeedsAttention),
             "cancelled" => Some(Self::Cancelled),
@@ -85,6 +89,7 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
     let entries = Rc::new(RefCell::new(Vec::<voxkey_ipc::HistoryEntry>::new()));
     let rows = Rc::new(RefCell::new(Vec::<adw::ActionRow>::new()));
     let retry_buttons = Rc::new(RefCell::new(Vec::<gtk4::Button>::new()));
+    let mutable_buttons = Rc::new(RefCell::new(Vec::<gtk4::Button>::new()));
     let actions_available = Rc::new(Cell::new(false));
     let initial_filter =
         HistoryFilter::from_key(&gui_settings::load_history_filter()).unwrap_or(HistoryFilter::All);
@@ -136,6 +141,7 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
     let filter_menu = gtk4::gio::Menu::new();
     for filter in [
         HistoryFilter::All,
+        HistoryFilter::Pinned,
         HistoryFilter::Completed,
         HistoryFilter::NeedsAttention,
         HistoryFilter::Cancelled,
@@ -161,6 +167,63 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
     filter_actions.add_action(&filter_action);
     filter_button.insert_action_group("history", Some(&filter_actions));
     search_bar.append(&filter_button);
+
+    let export_menu = gtk4::gio::Menu::new();
+    export_menu.append(Some("Readable text"), Some("history-export.text"));
+    export_menu.append(Some("JSON data"), Some("history-export.json"));
+    let export_button = gtk4::MenuButton::builder()
+        .icon_name("document-save-symbolic")
+        .menu_model(&export_menu)
+        .tooltip_text("Export history")
+        .valign(gtk4::Align::Center)
+        .build();
+    export_button.add_css_class("flat");
+    export_button.update_property(&[gtk4::accessible::Property::Label("Export history")]);
+    let export_actions = gtk4::gio::SimpleActionGroup::new();
+    let export_text_action = gtk4::gio::SimpleAction::new("text", None);
+    let export_json_action = gtk4::gio::SimpleAction::new("json", None);
+    export_text_action.set_enabled(false);
+    export_json_action.set_enabled(false);
+    export_actions.add_action(&export_text_action);
+    export_actions.add_action(&export_json_action);
+    export_button.insert_action_group("history-export", Some(&export_actions));
+    {
+        let entries = entries.clone();
+        let export_button = export_button.clone();
+        let toast_overlay = toast_overlay.clone();
+        export_text_action.connect_activate(move |_, _| {
+            start_history_export(
+                &export_button,
+                history_export_text(&entries.borrow()),
+                "voxkey-history.txt",
+                "Text files",
+                "*.txt",
+                "text/plain",
+                &toast_overlay,
+            );
+        });
+    }
+    {
+        let entries = entries.clone();
+        let export_button = export_button.clone();
+        let toast_overlay = toast_overlay.clone();
+        export_json_action.connect_activate(move |_, _| {
+            let Ok(json) = serde_json::to_string_pretty(&*entries.borrow()) else {
+                toast_overlay.add_toast(adw::Toast::new("Could not prepare the History export"));
+                return;
+            };
+            start_history_export(
+                &export_button,
+                json,
+                "voxkey-history.json",
+                "JSON files",
+                "*.json",
+                "application/json",
+                &toast_overlay,
+            );
+        });
+    }
+    search_bar.append(&export_button);
 
     let clear_button = gtk4::Button::builder()
         .icon_name("user-trash-symbolic")
@@ -231,10 +294,13 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
         let entries = entries.clone();
         let rows = rows.clone();
         let retry_buttons = retry_buttons.clone();
+        let mutable_buttons = mutable_buttons.clone();
         let actions_available = actions_available.clone();
         let active_filter = active_filter.clone();
         let latest_copy_text = latest_copy_text.clone();
         let copy_latest_action = copy_latest_action.clone();
+        let export_text_action = export_text_action.clone();
+        let export_json_action = export_json_action.clone();
         let group = group.clone();
         let search = search.clone();
         let search_bar = search_bar.clone();
@@ -250,6 +316,7 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
                 group.remove(&row);
             }
             retry_buttons.borrow_mut().clear();
+            mutable_buttons.borrow_mut().clear();
 
             let query = search.text().trim().to_lowercase();
             let filter = active_filter.get();
@@ -263,10 +330,17 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
                 .collect();
 
             let total = entries.borrow().len();
+            let clearable = entries
+                .borrow()
+                .iter()
+                .filter(|entry| !entry.pinned)
+                .count();
+            export_text_action.set_enabled(total > 0);
+            export_json_action.set_enabled(total > 0);
             let latest_text = latest_history_text(&entries.borrow());
             copy_latest_action.set_enabled(latest_text.is_some());
             *latest_copy_text.borrow_mut() = latest_text;
-            let clear_label = clear_history_action_label(total);
+            let clear_label = clear_history_action_label(clearable);
             clear_button.set_tooltip_text(Some(&clear_label));
             clear_button.update_property(&[gtk4::accessible::Property::Label(&clear_label)]);
             let filtering = !query.is_empty() || filter != HistoryFilter::All;
@@ -278,7 +352,7 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
                 filtering,
             )));
 
-            clear_button.set_sensitive(total > 0 && actions_available.get());
+            clear_button.set_sensitive(clearable > 0 && actions_available.get());
             if filtered.is_empty() {
                 if entries.borrow().is_empty() {
                     empty.set_title("No saved dictations");
@@ -302,13 +376,7 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
             for entry in filtered {
                 let row = adw::ActionRow::builder()
                     .title(history_title(&entry))
-                    .subtitle(format_history_subtitle(
-                        entry.recorded_at_unix_ms,
-                        &entry.provider,
-                        entry.outcome,
-                        entry.pending_insertion.as_deref(),
-                        entry.error.as_deref(),
-                    ))
+                    .subtitle(format_history_subtitle(&entry))
                     .title_lines(2)
                     .subtitle_lines(2)
                     .activatable(true)
@@ -328,6 +396,48 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
                 outcome_icon.add_css_class(outcome.style);
                 outcome_icon.set_accessible_role(gtk4::AccessibleRole::Presentation);
                 row.add_prefix(&outcome_icon);
+
+                let pin = gtk4::Button::from_icon_name(if entry.pinned {
+                    "starred-symbolic"
+                } else {
+                    "non-starred-symbolic"
+                });
+                pin.add_css_class("flat");
+                pin.set_valign(gtk4::Align::Center);
+                pin.set_tooltip_text(Some(if entry.pinned {
+                    "Unpin dictation"
+                } else {
+                    "Pin dictation"
+                }));
+                pin.update_property(&[gtk4::accessible::Property::Label(&history_action_label(
+                    if entry.pinned {
+                        "Unpin dictation"
+                    } else {
+                        "Pin dictation"
+                    },
+                    &entry,
+                ))]);
+                pin.set_sensitive(actions_available.get());
+                {
+                    let handle = handle.clone();
+                    let entry_id = entry.id;
+                    let pinned = entry.pinned;
+                    pin.connect_clicked(move |button| {
+                        button.set_sensitive(false);
+                        let completion = handle.send(DaemonCommand::SetHistoryEntryPinned {
+                            id: entry_id,
+                            pinned: !pinned,
+                        });
+                        let button = button.clone();
+                        gtk4::glib::spawn_future_local(async move {
+                            if completion.wait().await.is_err() {
+                                button.set_sensitive(true);
+                            }
+                        });
+                    });
+                }
+                row.add_suffix(&pin);
+                mutable_buttons.borrow_mut().push(pin);
 
                 {
                     let entry = entry.clone();
@@ -443,14 +553,18 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
             if !actions_available.get() {
                 return;
             }
-            let count = entries.borrow().len();
+            let count = entries
+                .borrow()
+                .iter()
+                .filter(|entry| !entry.pinned)
+                .count();
             if count == 0 {
                 return;
             }
             let dialog = adw::AlertDialog::builder()
                 .heading(clear_history_heading(count))
                 .body(
-                    "This permanently removes every saved transcript and failed recording from this computer.",
+                    "This permanently removes every unpinned transcript and failed recording. Pinned dictations are kept.",
                 )
                 .build();
             dialog.add_response("cancel", "Cancel");
@@ -485,14 +599,19 @@ pub fn build_history_page(handle: &DaemonHandle, toast_overlay: &adw::ToastOverl
         let entries = entries.clone();
         let clear_button = clear_button.clone();
         let retry_buttons = retry_buttons.clone();
+        let mutable_buttons = mutable_buttons.clone();
         Rc::new(move |available| {
             actions_available.set(available);
-            clear_button.set_sensitive(available && !entries.borrow().is_empty());
+            clear_button
+                .set_sensitive(available && entries.borrow().iter().any(|entry| !entry.pinned));
             for button in retry_buttons.borrow().iter() {
                 if available {
                     button.set_label("Retry");
                     button.set_tooltip_text(Some("Retry transcription"));
                 }
+                button.set_sensitive(available);
+            }
+            for button in mutable_buttons.borrow().iter() {
                 button.set_sensitive(available);
             }
         })
@@ -537,6 +656,7 @@ fn history_matches_filter(entry: &voxkey_ipc::HistoryEntry, filter: HistoryFilte
         .is_some_and(|pending| !pending.is_empty());
     match filter {
         HistoryFilter::All => true,
+        HistoryFilter::Pinned => entry.pinned,
         HistoryFilter::Completed => {
             entry.outcome == voxkey_ipc::TranscriptOutcome::Completed && !has_pending_text
         }
@@ -560,6 +680,7 @@ fn history_group_title(query: &str, filter: HistoryFilter) -> &'static str {
     }
     match filter {
         HistoryFilter::All => "Recent dictations",
+        HistoryFilter::Pinned => "Pinned dictations",
         HistoryFilter::Completed => "Completed dictations",
         HistoryFilter::NeedsAttention => "Needs attention",
         HistoryFilter::Cancelled => "Cancelled dictations",
@@ -586,6 +707,8 @@ fn history_matches_query(entry: &voxkey_ipc::HistoryEntry, query: &str) -> bool 
         || format_timestamp(entry.recorded_at_unix_ms)
             .to_lowercase()
             .contains(&query)
+        || (entry.pinned && "pinned".contains(&query))
+        || (entry.edited_at_unix_ms.is_some() && "edited".contains(&query))
         || (entry.text.is_empty() && history_title(entry).to_lowercase().contains(&query))
 }
 
@@ -707,11 +830,7 @@ fn build_history_details_dialog(
     };
     let dialog = adw::AlertDialog::builder()
         .heading(heading)
-        .body(format!(
-            "{}  •  {}",
-            format_timestamp(entry.recorded_at_unix_ms),
-            history_provider_name(&entry.provider)
-        ))
+        .body(history_details_metadata(entry))
         .body_use_markup(false)
         .extra_child(&scrolled)
         .build();
@@ -745,6 +864,38 @@ fn build_history_details_dialog(
             });
         });
     }
+
+    if !entry.text.is_empty() {
+        dialog.add_response("edit", "Edit transcription");
+        dialog.set_response_enabled("edit", daemon_actions_available);
+        let entry = entry.clone();
+        let handle = handle.clone();
+        let toast_overlay = toast_overlay.clone();
+        dialog.connect_response(Some("edit"), move |_, _| {
+            if let Some(root) = toast_overlay.root() {
+                present_history_edit_dialog(&entry, &root, &handle, &toast_overlay);
+            }
+        });
+    }
+
+    dialog.add_response(
+        "pin",
+        if entry.pinned {
+            "Unpin dictation"
+        } else {
+            "Pin dictation"
+        },
+    );
+    dialog.set_response_enabled("pin", daemon_actions_available);
+    let entry_id = entry.id;
+    let pinned = entry.pinned;
+    let pin_handle = handle.clone();
+    dialog.connect_response(Some("pin"), move |_, _| {
+        pin_handle.send(DaemonCommand::SetHistoryEntryPinned {
+            id: entry_id,
+            pinned: !pinned,
+        });
+    });
 
     if let Some((label, text, confirmation)) = history_copy_content(entry) {
         dialog.add_response("copy", label);
@@ -785,6 +936,207 @@ fn build_history_details_dialog(
     });
 
     dialog
+}
+
+fn present_history_edit_dialog(
+    entry: &voxkey_ipc::HistoryEntry,
+    root: &gtk4::Root,
+    handle: &DaemonHandle,
+    toast_overlay: &adw::ToastOverlay,
+) {
+    let text_view = gtk4::TextView::builder()
+        .editable(true)
+        .cursor_visible(true)
+        .wrap_mode(gtk4::WrapMode::WordChar)
+        .left_margin(14)
+        .right_margin(14)
+        .top_margin(12)
+        .bottom_margin(12)
+        .build();
+    text_view.buffer().set_text(&entry.text);
+    let scrolled = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .min_content_height(180)
+        .max_content_height(380)
+        .propagate_natural_height(true)
+        .child(&text_view)
+        .build();
+    scrolled.add_css_class("card");
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Edit transcription")
+        .body("The corrected text will be used for copying and future insertion")
+        .extra_child(&scrolled)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("save", "Save correction");
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("save"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_enabled("save", false);
+    {
+        let dialog = dialog.clone();
+        let original = entry.text.clone();
+        text_view.buffer().connect_changed(move |buffer| {
+            let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+            dialog.set_response_enabled(
+                "save",
+                history_edit_is_valid(&text) && text.trim() != original.trim(),
+            );
+        });
+    }
+    {
+        let text_view = text_view.clone();
+        let handle = handle.clone();
+        let toast_overlay = toast_overlay.clone();
+        let entry_id = entry.id;
+        dialog.connect_response(Some("save"), move |_, _| {
+            let buffer = text_view.buffer();
+            let text = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .trim()
+                .to_string();
+            if !history_edit_is_valid(&text) {
+                return;
+            }
+            let completion =
+                handle.send(DaemonCommand::UpdateHistoryEntryText { id: entry_id, text });
+            let toast_overlay = toast_overlay.clone();
+            gtk4::glib::spawn_future_local(async move {
+                if completion.wait().await.is_ok() {
+                    toast_overlay.add_toast(adw::Toast::new("Transcription updated"));
+                } else {
+                    toast_overlay.add_toast(adw::Toast::new(
+                        "Could not update the transcription. Try again.",
+                    ));
+                }
+            });
+        });
+    }
+    dialog.present(Some(root));
+    text_view.grab_focus();
+}
+
+fn history_edit_is_valid(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty() && text.len() <= 1024 * 1024
+}
+
+fn history_details_metadata(entry: &voxkey_ipc::HistoryEntry) -> String {
+    let mut parts = vec![
+        format_timestamp(entry.recorded_at_unix_ms),
+        history_provider_name(&entry.provider),
+    ];
+    if entry.pinned {
+        parts.push("Pinned".to_string());
+    }
+    if entry.edited_at_unix_ms.is_some() {
+        parts.push("Edited".to_string());
+    }
+    if let Some(duration) = entry.audio_duration_ms {
+        parts.push(format!("{} audio", format_metric_duration(duration)));
+    }
+    if let Some(duration) = entry.processing_duration_ms {
+        parts.push(format!("{} processing", format_metric_duration(duration)));
+    }
+    parts.join("  •  ")
+}
+
+fn history_export_text(entries: &[voxkey_ipc::HistoryEntry]) -> String {
+    let mut output = String::from("Voxkey transcription history\n\n");
+    for (index, entry) in entries.iter().enumerate() {
+        if index != 0 {
+            output.push_str("\n----------------------------------------\n\n");
+        }
+        output.push_str(&history_details_metadata(entry));
+        output.push('\n');
+        if entry.text.trim().is_empty() {
+            output.push_str("No transcription text was produced.\n");
+        } else {
+            output.push_str(entry.text.trim());
+            output.push('\n');
+        }
+        if let Some(error) = entry.error.as_deref().filter(|error| !error.is_empty()) {
+            output.push_str("Error: ");
+            output.push_str(error);
+            output.push('\n');
+        }
+        if let Some(pending) = entry
+            .pending_insertion
+            .as_deref()
+            .filter(|pending| !pending.is_empty())
+        {
+            output.push_str("Not typed yet: ");
+            output.push_str(pending);
+            output.push('\n');
+        }
+    }
+    output
+}
+
+fn start_history_export(
+    button: &gtk4::MenuButton,
+    contents: String,
+    initial_name: &str,
+    filter_name: &str,
+    pattern: &str,
+    mime_type: &str,
+    toast_overlay: &adw::ToastOverlay,
+) {
+    let Some(parent) = button
+        .root()
+        .and_then(|root| root.downcast::<gtk4::Window>().ok())
+    else {
+        return;
+    };
+    let filter = gtk4::FileFilter::new();
+    filter.set_name(Some(filter_name));
+    filter.add_pattern(pattern);
+    filter.add_mime_type(mime_type);
+    let dialog = gtk4::FileDialog::builder()
+        .title("Export History")
+        .accept_label("Export")
+        .initial_name(initial_name)
+        .default_filter(&filter)
+        .modal(true)
+        .build();
+    let toast_overlay = toast_overlay.clone();
+    gtk4::glib::spawn_future_local(async move {
+        let file = match dialog.save_future(Some(&parent)).await {
+            Ok(file) => file,
+            Err(error)
+                if error.matches(gtk4::DialogError::Cancelled)
+                    || error.matches(gtk4::DialogError::Dismissed)
+                    || error.matches(gtk4::gio::IOErrorEnum::Cancelled) =>
+            {
+                return;
+            }
+            Err(error) => {
+                tracing::warn!("Could not open the History export chooser: {error}");
+                toast_overlay.add_toast(adw::Toast::new(
+                    "Could not open the file chooser. Try again.",
+                ));
+                return;
+            }
+        };
+        match file
+            .replace_contents_future(
+                contents.into_bytes(),
+                None,
+                false,
+                gtk4::gio::FileCreateFlags::REPLACE_DESTINATION,
+            )
+            .await
+        {
+            Ok(_) => toast_overlay.add_toast(adw::Toast::new("History exported")),
+            Err((_, error)) => {
+                tracing::warn!("Could not write History export: {error}");
+                toast_overlay.add_toast(adw::Toast::new(
+                    "Could not save the History export. Try another folder.",
+                ));
+            }
+        }
+    });
 }
 
 fn unix_seconds(unix_ms: i64) -> i64 {
@@ -876,28 +1228,52 @@ fn format_timestamp_at(
         .unwrap_or_else(|_| "Unknown time".to_string())
 }
 
-fn format_history_subtitle(
-    recorded_at_unix_ms: i64,
-    provider: &str,
-    outcome: voxkey_ipc::TranscriptOutcome,
-    pending_insertion: Option<&str>,
-    error: Option<&str>,
-) -> String {
+fn format_history_subtitle(entry: &voxkey_ipc::HistoryEntry) -> String {
     let mut parts = vec![
-        format_timestamp(recorded_at_unix_ms),
-        gtk4::glib::markup_escape_text(&history_provider_name(provider)).to_string(),
+        format_timestamp(entry.recorded_at_unix_ms),
+        gtk4::glib::markup_escape_text(&history_provider_name(&entry.provider)).to_string(),
     ];
-    if let Some(outcome) = history_outcome_label(outcome) {
+    if entry.pinned {
+        parts.push("Pinned".to_string());
+    }
+    if entry.edited_at_unix_ms.is_some() {
+        parts.push("Edited".to_string());
+    }
+    if let Some(audio_duration_ms) = entry.audio_duration_ms {
+        parts.push(format!(
+            "{} audio",
+            format_metric_duration(audio_duration_ms)
+        ));
+    }
+    if let Some(processing_duration_ms) = entry.processing_duration_ms {
+        parts.push(format!(
+            "{} processing",
+            format_metric_duration(processing_duration_ms)
+        ));
+    }
+    if let Some(outcome) = history_outcome_label(entry.outcome) {
         parts.push(outcome.to_string());
     }
-    if pending_insertion.is_some_and(|pending| !pending.is_empty()) {
+    if entry
+        .pending_insertion
+        .as_deref()
+        .is_some_and(|pending| !pending.is_empty())
+    {
         parts.push("Typing incomplete".to_string());
     }
-    if let Some(error) = error {
+    if let Some(error) = entry.error.as_deref() {
         let summary = error.chars().take(240).collect::<String>();
         parts.push(gtk4::glib::markup_escape_text(&summary).to_string());
     }
     parts.join("  •  ")
+}
+
+fn format_metric_duration(milliseconds: u64) -> String {
+    if milliseconds < 1_000 {
+        format!("{milliseconds} ms")
+    } else {
+        format!("{:.1} s", milliseconds as f64 / 1_000.0)
+    }
 }
 
 fn history_outcome_label(outcome: voxkey_ipc::TranscriptOutcome) -> Option<&'static str> {
@@ -1009,6 +1385,7 @@ mod tests {
             pending_insertion: None,
             audio_path: Some("/tmp/recording.wav".to_string()),
             error: None,
+            ..Default::default()
         };
         assert!(history_can_retry(&entry));
 
@@ -1039,6 +1416,7 @@ mod tests {
             pending_insertion: None,
             audio_path: None,
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -1064,6 +1442,7 @@ mod tests {
             pending_insertion: Some("remaining words".to_string()),
             audio_path: None,
             error: Some("full provider error".to_string()),
+            ..Default::default()
         };
 
         let details = history_details_text(&entry);
@@ -1098,6 +1477,7 @@ mod tests {
             pending_insertion: None,
             audio_path: None,
             error: None,
+            ..Default::default()
         };
         let entries = vec![
             entry(1, 100, "Older transcription"),
@@ -1133,6 +1513,7 @@ mod tests {
             pending_insertion: Some("remaining words".to_string()),
             audio_path: None,
             error: Some("unprocessable response".to_string()),
+            ..Default::default()
         };
 
         assert!(history_matches_query(&entry, "parakeet v3 server"));
@@ -1154,6 +1535,7 @@ mod tests {
             pending_insertion: None,
             audio_path: None,
             error: None,
+            ..Default::default()
         };
 
         assert!(history_matches_filter(&entry, HistoryFilter::All));
@@ -1189,6 +1571,7 @@ mod tests {
     fn history_filter_keys_and_headings_are_stable() {
         for filter in [
             HistoryFilter::All,
+            HistoryFilter::Pinned,
             HistoryFilter::Completed,
             HistoryFilter::NeedsAttention,
             HistoryFilter::Cancelled,
@@ -1218,13 +1601,12 @@ mod tests {
 
     #[test]
     fn history_subtitle_escapes_provider_markup() {
-        let subtitle = format_history_subtitle(
-            1_720_000_000_000,
-            "<b>remote & custom</b>",
-            voxkey_ipc::TranscriptOutcome::Completed,
-            None,
-            None,
-        );
+        let entry = voxkey_ipc::HistoryEntry {
+            recorded_at_unix_ms: 1_720_000_000_000,
+            provider: "<b>remote & custom</b>".to_string(),
+            ..Default::default()
+        };
+        let subtitle = format_history_subtitle(&entry);
 
         assert!(
             subtitle.contains("&lt;b&gt;remote &amp; custom&lt;/b&gt;"),
@@ -1249,13 +1631,14 @@ mod tests {
 
     #[test]
     fn history_subtitle_marks_partial_output_and_uninserted_text() {
-        let subtitle = format_history_subtitle(
-            1_720_000_000_000,
-            "Mistral Realtime",
-            voxkey_ipc::TranscriptOutcome::PartialTransportClose,
-            Some("remaining words"),
-            None,
-        );
+        let entry = voxkey_ipc::HistoryEntry {
+            recorded_at_unix_ms: 1_720_000_000_000,
+            provider: "Mistral Realtime".to_string(),
+            outcome: voxkey_ipc::TranscriptOutcome::PartialTransportClose,
+            pending_insertion: Some("remaining words".to_string()),
+            ..Default::default()
+        };
+        let subtitle = format_history_subtitle(&entry);
 
         assert!(subtitle.contains("Partial — connection lost"), "{subtitle}");
         assert!(subtitle.contains("Typing incomplete"), "{subtitle}");
@@ -1273,8 +1656,13 @@ mod tests {
                 "Partial — dictation interrupted",
             ),
         ] {
-            let subtitle =
-                format_history_subtitle(1_720_000_000_000, "Mistral Realtime", outcome, None, None);
+            let entry = voxkey_ipc::HistoryEntry {
+                recorded_at_unix_ms: 1_720_000_000_000,
+                provider: "Mistral Realtime".to_string(),
+                outcome,
+                ..Default::default()
+            };
+            let subtitle = format_history_subtitle(&entry);
             assert!(subtitle.contains(expected), "{subtitle}");
         }
     }
@@ -1308,18 +1696,72 @@ mod tests {
 
     #[test]
     fn failed_recording_subtitle_escapes_the_provider_error() {
-        let subtitle = format_history_subtitle(
-            1_720_000_000_000,
-            "Parakeet HTTP",
-            voxkey_ipc::TranscriptOutcome::Failed,
-            None,
-            Some("422 <unprocessable> & rejected"),
-        );
+        let entry = voxkey_ipc::HistoryEntry {
+            recorded_at_unix_ms: 1_720_000_000_000,
+            provider: "Parakeet HTTP".to_string(),
+            outcome: voxkey_ipc::TranscriptOutcome::Failed,
+            error: Some("422 <unprocessable> & rejected".to_string()),
+            ..Default::default()
+        };
+        let subtitle = format_history_subtitle(&entry);
 
         assert!(subtitle.contains("Recording saved"), "{subtitle}");
         assert!(
             subtitle.contains("422 &lt;unprocessable&gt; &amp; rejected"),
             "{subtitle}"
         );
+    }
+
+    #[test]
+    fn pinned_filter_and_metadata_are_visible() {
+        let entry = voxkey_ipc::HistoryEntry {
+            id: 1,
+            recorded_at_unix_ms: 1_720_000_000_000,
+            text: "Corrected transcript".to_string(),
+            provider: "Parakeet v3".to_string(),
+            pinned: true,
+            edited_at_unix_ms: Some(1_720_000_001_000),
+            audio_duration_ms: Some(2_500),
+            processing_duration_ms: Some(240),
+            ..Default::default()
+        };
+
+        assert!(history_matches_filter(&entry, HistoryFilter::Pinned));
+        let subtitle = format_history_subtitle(&entry);
+        assert!(subtitle.contains("Pinned"), "{subtitle}");
+        assert!(subtitle.contains("Edited"), "{subtitle}");
+        assert!(subtitle.contains("2.5 s audio"), "{subtitle}");
+        assert!(subtitle.contains("240 ms processing"), "{subtitle}");
+    }
+
+    #[test]
+    fn readable_export_contains_text_and_recovery_details() {
+        let entry = voxkey_ipc::HistoryEntry {
+            id: 1,
+            recorded_at_unix_ms: 1_720_000_000_000,
+            text: "Corrected transcript".to_string(),
+            provider: "Test".to_string(),
+            pending_insertion: Some("remaining text".to_string()),
+            error: Some("temporary failure".to_string()),
+            ..Default::default()
+        };
+        let exported = history_export_text(&[entry]);
+        assert!(exported.starts_with("Voxkey transcription history"));
+        assert!(exported.contains("Corrected transcript"));
+        assert!(exported.contains("Error: temporary failure"));
+        assert!(exported.contains("Not typed yet: remaining text"));
+    }
+
+    #[test]
+    fn edit_validation_rejects_empty_and_oversized_text() {
+        assert!(history_edit_is_valid(" corrected "));
+        assert!(!history_edit_is_valid("   "));
+        assert!(!history_edit_is_valid(&("x".repeat(1024 * 1024 + 1))));
+    }
+
+    #[test]
+    fn metric_duration_uses_readable_units() {
+        assert_eq!(format_metric_duration(240), "240 ms");
+        assert_eq!(format_metric_duration(2_500), "2.5 s");
     }
 }

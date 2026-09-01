@@ -707,6 +707,11 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         .subtitle_lines(2)
         .model(&execution_provider_model)
         .build();
+    let preload_model_row = adw::SwitchRow::builder()
+        .title("Ready model at startup")
+        .subtitle("Uses more memory to make the first local dictation start faster")
+        .subtitle_lines(2)
+        .build();
 
     let model_status_row = adw::ActionRow::builder()
         .title("Local model")
@@ -758,6 +763,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     }
     model_configuration_group.add(&parakeet_endpoint.status);
     model_configuration_group.add(&execution_provider_row);
+    model_configuration_group.add(&preload_model_row);
     model_configuration_group.add(&model_status_row);
 
     // Initially hide non-whisper.cpp rows (default provider)
@@ -770,6 +776,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     parakeet_backend_row.set_visible(false);
     parakeet_endpoint.set_visible(false);
     execution_provider_row.set_visible(false);
+    preload_model_row.set_visible(false);
     model_status_row.set_visible(false);
 
     models_box.append(&transcription_group);
@@ -795,6 +802,40 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     // Monotonically identifies the newest keyring status read. Editing the field
     // or changing providers invalidates every older asynchronous reply.
     let api_key_request_id = Rc::new(Cell::new(0_u64));
+    {
+        let state = transcriber_state.clone();
+        let updating = updating_widgets.clone();
+        let handle = handle.clone();
+        preload_model_row.connect_active_notify(move |row| {
+            if updating.get() {
+                return;
+            }
+            state.borrow_mut().parakeet.preload_model = row.is_active();
+            send_transcriber_config(&state, &handle);
+        });
+    }
+    {
+        let preload_model_row = preload_model_row.clone();
+        let parakeet_backend_row = parakeet_backend_row.clone();
+        provider_row.connect_selected_notify(move |row| {
+            preload_model_row.set_visible(
+                (local_model_for_choice(row.selected()).is_some()
+                    || row.selected() == CUSTOM_PARAKEET_CHOICE)
+                    && parakeet_backend_row.selected() == 0,
+            );
+        });
+    }
+    {
+        let preload_model_row = preload_model_row.clone();
+        let provider_row = provider_row.clone();
+        parakeet_backend_row.connect_selected_notify(move |row| {
+            preload_model_row.set_visible(
+                (local_model_for_choice(provider_row.selected()).is_some()
+                    || provider_row.selected() == CUSTOM_PARAKEET_CHOICE)
+                    && row.selected() == 0,
+            );
+        });
+    }
 
     // -- Audio Input page --
     let audio_box = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
@@ -833,6 +874,72 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     refresh_audio_button.add_css_class("flat");
     audio_group.set_header_suffix(Some(&refresh_audio_button));
     audio_box.append(&audio_group);
+
+    let signal_group = adw::PreferencesGroup::builder()
+        .title("Signal check")
+        .description("Speak normally for four seconds; the sample stays on this computer and is deleted immediately")
+        .build();
+    let signal_row = adw::ActionRow::builder()
+        .title("Test your microphone")
+        .subtitle("Check that Voxkey can hear a clear, unclipped voice signal")
+        .subtitle_lines(2)
+        .build();
+    let signal_status_icon = gtk4::Image::from_icon_name("audio-input-microphone-symbolic");
+    signal_status_icon.add_css_class("accent");
+    signal_row.add_prefix(&signal_status_icon);
+    let signal_level = gtk4::LevelBar::builder()
+        .min_value(0.0)
+        .max_value(1.0)
+        .value(0.0)
+        .width_request(128)
+        .valign(gtk4::Align::Center)
+        .build();
+    signal_level.set_tooltip_text(Some("Microphone signal level"));
+    signal_level.update_property(&[gtk4::accessible::Property::Label("Microphone signal level")]);
+    signal_row.add_suffix(&signal_level);
+    let signal_spinner = gtk4::Spinner::new();
+    signal_spinner.set_valign(gtk4::Align::Center);
+    signal_spinner.set_visible(false);
+    signal_row.add_suffix(&signal_spinner);
+    let signal_test_button = gtk4::Button::with_label("Start test");
+    signal_test_button.set_valign(gtk4::Align::Center);
+    signal_test_button.add_css_class("suggested-action");
+    signal_row.add_suffix(&signal_test_button);
+    signal_group.add(&signal_row);
+    audio_box.append(&signal_group);
+
+    let hands_free_group = adw::PreferencesGroup::builder()
+        .title("Voice-aware recording")
+        .description("Finish hands-free after you stop speaking and avoid processing empty audio")
+        .build();
+    let auto_stop_row = adw::SwitchRow::builder()
+        .title("Stop after silence")
+        .subtitle("Finish automatically once speech has started and then becomes quiet")
+        .subtitle_lines(2)
+        .build();
+    let auto_stop_duration_adjustment = gtk4::Adjustment::new(3.0, 1.5, 30.0, 0.5, 1.0, 0.0);
+    let auto_stop_duration_row = adw::SpinRow::builder()
+        .title("Silence duration")
+        .subtitle("How long Voxkey waits after your last spoken sound")
+        .subtitle_lines(2)
+        .adjustment(&auto_stop_duration_adjustment)
+        .digits(1)
+        .sensitive(false)
+        .build();
+    add_spin_row_unit(&auto_stop_duration_row, "s");
+    let no_speech_guard_row = adw::SwitchRow::builder()
+        .title("Skip silent recordings")
+        .subtitle("Do not upload or decode a batch recording when no voice was detected")
+        .subtitle_lines(2)
+        .active(true)
+        .build();
+    hands_free_group.add(&auto_stop_row);
+    hands_free_group.add(&auto_stop_duration_row);
+    hands_free_group.add(&no_speech_guard_row);
+    audio_box.append(&hands_free_group);
+    let audio_behavior_state = Rc::new(RefCell::new(voxkey_ipc::AudioBehaviorConfig::default()));
+    let updating_audio_behavior_widgets = Rc::new(Cell::new(false));
+    let microphone_test_running = Rc::new(Cell::new(false));
 
     let recording_format_group = adw::PreferencesGroup::builder()
         .title("Capture details")
@@ -925,6 +1032,87 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             });
         });
     }
+    {
+        let handle = handle.clone();
+        let toast_overlay = toast_overlay.clone();
+        let signal_row = signal_row.clone();
+        let signal_status_icon = signal_status_icon.clone();
+        let signal_level = signal_level.clone();
+        let signal_spinner = signal_spinner.clone();
+        let audio_device_row = audio_device_row.clone();
+        let refresh_audio_button = refresh_audio_button.clone();
+        let microphone_test_running = microphone_test_running.clone();
+        signal_test_button.connect_clicked(move |button| {
+            if microphone_test_running.replace(true) {
+                return;
+            }
+            button.set_sensitive(false);
+            button.set_label("Listening…");
+            signal_spinner.set_visible(true);
+            signal_spinner.start();
+            signal_level.set_value(0.0);
+            apply_microphone_signal_presentation(
+                voxkey_ipc::AudioSignalQuality::Silent,
+                true,
+                &signal_row,
+                &signal_status_icon,
+            );
+            audio_device_row.set_sensitive(false);
+            refresh_audio_button.set_sensitive(false);
+            let completion = handle.send(DaemonCommand::TestMicrophone(4_000));
+            let button = button.clone();
+            let toast_overlay = toast_overlay.clone();
+            let signal_row = signal_row.clone();
+            let signal_status_icon = signal_status_icon.clone();
+            let signal_level = signal_level.clone();
+            let signal_spinner = signal_spinner.clone();
+            let audio_device_row = audio_device_row.clone();
+            let refresh_audio_button = refresh_audio_button.clone();
+            let microphone_test_running = microphone_test_running.clone();
+            glib::spawn_future_local(async move {
+                let result = completion.wait_microphone_test().await;
+                microphone_test_running.set(false);
+                signal_spinner.stop();
+                signal_spinner.set_visible(false);
+                button.set_label("Test again");
+                button.set_sensitive(true);
+                audio_device_row.set_sensitive(true);
+                refresh_audio_button.set_sensitive(true);
+                match result {
+                    Ok(result) => {
+                        signal_level.set_value(result.peak.clamp(0.0, 1.0));
+                        apply_microphone_signal_presentation(
+                            result.quality,
+                            false,
+                            &signal_row,
+                            &signal_status_icon,
+                        );
+                    }
+                    Err(_) => {
+                        signal_level.set_value(0.0);
+                        signal_row.set_title("Microphone test did not finish");
+                        signal_row.set_subtitle("Check the selected microphone, then try again");
+                        set_signal_status_icon(
+                            &signal_status_icon,
+                            "dialog-warning-symbolic",
+                            Some("warning"),
+                        );
+                        toast_overlay.add_toast(adw::Toast::new(
+                            "Could not test the microphone. Check the device and try again.",
+                        ));
+                    }
+                }
+            });
+        });
+    }
+    wire_audio_behavior_actions(
+        &auto_stop_row,
+        &auto_stop_duration_row,
+        &no_speech_guard_row,
+        &audio_behavior_state,
+        &updating_audio_behavior_widgets,
+        &handle,
+    );
 
     // -- Dictionary page --
     let dictionary_config = Rc::new(RefCell::new(voxkey_ipc::DictionaryConfig::default()));
@@ -1003,7 +1191,52 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     shortcut_details_icon.set_accessible_role(gtk4::AccessibleRole::Presentation);
     shortcut_row.add_suffix(&shortcut_details_icon);
     dictation_group.add(&shortcut_row);
+    let shortcut_mode_model =
+        gtk4::StringList::new(&["Press once to start or stop", "Hold while speaking"]);
+    let shortcut_mode_row = adw::ComboRow::builder()
+        .title("Shortcut behavior")
+        .subtitle("Press once to start, then press again to finish")
+        .subtitle_lines(2)
+        .model(&shortcut_mode_model)
+        .build();
+    shortcut_mode_row.add_prefix(&gtk4::Image::from_icon_name("media-record-symbolic"));
+    dictation_group.add(&shortcut_mode_row);
+    let updating_shortcut_mode = Rc::new(Cell::new(false));
     settings_box.append(&dictation_group);
+
+    let history_storage_group = adw::PreferencesGroup::builder()
+        .title("Saved history")
+        .description("Cleanup runs immediately; pinned dictations are always kept")
+        .build();
+    let history_age_row = adw::SwitchRow::builder()
+        .title("Delete old dictations automatically")
+        .subtitle("Remove unpinned items after a chosen number of days")
+        .subtitle_lines(2)
+        .build();
+    let history_age_adjustment = gtk4::Adjustment::new(90.0, 1.0, 3_650.0, 1.0, 30.0, 0.0);
+    let history_age_days_row = adw::SpinRow::builder()
+        .title("Keep for")
+        .adjustment(&history_age_adjustment)
+        .digits(0)
+        .sensitive(false)
+        .build();
+    add_spin_row_unit(&history_age_days_row, "days");
+    let history_count_adjustment = gtk4::Adjustment::new(500.0, 25.0, 5_000.0, 25.0, 100.0, 0.0);
+    let history_count_row = adw::SpinRow::builder()
+        .title("Recent dictations to keep")
+        .subtitle("Pinned dictations do not count toward this limit")
+        .subtitle_lines(2)
+        .adjustment(&history_count_adjustment)
+        .digits(0)
+        .build();
+    add_spin_row_unit(&history_count_row, "items");
+    history_storage_group.add(&history_age_row);
+    history_storage_group.add(&history_age_days_row);
+    history_storage_group.add(&history_count_row);
+    settings_box.append(&history_storage_group);
+    let history_retention_state =
+        Rc::new(RefCell::new(voxkey_ipc::HistoryRetentionConfig::default()));
+    let updating_history_retention = Rc::new(Cell::new(false));
 
     let preview_group = adw::PreferencesGroup::builder()
         .title("Live feedback")
@@ -1241,6 +1474,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         audio_box.clone().upcast(),
         dictionary_page.widget.clone(),
         dictation_group.clone().upcast(),
+        history_storage_group.clone().upcast(),
         preview_group.clone().upcast(),
         preview_advanced_group.clone().upcast(),
         insertion_group.clone().upcast(),
@@ -1635,6 +1869,29 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     }
     // -- Wire up user actions --
     wire_shortcut_capture(&shortcut_row, &handle, &toast_overlay, &window);
+    {
+        let handle = handle.clone();
+        let updating_shortcut_mode = updating_shortcut_mode.clone();
+        let dictation_group = dictation_group.clone();
+        shortcut_mode_row.connect_selected_notify(move |row| {
+            if updating_shortcut_mode.get() {
+                return;
+            }
+            let mode = shortcut_mode_for_selection(row.selected());
+            apply_shortcut_mode_presentation(mode, &dictation_group, row);
+            handle.send(DaemonCommand::SetShortcutMode(
+                mode.as_wire_value().to_string(),
+            ));
+        });
+    }
+    wire_history_retention_actions(
+        &history_age_row,
+        &history_age_days_row,
+        &history_count_row,
+        &history_retention_state,
+        &updating_history_retention,
+        &handle,
+    );
     wire_whisper_command_picker(
         &choose_command_button,
         &command_row,
@@ -1732,6 +1989,9 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     let last_error_state_update = last_error_state.clone();
     let shortcut_row_update = shortcut_row.clone();
     let shortcut_label_update = shortcut_label.clone();
+    let shortcut_mode_row_update = shortcut_mode_row.clone();
+    let dictation_group_update = dictation_group.clone();
+    let updating_shortcut_mode_update = updating_shortcut_mode.clone();
     let provider_row_update = provider_row.clone();
     let provider_model_update = provider_model.clone();
     let command_row_update = command_row.clone();
@@ -1747,6 +2007,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     let parakeet_backend_row_update = parakeet_backend_row.clone();
     let parakeet_endpoint_update = parakeet_endpoint.clone();
     let execution_provider_row_update = execution_provider_row.clone();
+    let preload_model_row_update = preload_model_row.clone();
     let model_status_row_update = model_status_row.clone();
     let model_download_progress_update = model_download_progress.clone();
     let download_button_update = download_button.clone();
@@ -1777,6 +2038,20 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     let audio_device_row_update = audio_device_row.clone();
     let audio_devices_update = audio_devices.clone();
     let updating_audio_widgets_update = updating_audio_widgets.clone();
+    let audio_behavior_state_update = audio_behavior_state.clone();
+    let updating_audio_behavior_widgets_update = updating_audio_behavior_widgets.clone();
+    let auto_stop_row_update = auto_stop_row.clone();
+    let auto_stop_duration_row_update = auto_stop_duration_row.clone();
+    let no_speech_guard_row_update = no_speech_guard_row.clone();
+    let history_retention_state_update = history_retention_state.clone();
+    let updating_history_retention_update = updating_history_retention.clone();
+    let history_age_row_update = history_age_row.clone();
+    let history_age_days_row_update = history_age_days_row.clone();
+    let history_count_row_update = history_count_row.clone();
+    let signal_row_update = signal_row.clone();
+    let signal_status_icon_update = signal_status_icon.clone();
+    let signal_level_update = signal_level.clone();
+    let microphone_test_running_update = microphone_test_running.clone();
     let recording_format_row_update = recording_format_row.clone();
     let permissions_nav_update = permissions_nav.clone();
     let settings_nav_update = settings_nav.clone();
@@ -1821,10 +2096,15 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                         state,
                         shortcut_trigger,
                         shortcut_description,
+                        shortcut_mode,
                         transcriber_config,
                         injection_config,
                         preview_config,
                         dictionary_config,
+                        audio_behavior_config,
+                        history_retention_config,
+                        audio_signal,
+                        audio_level,
                         transcription_history,
                         audio_input_devices,
                         audio_input_device,
@@ -1869,6 +2149,12 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                     shortcut_label_update.set_accelerator(&shortcut_trigger);
                     shortcut_row_update
                         .set_subtitle(&shortcut_subtitle(&shortcut_description, true));
+                    apply_shortcut_mode_to_widgets(
+                        &shortcut_mode,
+                        &dictation_group_update,
+                        &shortcut_mode_row_update,
+                        &updating_shortcut_mode_update,
+                    );
                     let _ = last_transcript;
                     history_apply_update(&transcription_history);
                     dictionary_apply_update(&dictionary_config);
@@ -1880,6 +2166,35 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                         &audio_devices_update,
                         &updating_audio_widgets_update,
                     );
+                    apply_audio_behavior_config_to_widgets(
+                        &audio_behavior_config,
+                        &auto_stop_row_update,
+                        &auto_stop_duration_row_update,
+                        &no_speech_guard_row_update,
+                        &audio_behavior_state_update,
+                        &updating_audio_behavior_widgets_update,
+                    );
+                    apply_history_retention_to_widgets(
+                        &history_retention_config,
+                        &history_age_row_update,
+                        &history_age_days_row_update,
+                        &history_count_row_update,
+                        &history_retention_state_update,
+                        &updating_history_retention_update,
+                    );
+                    if microphone_signal_is_live(microphone_test_running_update.get(), &state) {
+                        signal_level_update.set_value(audio_level.clamp(0.0, 1.0));
+                        if let Some(quality) =
+                            voxkey_ipc::AudioSignalQuality::from_wire_value(&audio_signal)
+                        {
+                            apply_microphone_signal_presentation(
+                                quality,
+                                true,
+                                &signal_row_update,
+                                &signal_status_icon_update,
+                            );
+                        }
+                    }
                     current_sample_rate = sample_rate;
                     current_channels = channels;
                     recording_format_row_update
@@ -1908,6 +2223,11 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                         &api_key_stored_for_update,
                         &expert_mode_update,
                         transcriber_widgets_initialized_update.replace(true),
+                    );
+                    sync_preload_model_widget(
+                        &transcriber_config,
+                        &preload_model_row_update,
+                        &updating_widgets_update,
                     );
                     apply_preview_config_to_widgets(
                         &preview_config,
@@ -2072,6 +2392,15 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                         &permission_status_update,
                         &retry_permission_button_update,
                     );
+                    if !microphone_test_running_update.get()
+                        && !microphone_signal_is_live(false, &state)
+                    {
+                        signal_level_update.set_value(0.0);
+                        reset_microphone_signal_presentation(
+                            &signal_row_update,
+                            &signal_status_icon_update,
+                        );
+                    }
                 }
                 DaemonUpdate::PropertyChanged { name, value } => match name.as_str() {
                     "last_transcript" => {}
@@ -2117,6 +2446,14 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                     "shortcut_description" => {
                         shortcut_row_update.set_subtitle(&shortcut_subtitle(&value, true));
                     }
+                    "shortcut_mode" => {
+                        apply_shortcut_mode_to_widgets(
+                            &value,
+                            &dictation_group_update,
+                            &shortcut_mode_row_update,
+                            &updating_shortcut_mode_update,
+                        );
+                    }
                     "transcriber_config" => {
                         let previous_service =
                             transcriber_api_service(&transcriber_state_update.borrow());
@@ -2144,6 +2481,11 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                             &api_key_stored_for_update,
                             &expert_mode_update,
                             transcriber_widgets_initialized_update.replace(true),
+                        );
+                        sync_preload_model_widget(
+                            &value,
+                            &preload_model_row_update,
+                            &updating_widgets_update,
                         );
                         let service = transcriber_api_service(&transcriber_state_update.borrow());
                         if previous_service != service {
@@ -2211,6 +2553,50 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                     }
                     "dictionary_config" => {
                         dictionary_apply_update(&value);
+                    }
+                    "audio_behavior_config" => {
+                        apply_audio_behavior_config_to_widgets(
+                            &value,
+                            &auto_stop_row_update,
+                            &auto_stop_duration_row_update,
+                            &no_speech_guard_row_update,
+                            &audio_behavior_state_update,
+                            &updating_audio_behavior_widgets_update,
+                        );
+                    }
+                    "history_retention_config" => {
+                        apply_history_retention_to_widgets(
+                            &value,
+                            &history_age_row_update,
+                            &history_age_days_row_update,
+                            &history_count_row_update,
+                            &history_retention_state_update,
+                            &updating_history_retention_update,
+                        );
+                    }
+                    "audio_signal" => {
+                        if microphone_signal_is_live(
+                            microphone_test_running_update.get(),
+                            permission_daemon_state_update.borrow().as_str(),
+                        ) && let Some(quality) =
+                            voxkey_ipc::AudioSignalQuality::from_wire_value(&value)
+                        {
+                            apply_microphone_signal_presentation(
+                                quality,
+                                true,
+                                &signal_row_update,
+                                &signal_status_icon_update,
+                            );
+                        }
+                    }
+                    "audio_level" => {
+                        if microphone_signal_is_live(
+                            microphone_test_running_update.get(),
+                            permission_daemon_state_update.borrow().as_str(),
+                        ) && let Ok(level) = value.parse::<f64>()
+                        {
+                            signal_level_update.set_value(level.clamp(0.0, 1.0));
+                        }
                     }
                     "audio_input_device" => {
                         handle_update.send(DaemonCommand::RefreshAudioInputDevices);
@@ -2764,6 +3150,260 @@ fn apply_audio_devices_to_widgets(
     updating.set(false);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MicrophoneSignalCopy {
+    title: &'static str,
+    subtitle: &'static str,
+    icon_name: &'static str,
+    style: Option<&'static str>,
+}
+
+fn microphone_signal_copy(
+    quality: voxkey_ipc::AudioSignalQuality,
+    testing: bool,
+) -> MicrophoneSignalCopy {
+    match (quality, testing) {
+        (voxkey_ipc::AudioSignalQuality::Silent, true) => MicrophoneSignalCopy {
+            title: "Listening for your voice…",
+            subtitle: "Speak at the volume and distance you normally use for dictation",
+            icon_name: "audio-input-microphone-symbolic",
+            style: Some("accent"),
+        },
+        (voxkey_ipc::AudioSignalQuality::Silent, false) => MicrophoneSignalCopy {
+            title: "No voice detected",
+            subtitle: "Check the selected microphone and its input level, then test again",
+            icon_name: "microphone-sensitivity-muted-symbolic",
+            style: Some("warning"),
+        },
+        (voxkey_ipc::AudioSignalQuality::Quiet, _) => MicrophoneSignalCopy {
+            title: "Voice signal is quiet",
+            subtitle: "Move closer or raise the microphone input level for more reliable text",
+            icon_name: "microphone-sensitivity-low-symbolic",
+            style: Some("warning"),
+        },
+        (voxkey_ipc::AudioSignalQuality::Good, _) => MicrophoneSignalCopy {
+            title: "Voice signal looks good",
+            subtitle: "Voxkey can hear a clear signal at this microphone level",
+            icon_name: "emblem-ok-symbolic",
+            style: Some("success"),
+        },
+        (voxkey_ipc::AudioSignalQuality::Clipping, _) => MicrophoneSignalCopy {
+            title: "Voice signal is clipping",
+            subtitle: "Lower the microphone input level or move farther away",
+            icon_name: "dialog-warning-symbolic",
+            style: Some("error"),
+        },
+    }
+}
+
+fn set_signal_status_icon(icon: &gtk4::Image, icon_name: &str, style: Option<&str>) {
+    for class in ["accent", "success", "warning", "error"] {
+        icon.remove_css_class(class);
+    }
+    icon.set_icon_name(Some(icon_name));
+    if let Some(style) = style {
+        icon.add_css_class(style);
+    }
+}
+
+fn apply_microphone_signal_presentation(
+    quality: voxkey_ipc::AudioSignalQuality,
+    testing: bool,
+    row: &adw::ActionRow,
+    icon: &gtk4::Image,
+) {
+    let copy = microphone_signal_copy(quality, testing);
+    row.set_title(copy.title);
+    row.set_subtitle(copy.subtitle);
+    set_signal_status_icon(icon, copy.icon_name, copy.style);
+}
+
+fn reset_microphone_signal_presentation(row: &adw::ActionRow, icon: &gtk4::Image) {
+    row.set_title("Test your microphone");
+    row.set_subtitle("Check that Voxkey can hear a clear, unclipped voice signal");
+    set_signal_status_icon(icon, "audio-input-microphone-symbolic", Some("accent"));
+}
+
+fn microphone_signal_is_live(test_running: bool, daemon_state: &str) -> bool {
+    test_running || matches!(daemon_state, "Recording" | "Connecting" | "Streaming")
+}
+
+fn apply_audio_behavior_config_to_widgets(
+    config_json: &str,
+    auto_stop_row: &adw::SwitchRow,
+    auto_stop_duration_row: &adw::SpinRow,
+    no_speech_guard_row: &adw::SwitchRow,
+    state: &Rc<RefCell<voxkey_ipc::AudioBehaviorConfig>>,
+    updating: &Rc<Cell<bool>>,
+) {
+    let Ok(config) = serde_json::from_str::<voxkey_ipc::AudioBehaviorConfig>(config_json) else {
+        return;
+    };
+    let config = config.normalized();
+    updating.set(true);
+    let auto_stop_enabled = config.auto_stop_silence_ms != 0;
+    auto_stop_row.set_active(auto_stop_enabled);
+    auto_stop_duration_row.set_sensitive(auto_stop_enabled);
+    if auto_stop_enabled {
+        auto_stop_duration_row.set_value(f64::from(config.auto_stop_silence_ms) / 1_000.0);
+    }
+    no_speech_guard_row.set_active(config.no_speech_guard);
+    *state.borrow_mut() = config;
+    updating.set(false);
+}
+
+fn send_audio_behavior_config(
+    state: &Rc<RefCell<voxkey_ipc::AudioBehaviorConfig>>,
+    handle: &DaemonHandle,
+) {
+    if let Ok(config_json) = serde_json::to_string(&*state.borrow()) {
+        handle.send(DaemonCommand::SetAudioBehaviorConfig(config_json));
+    }
+}
+
+fn wire_audio_behavior_actions(
+    auto_stop_row: &adw::SwitchRow,
+    auto_stop_duration_row: &adw::SpinRow,
+    no_speech_guard_row: &adw::SwitchRow,
+    state: &Rc<RefCell<voxkey_ipc::AudioBehaviorConfig>>,
+    updating: &Rc<Cell<bool>>,
+    handle: &DaemonHandle,
+) {
+    {
+        let duration_row = auto_stop_duration_row.clone();
+        let state = state.clone();
+        let updating = updating.clone();
+        let handle = handle.clone();
+        auto_stop_row.connect_active_notify(move |row| {
+            if updating.get() {
+                return;
+            }
+            duration_row.set_sensitive(row.is_active());
+            state.borrow_mut().auto_stop_silence_ms = if row.is_active() {
+                (duration_row.value() * 1_000.0).round() as u32
+            } else {
+                0
+            };
+            let normalized = state.borrow().clone().normalized();
+            *state.borrow_mut() = normalized;
+            send_audio_behavior_config(&state, &handle);
+        });
+    }
+    {
+        let auto_stop_row = auto_stop_row.clone();
+        let state = state.clone();
+        let updating = updating.clone();
+        let handle = handle.clone();
+        auto_stop_duration_row.connect_value_notify(move |row| {
+            if updating.get() || !auto_stop_row.is_active() {
+                return;
+            }
+            state.borrow_mut().auto_stop_silence_ms = (row.value() * 1_000.0).round() as u32;
+            let normalized = state.borrow().clone().normalized();
+            *state.borrow_mut() = normalized;
+            send_audio_behavior_config(&state, &handle);
+        });
+    }
+    {
+        let state = state.clone();
+        let updating = updating.clone();
+        let handle = handle.clone();
+        no_speech_guard_row.connect_active_notify(move |row| {
+            if updating.get() {
+                return;
+            }
+            state.borrow_mut().no_speech_guard = row.is_active();
+            send_audio_behavior_config(&state, &handle);
+        });
+    }
+}
+
+fn apply_history_retention_to_widgets(
+    config_json: &str,
+    age_row: &adw::SwitchRow,
+    age_days_row: &adw::SpinRow,
+    count_row: &adw::SpinRow,
+    state: &Rc<RefCell<voxkey_ipc::HistoryRetentionConfig>>,
+    updating: &Rc<Cell<bool>>,
+) {
+    let Ok(config) = serde_json::from_str::<voxkey_ipc::HistoryRetentionConfig>(config_json) else {
+        return;
+    };
+    let config = config.normalized();
+    updating.set(true);
+    let age_enabled = config.max_age_days != 0;
+    age_row.set_active(age_enabled);
+    age_days_row.set_sensitive(age_enabled);
+    if age_enabled {
+        age_days_row.set_value(f64::from(config.max_age_days));
+    }
+    count_row.set_value(f64::from(config.max_entries));
+    *state.borrow_mut() = config;
+    updating.set(false);
+}
+
+fn send_history_retention_config(
+    state: &Rc<RefCell<voxkey_ipc::HistoryRetentionConfig>>,
+    handle: &DaemonHandle,
+) {
+    if let Ok(config_json) = serde_json::to_string(&*state.borrow()) {
+        handle.send(DaemonCommand::SetHistoryRetentionConfig(config_json));
+    }
+}
+
+fn wire_history_retention_actions(
+    age_row: &adw::SwitchRow,
+    age_days_row: &adw::SpinRow,
+    count_row: &adw::SpinRow,
+    state: &Rc<RefCell<voxkey_ipc::HistoryRetentionConfig>>,
+    updating: &Rc<Cell<bool>>,
+    handle: &DaemonHandle,
+) {
+    {
+        let age_days_row = age_days_row.clone();
+        let state = state.clone();
+        let updating = updating.clone();
+        let handle = handle.clone();
+        age_row.connect_active_notify(move |row| {
+            if updating.get() {
+                return;
+            }
+            age_days_row.set_sensitive(row.is_active());
+            state.borrow_mut().max_age_days = if row.is_active() {
+                age_days_row.value().round() as u32
+            } else {
+                0
+            };
+            send_history_retention_config(&state, &handle);
+        });
+    }
+    {
+        let age_row = age_row.clone();
+        let state = state.clone();
+        let updating = updating.clone();
+        let handle = handle.clone();
+        age_days_row.connect_value_notify(move |row| {
+            if updating.get() || !age_row.is_active() {
+                return;
+            }
+            state.borrow_mut().max_age_days = row.value().round() as u32;
+            send_history_retention_config(&state, &handle);
+        });
+    }
+    {
+        let state = state.clone();
+        let updating = updating.clone();
+        let handle = handle.clone();
+        count_row.connect_value_notify(move |row| {
+            if updating.get() {
+                return;
+            }
+            state.borrow_mut().max_entries = row.value().round() as u32;
+            send_history_retention_config(&state, &handle);
+        });
+    }
+}
+
 fn add_spin_row_unit(row: &adw::SpinRow, unit: &str) {
     let label = gtk4::Label::new(Some(unit));
     label.add_css_class("dim-label");
@@ -3204,6 +3844,57 @@ fn shortcut_subtitle(description: &str, daemon_available: bool) -> String {
     } else {
         "Available after Voxkey starts".to_string()
     }
+}
+
+fn shortcut_mode_for_selection(selected: u32) -> voxkey_ipc::ShortcutMode {
+    if selected == 1 {
+        voxkey_ipc::ShortcutMode::PushToTalk
+    } else {
+        voxkey_ipc::ShortcutMode::Toggle
+    }
+}
+
+fn shortcut_mode_selection(mode: voxkey_ipc::ShortcutMode) -> u32 {
+    match mode {
+        voxkey_ipc::ShortcutMode::Toggle => 0,
+        voxkey_ipc::ShortcutMode::PushToTalk => 1,
+    }
+}
+
+fn apply_shortcut_mode_presentation(
+    mode: voxkey_ipc::ShortcutMode,
+    group: &adw::PreferencesGroup,
+    row: &adw::ComboRow,
+) {
+    match mode {
+        voxkey_ipc::ShortcutMode::Toggle => {
+            group.set_description(Some(
+                "Use one shortcut to start listening, then press it again when you finish",
+            ));
+            row.set_subtitle("Press once to start, then press again to finish");
+        }
+        voxkey_ipc::ShortcutMode::PushToTalk => {
+            group.set_description(Some(
+                "Hold the shortcut while speaking, then release it to finish",
+            ));
+            row.set_subtitle("Recording stops as soon as you release the shortcut");
+        }
+    }
+}
+
+fn apply_shortcut_mode_to_widgets(
+    wire_value: &str,
+    group: &adw::PreferencesGroup,
+    row: &adw::ComboRow,
+    updating: &Rc<Cell<bool>>,
+) {
+    let Some(mode) = voxkey_ipc::ShortcutMode::from_wire_value(wire_value) else {
+        return;
+    };
+    updating.set(true);
+    row.set_selected(shortcut_mode_selection(mode));
+    apply_shortcut_mode_presentation(mode, group, row);
+    updating.set(false);
 }
 
 fn readable_shortcut(description: &str) -> String {
@@ -4069,6 +4760,19 @@ fn apply_transcriber_config_to_widgets(
     );
 
     updating_widgets.set(false);
+}
+
+fn sync_preload_model_widget(config_json: &str, row: &adw::SwitchRow, updating: &Rc<Cell<bool>>) {
+    let Ok(config) = serde_json::from_str::<voxkey_ipc::TranscriberConfig>(config_json) else {
+        return;
+    };
+    updating.set(true);
+    row.set_active(config.parakeet.preload_model);
+    row.set_visible(
+        config.provider == voxkey_ipc::TranscriberProvider::Parakeet
+            && config.parakeet.backend == voxkey_ipc::ParakeetBackend::Local,
+    );
+    updating.set(false);
 }
 
 /// Build the current TranscriberConfig from shared state and send it to the daemon.
@@ -7001,6 +7705,45 @@ mod tests {
             shortcut_subtitle("", false),
             "Available after Voxkey starts"
         );
+    }
+
+    #[test]
+    fn shortcut_behavior_selection_round_trips() {
+        for mode in [
+            voxkey_ipc::ShortcutMode::Toggle,
+            voxkey_ipc::ShortcutMode::PushToTalk,
+        ] {
+            assert_eq!(
+                shortcut_mode_for_selection(shortcut_mode_selection(mode)),
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn microphone_quality_copy_gives_actionable_guidance() {
+        let quiet = microphone_signal_copy(voxkey_ipc::AudioSignalQuality::Quiet, false);
+        assert!(quiet.title.contains("quiet"));
+        assert!(quiet.subtitle.contains("Move closer"));
+        assert_eq!(quiet.style, Some("warning"));
+
+        let clipping = microphone_signal_copy(voxkey_ipc::AudioSignalQuality::Clipping, false);
+        assert!(clipping.title.contains("clipping"));
+        assert!(clipping.subtitle.contains("Lower"));
+        assert_eq!(clipping.style, Some("error"));
+
+        let good = microphone_signal_copy(voxkey_ipc::AudioSignalQuality::Good, false);
+        assert_eq!(good.style, Some("success"));
+    }
+
+    #[test]
+    fn live_microphone_feedback_is_limited_to_capture_states() {
+        assert!(microphone_signal_is_live(true, "Idle"));
+        assert!(microphone_signal_is_live(false, "Recording"));
+        assert!(microphone_signal_is_live(false, "Connecting"));
+        assert!(microphone_signal_is_live(false, "Streaming"));
+        assert!(!microphone_signal_is_live(false, "Idle"));
+        assert!(!microphone_signal_is_live(false, "Transcribing"));
     }
 
     #[test]

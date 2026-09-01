@@ -80,6 +80,7 @@ enum InjectionRecord {
         full_text: String,
         transcriber: Box<voxkey_ipc::TranscriberConfig>,
         outcome: voxkey_ipc::TranscriptOutcome,
+        metrics: voxkey_ipc::HistoryMetrics,
     },
     ExistingTranscript {
         history_id: u64,
@@ -132,12 +133,14 @@ impl Injector {
                         full_text,
                         transcriber,
                         outcome,
+                        metrics,
                     } => {
-                        let saved = shared.record_transcript(
+                        let saved = shared.record_transcript_with_metrics(
                             full_text.clone(),
                             &transcriber,
                             outcome,
                             pending_insertion,
+                            metrics,
                         );
                         if saved.is_ok() {
                             DaemonInterface::notify_transcription_complete(&connection, &full_text)
@@ -208,6 +211,7 @@ impl Injector {
         text: String,
         transcriber: voxkey_ipc::TranscriberConfig,
         outcome: voxkey_ipc::TranscriptOutcome,
+        metrics: voxkey_ipc::HistoryMetrics,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.tx
             .as_ref()
@@ -218,6 +222,7 @@ impl Injector {
                     full_text: text,
                     transcriber: Box::new(transcriber),
                     outcome,
+                    metrics,
                 },
             })
             .await?;

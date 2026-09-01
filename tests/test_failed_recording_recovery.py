@@ -71,6 +71,9 @@ args = [
 
 [preview]
 mode = "never"
+
+[audio]
+no_speech_guard = false
 '''
     )
     os.chmod(path, 0o600)

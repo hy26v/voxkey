@@ -90,7 +90,7 @@ fn known_dictionary_tab(tab: &str) -> Option<&str> {
 fn known_history_filter(filter: &str) -> Option<&str> {
     matches!(
         filter,
-        "all" | "completed" | "needs-attention" | "cancelled"
+        "all" | "pinned" | "completed" | "needs-attention" | "cancelled"
     )
     .then_some(filter)
 }
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn history_filter_accepts_only_visible_filter_choices() {
-        for filter in ["all", "completed", "needs-attention", "cancelled"] {
+        for filter in ["all", "pinned", "completed", "needs-attention", "cancelled"] {
             assert_eq!(known_history_filter(filter), Some(filter));
         }
         assert_eq!(known_history_filter("issues"), None);

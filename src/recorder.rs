@@ -3,9 +3,10 @@
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::audio_signal::{SignalMonitor, SignalSnapshot};
 use crate::config::AudioConfig;
 
 /// Preview audio buffered ahead of the consumer. Deep enough that a preview
@@ -346,19 +347,6 @@ fn publish_preview_samples(
     }
 }
 
-fn publish_audio_level(audio_level: &AtomicU32, data: &[i16]) {
-    let peak = data
-        .iter()
-        .map(|sample| u32::from(sample.unsigned_abs()))
-        .max()
-        .unwrap_or(0);
-    audio_level.store(peak, Ordering::Relaxed);
-}
-
-fn normalized_audio_level(audio_level: &AtomicU32) -> f64 {
-    f64::from(audio_level.load(Ordering::Relaxed)) / 32_768.0
-}
-
 /// Records audio from the default input device.
 #[derive(Clone)]
 pub struct Recorder {
@@ -448,8 +436,8 @@ impl Recorder {
 
         let recording = Arc::new(AtomicBool::new(true));
         let recording_clone = recording.clone();
-        let audio_level = Arc::new(AtomicU32::new(0));
-        let callback_audio_level = audio_level.clone();
+        let signal = SignalMonitor::default();
+        let callback_signal = signal.clone();
 
         let stream = device.build_input_stream(
             &desired_config,
@@ -457,7 +445,7 @@ impl Recorder {
                 if !recording_clone.load(Ordering::Relaxed) {
                     return;
                 }
-                publish_audio_level(&callback_audio_level, data);
+                callback_signal.observe(data);
                 publish_streaming_samples(&tx, &buffer_errors, data);
             },
             move |err| {
@@ -472,7 +460,7 @@ impl Recorder {
         Ok(StreamingRecordingHandle {
             stream: Some(stream),
             recording,
-            audio_level,
+            signal,
             rx: Some(rx),
             capture_error_rx: Some(capture_error_rx),
             _capture_error_tx: capture_error_tx,
@@ -539,8 +527,8 @@ impl Recorder {
 
         let recording = Arc::new(AtomicBool::new(true));
         let recording_clone = recording.clone();
-        let audio_level = Arc::new(AtomicU32::new(0));
-        let callback_audio_level = audio_level.clone();
+        let signal = SignalMonitor::default();
+        let callback_signal = signal.clone();
         let writer_clone = writer.clone();
         let (capture_error_tx, capture_error_rx) = tokio::sync::watch::channel(None);
         let sample_capture_errors = capture_error_tx.clone();
@@ -556,7 +544,7 @@ impl Recorder {
                 if !recording_clone.load(Ordering::Relaxed) {
                     return;
                 }
-                publish_audio_level(&callback_audio_level, data);
+                callback_signal.observe(data);
                 capture_samples(
                     &writer_clone,
                     &sample_capture_errors,
@@ -582,7 +570,7 @@ impl Recorder {
             stream: Some(stream),
             writer,
             recording,
-            audio_level,
+            signal,
             wav_path: Some(audio_file.keep()?),
             tail_capture: self.tail_capture,
             preview_rx,
@@ -634,7 +622,7 @@ fn normalize_input_device_names(mut names: Vec<String>) -> Vec<String> {
 pub struct StreamingRecordingHandle {
     stream: Option<cpal::Stream>,
     recording: Arc<AtomicBool>,
-    audio_level: Arc<AtomicU32>,
+    signal: SignalMonitor,
     rx: Option<tokio::sync::mpsc::Receiver<Vec<i16>>>,
     capture_error_rx: Option<tokio::sync::watch::Receiver<Option<String>>>,
     _capture_error_tx: tokio::sync::watch::Sender<Option<String>>,
@@ -642,9 +630,8 @@ pub struct StreamingRecordingHandle {
 }
 
 impl StreamingRecordingHandle {
-    /// Most recent peak sample amplitude normalized to the 0.0..=1.0 range.
-    pub fn audio_level(&self) -> f64 {
-        normalized_audio_level(&self.audio_level)
+    pub fn signal_snapshot(&self) -> SignalSnapshot {
+        self.signal.snapshot()
     }
 
     /// Take the audio chunk receiver. Can only be called once.
@@ -680,7 +667,7 @@ pub struct RecordingHandle {
     stream: Option<cpal::Stream>,
     writer: Arc<Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>>,
     recording: Arc<AtomicBool>,
-    audio_level: Arc<AtomicU32>,
+    signal: SignalMonitor,
     /// The captured audio, owned by this handle until `stop()` succeeds and
     /// hands it to the transcriber. While it is still here, dropping the
     /// handle deletes it.
@@ -696,9 +683,8 @@ pub struct RecordingHandle {
 }
 
 impl RecordingHandle {
-    /// Most recent peak sample amplitude normalized to the 0.0..=1.0 range.
-    pub fn audio_level(&self) -> f64 {
-        normalized_audio_level(&self.audio_level)
+    pub fn signal_snapshot(&self) -> SignalSnapshot {
+        self.signal.snapshot()
     }
 
     /// Take the auxiliary PCM stream used for replaceable transcription
@@ -725,14 +711,27 @@ impl RecordingHandle {
     /// Captures a short tail of audio before stopping to avoid cutting off the last words.
     #[cfg(test)]
     pub async fn stop(self) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-        self.stop_with_sample_count().await.map(|(path, _)| path)
+        self.stop_with_summary()
+            .await
+            .map(|recording| recording.path)
     }
 
     /// Finalize a recording and report only microphone samples, excluding the
     /// synthetic trailing silence appended for final transcription quality.
+    #[cfg(test)]
     pub async fn stop_with_sample_count(
-        mut self,
+        self,
     ) -> Result<(PathBuf, u64), Box<dyn std::error::Error + Send + Sync>> {
+        self.stop_with_summary()
+            .await
+            .map(|recording| (recording.path, recording.recorded_samples))
+    }
+
+    /// Finalize a recording and return the captured signal summary used by
+    /// transcription guards, diagnostics, and History metrics.
+    pub async fn stop_with_summary(
+        mut self,
+    ) -> Result<FinalizedRecording, Box<dyn std::error::Error + Send + Sync>> {
         // Keep capturing for the configured tail so trailing speech isn't cut off
         tokio::time::sleep(self.tail_capture).await;
 
@@ -764,6 +763,7 @@ impl RecordingHandle {
             }
         }
         let recorded_samples = self.recorded_samples.load(Ordering::Relaxed);
+        let signal = self.signal.snapshot();
 
         let dropped = self.dropped_preview_chunks.load(Ordering::Relaxed);
         if dropped > 0 {
@@ -777,7 +777,11 @@ impl RecordingHandle {
         // over this handle is still responsible for deleting it.
         let wav_path = self.wav_path.take().ok_or("recording has no audio file")?;
         tracing::info!("Recording stopped, saved to: {}", wav_path.display());
-        Ok((wav_path, recorded_samples))
+        Ok(FinalizedRecording {
+            path: wav_path,
+            recorded_samples,
+            signal,
+        })
     }
 
     /// Stop and delete an abandoned recording, waiting for owned system-audio
@@ -790,6 +794,13 @@ impl RecordingHandle {
         }
         // Drop retains ownership of scratch-file and writer cleanup.
     }
+}
+
+#[derive(Debug)]
+pub struct FinalizedRecording {
+    pub path: PathBuf,
+    pub recorded_samples: u64,
+    pub signal: SignalSnapshot,
 }
 
 impl Drop for RecordingHandle {
@@ -844,12 +855,12 @@ mod tests {
 
     #[test]
     fn microphone_peak_is_normalized_and_handles_i16_min() {
-        let level = AtomicU32::new(0);
-        publish_audio_level(&level, &[0, 8_192, -16_384]);
-        assert!((normalized_audio_level(&level) - 0.5).abs() < f64::EPSILON);
+        let signal = SignalMonitor::default();
+        signal.observe(&[0, 8_192, -16_384]);
+        assert!((signal.snapshot().latest_peak - 0.5).abs() < f64::EPSILON);
 
-        publish_audio_level(&level, &[i16::MIN]);
-        assert!((normalized_audio_level(&level) - 1.0).abs() < f64::EPSILON);
+        signal.observe(&[i16::MIN]);
+        assert!((signal.snapshot().latest_peak - 1.0).abs() < f64::EPSILON);
     }
 
     struct ToggleWriter {
@@ -891,7 +902,7 @@ mod tests {
             stream: None,
             writer: Arc::new(Mutex::new(Some(writer))),
             recording: Arc::new(AtomicBool::new(true)),
-            audio_level: Arc::new(AtomicU32::new(0)),
+            signal: SignalMonitor::default(),
             wav_path: Some(path.to_path_buf()),
             tail_capture: std::time::Duration::ZERO,
             preview_rx: None,
@@ -1036,6 +1047,7 @@ mod tests {
             max_recording_seconds: 600,
             input_device: String::new(),
             mute_output_while_recording: false,
+            behavior: crate::config::AudioBehaviorConfig::default(),
         };
         let recorder = Recorder::new(&config);
         assert_eq!(recorder.tail_capture, std::time::Duration::from_millis(175));
@@ -1050,6 +1062,7 @@ mod tests {
             max_recording_seconds: 600,
             input_device: String::new(),
             mute_output_while_recording: false,
+            behavior: crate::config::AudioBehaviorConfig::default(),
         };
 
         let recorder = Recorder::new(&config);

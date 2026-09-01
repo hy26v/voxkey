@@ -465,6 +465,42 @@ impl Transcriber {
         }
     }
 
+    /// Warm the selected in-process model cache. First use and warm-up share
+    /// the same `OnceCell`, so a dictation that starts during warm-up awaits
+    /// that work instead of initializing a second recognizer.
+    pub async fn preload_local_model(&self) -> Result<bool, DynError> {
+        match self {
+            Self::Parakeet {
+                model_name,
+                execution_provider,
+                sample_rate,
+                recognizer,
+                model_verification,
+                hotwords,
+            } => {
+                ensure_parakeet_model_available_cached(
+                    model_verification.clone(),
+                    model_name.clone(),
+                )
+                .await?;
+                initialize_parakeet_recognizer(
+                    recognizer.clone(),
+                    model_name.clone(),
+                    *execution_provider,
+                    *sample_rate,
+                    hotwords.clone(),
+                )
+                .await?;
+                Ok(true)
+            }
+            Self::LocalStreaming(model) => {
+                model.recognizer().await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub fn from_config(
         config: &TranscriberConfig,
         sample_rate: u32,
@@ -2756,6 +2792,7 @@ mod tests {
                 api_key: String::new(),
                 allow_insecure_http: false,
                 execution_provider: voxkey_ipc::ExecutionProviderChoice::Cpu,
+                preload_model: false,
             },
         };
         let t = Transcriber::from_config(&config, 16000, &[]);
@@ -2804,6 +2841,7 @@ mod tests {
                 api_key: "server-token".to_string(),
                 allow_insecure_http: true,
                 execution_provider: voxkey_ipc::ExecutionProviderChoice::Cuda,
+                preload_model: false,
             },
             ..Default::default()
         };
@@ -2842,6 +2880,7 @@ mod tests {
                 api_key: String::new(),
                 allow_insecure_http: false,
                 execution_provider: voxkey_ipc::ExecutionProviderChoice::Cpu,
+                preload_model: false,
             },
             ..Default::default()
         };

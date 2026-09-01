@@ -27,6 +27,9 @@ def daemon_config(isolated_voxkey_home):
         f'''[injection]
 typing_delay_ms = 50
 
+[audio]
+no_speech_guard = false
+
 [transcriber]
 provider = "whisper-cpp"
 

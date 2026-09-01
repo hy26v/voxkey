@@ -21,6 +21,7 @@ const KEYRING_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 // Endpoint checks include DNS, TLS, and a bounded network probe. Keep their
 // D-Bus method timeout above the daemon's own eight-second probe deadline.
 const ENDPOINT_CHECK_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+const MICROPHONE_TEST_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const ENDPOINT_CHECK_CONCURRENCY: usize = 2;
 const UPDATE_QUEUE_CAPACITY: usize = 256;
 const COMMAND_QUEUE_CAPACITY: usize = 32;
@@ -113,10 +114,15 @@ pub struct DaemonSnapshot {
     pub state: String,
     pub shortcut_trigger: String,
     pub shortcut_description: String,
+    pub shortcut_mode: String,
     pub transcriber_config: String,
     pub injection_config: String,
     pub preview_config: String,
     pub dictionary_config: String,
+    pub audio_behavior_config: String,
+    pub history_retention_config: String,
+    pub audio_signal: String,
+    pub audio_level: f64,
     pub transcription_history: String,
     pub audio_input_devices: String,
     pub audio_input_device: String,
@@ -183,12 +189,19 @@ struct CommandRequest {
     completion: tokio::sync::oneshot::Sender<Result<CommandResponse, String>>,
 }
 
-type CommandResponse = Option<voxkey_ipc::EndpointCheckResult>;
+#[derive(Debug)]
+enum CommandValue {
+    EndpointCheck(voxkey_ipc::EndpointCheckResult),
+    MicrophoneTest(voxkey_ipc::MicrophoneTestResult),
+}
+
+type CommandResponse = Option<CommandValue>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeferredCommandLane {
     Endpoint,
     Keyring,
+    Microphone,
 }
 
 impl DeferredCommandLane {
@@ -198,6 +211,7 @@ impl DeferredCommandLane {
             // Reads and writes share one FIFO lane so a status query can never
             // overtake a key the user just saved or removed.
             Self::Keyring => 1,
+            Self::Microphone => 1,
         }
     }
 }
@@ -210,6 +224,8 @@ struct DeferredCommandScheduler {
     endpoint_waiting: VecDeque<CommandRequest>,
     keyring_active: usize,
     keyring_waiting: VecDeque<CommandRequest>,
+    microphone_active: usize,
+    microphone_waiting: VecDeque<CommandRequest>,
 }
 
 impl DeferredCommandScheduler {
@@ -222,6 +238,9 @@ impl DeferredCommandScheduler {
                 (&mut self.endpoint_active, &mut self.endpoint_waiting)
             }
             DeferredCommandLane::Keyring => (&mut self.keyring_active, &mut self.keyring_waiting),
+            DeferredCommandLane::Microphone => {
+                (&mut self.microphone_active, &mut self.microphone_waiting)
+            }
         }
     }
 
@@ -437,10 +456,31 @@ impl CommandCompletion {
     }
 
     pub async fn wait_endpoint_check(self) -> Result<voxkey_ipc::EndpointCheckResult, String> {
-        self.receiver
+        match self
+            .receiver
             .await
             .unwrap_or_else(|_| Err("Voxkey command channel closed before replying".to_string()))?
-            .ok_or_else(|| "Voxkey returned no endpoint-check result".to_string())
+        {
+            Some(CommandValue::EndpointCheck(result)) => Ok(result),
+            Some(CommandValue::MicrophoneTest(_)) => {
+                Err("Voxkey returned a microphone result for an endpoint check".to_string())
+            }
+            None => Err("Voxkey returned no endpoint-check result".to_string()),
+        }
+    }
+
+    pub async fn wait_microphone_test(self) -> Result<voxkey_ipc::MicrophoneTestResult, String> {
+        match self
+            .receiver
+            .await
+            .unwrap_or_else(|_| Err("Voxkey command channel closed before replying".to_string()))?
+        {
+            Some(CommandValue::MicrophoneTest(result)) => Ok(result),
+            Some(CommandValue::EndpointCheck(_)) => {
+                Err("Voxkey returned an endpoint result for a microphone test".to_string())
+            }
+            None => Err("Voxkey returned no microphone-test result".to_string()),
+        }
     }
 }
 
@@ -465,6 +505,7 @@ enum ConnectionOutcome {
 pub enum DaemonCommand {
     CancelDictation,
     SetShortcut(String),
+    SetShortcutMode(String),
     SetTranscriberConfig(String),
     /// Persist a transcriber config after its endpoint passed a connectivity
     /// check. Failures are presented inline by the endpoint editor.
@@ -474,9 +515,20 @@ pub enum DaemonCommand {
     SetInjectionConfig(String),
     SetPreviewConfig(String),
     SetDictionaryConfig(String),
+    SetAudioBehaviorConfig(String),
+    SetHistoryRetentionConfig(String),
     SetAudioInputDevice(String),
     RefreshAudioInputDevices,
+    TestMicrophone(u32),
     DeleteHistoryEntry(u64),
+    SetHistoryEntryPinned {
+        id: u64,
+        pinned: bool,
+    },
+    UpdateHistoryEntryText {
+        id: u64,
+        text: String,
+    },
     ClearHistory,
     RetryHistoryEntry(u64),
     OpenRecordingFolder(String),
@@ -511,15 +563,21 @@ impl DaemonCommand {
         match self {
             Self::CancelDictation => "Cancel dictation",
             Self::SetShortcut(_) => "Update shortcut",
+            Self::SetShortcutMode(_) => "Update shortcut behavior",
             Self::SetTranscriberConfig(_) => "Update transcription settings",
             Self::SaveCheckedEndpoint(_) => "Save server address",
             Self::CheckEndpoint(_) => "Check server",
             Self::SetInjectionConfig(_) => "Update typing settings",
             Self::SetPreviewConfig(_) => "Update live preview settings",
             Self::SetDictionaryConfig(_) => "Update dictionary",
+            Self::SetAudioBehaviorConfig(_) => "Update audio behavior",
+            Self::SetHistoryRetentionConfig(_) => "Update History cleanup",
             Self::SetAudioInputDevice(_) => "Select microphone",
             Self::RefreshAudioInputDevices => "Refresh microphones",
+            Self::TestMicrophone(_) => "Test microphone",
             Self::DeleteHistoryEntry(_) => "Delete history entry",
+            Self::SetHistoryEntryPinned { .. } => "Update History pin",
+            Self::UpdateHistoryEntryText { .. } => "Edit transcription",
             Self::ClearHistory => "Clear history",
             Self::RetryHistoryEntry(_) => "Retry transcription",
             Self::OpenRecordingFolder(_) => "Open recording folder",
@@ -540,12 +598,15 @@ impl DaemonCommand {
     fn rollback_property(&self) -> Option<&'static str> {
         match self {
             Self::SetShortcut(_) => Some("shortcut_trigger"),
+            Self::SetShortcutMode(_) => Some("shortcut_mode"),
             Self::SetTranscriberConfig(_) | Self::SaveCheckedEndpoint(_) => {
                 Some("transcriber_config")
             }
             Self::SetInjectionConfig(_) => Some("injection_config"),
             Self::SetPreviewConfig(_) => Some("preview_config"),
             Self::SetDictionaryConfig(_) => Some("dictionary_config"),
+            Self::SetAudioBehaviorConfig(_) => Some("audio_behavior_config"),
+            Self::SetHistoryRetentionConfig(_) => Some("history_retention_config"),
             Self::SetAudioInputDevice(_) => Some("audio_input_device"),
             _ => None,
         }
@@ -554,13 +615,18 @@ impl DaemonCommand {
     fn reports_failure_inline(&self) -> bool {
         matches!(
             self,
-            Self::SetShortcut(_) | Self::CheckEndpoint(_) | Self::SaveCheckedEndpoint(_)
+            Self::SetShortcut(_)
+                | Self::CheckEndpoint(_)
+                | Self::SaveCheckedEndpoint(_)
+                | Self::TestMicrophone(_)
+                | Self::UpdateHistoryEntryText { .. }
         )
     }
 
     fn deferred_lane(&self) -> Option<DeferredCommandLane> {
         match self {
             Self::CheckEndpoint(_) => Some(DeferredCommandLane::Endpoint),
+            Self::TestMicrophone(_) => Some(DeferredCommandLane::Microphone),
             Self::SetApiKey { .. } | Self::ClearApiKey { .. } | Self::HasApiKey { .. } => {
                 Some(DeferredCommandLane::Keyring)
             }
@@ -583,15 +649,34 @@ impl std::fmt::Debug for DaemonCommand {
         match self {
             Self::CancelDictation => write!(f, "CancelDictation"),
             Self::SetShortcut(s) => f.debug_tuple("SetShortcut").field(s).finish(),
+            Self::SetShortcutMode(s) => f.debug_tuple("SetShortcutMode").field(s).finish(),
             Self::SetTranscriberConfig(_) => f.write_str("SetTranscriberConfig(<redacted>)"),
             Self::SaveCheckedEndpoint(_) => f.write_str("SaveCheckedEndpoint(<redacted>)"),
             Self::CheckEndpoint(_) => f.write_str("CheckEndpoint(<redacted>)"),
             Self::SetInjectionConfig(s) => f.debug_tuple("SetInjectionConfig").field(s).finish(),
             Self::SetPreviewConfig(s) => f.debug_tuple("SetPreviewConfig").field(s).finish(),
             Self::SetDictionaryConfig(s) => f.debug_tuple("SetDictionaryConfig").field(s).finish(),
+            Self::SetAudioBehaviorConfig(s) => {
+                f.debug_tuple("SetAudioBehaviorConfig").field(s).finish()
+            }
+            Self::SetHistoryRetentionConfig(s) => {
+                f.debug_tuple("SetHistoryRetentionConfig").field(s).finish()
+            }
             Self::SetAudioInputDevice(s) => f.debug_tuple("SetAudioInputDevice").field(s).finish(),
             Self::RefreshAudioInputDevices => write!(f, "RefreshAudioInputDevices"),
+            Self::TestMicrophone(duration) => {
+                f.debug_tuple("TestMicrophone").field(duration).finish()
+            }
             Self::DeleteHistoryEntry(id) => f.debug_tuple("DeleteHistoryEntry").field(id).finish(),
+            Self::SetHistoryEntryPinned { id, pinned } => f
+                .debug_struct("SetHistoryEntryPinned")
+                .field("id", id)
+                .field("pinned", pinned)
+                .finish(),
+            Self::UpdateHistoryEntryText { id, .. } => f
+                .debug_struct("UpdateHistoryEntryText")
+                .field("id", id)
+                .finish_non_exhaustive(),
             Self::ClearHistory => write!(f, "ClearHistory"),
             Self::RetryHistoryEntry(id) => f.debug_tuple("RetryHistoryEntry").field(id).finish(),
             Self::OpenRecordingFolder(_) => write!(f, "OpenRecordingFolder(<path>)"),
@@ -1007,10 +1092,15 @@ async fn try_connect(
         .shortcut_description()
         .await
         .unwrap_or_else(|_| shortcut_trigger.clone());
+    let shortcut_mode = proxy.shortcut_mode().await?;
     let transcriber_config = proxy.transcriber_config().await?;
     let injection_config = proxy.injection_config().await?;
     let preview_config = proxy.preview_config().await?;
     let dictionary_config = proxy.dictionary_config().await?;
+    let audio_behavior_config = proxy.audio_behavior_config().await?;
+    let history_retention_config = proxy.history_retention_config().await?;
+    let audio_signal = proxy.audio_signal().await?;
+    let audio_level = proxy.audio_level().await?;
     // Keep optional display-only properties tolerant for third-party clients
     // and forward compatibility. The protocol handshake above has already
     // replaced an older packaged daemon before authoritative state is read.
@@ -1033,10 +1123,15 @@ async fn try_connect(
         state,
         shortcut_trigger,
         shortcut_description,
+        shortcut_mode,
         transcriber_config,
         injection_config,
         preview_config,
         dictionary_config,
+        audio_behavior_config,
+        history_retention_config,
+        audio_signal,
+        audio_level,
         transcription_history,
         audio_input_devices,
         audio_input_device,
@@ -1053,11 +1148,16 @@ async fn try_connect(
     let mut portal_stream = proxy.receive_portal_connected_changed().await;
     let mut shortcut_stream = proxy.receive_shortcut_trigger_changed().await;
     let mut shortcut_description_stream = proxy.receive_shortcut_description_changed().await;
+    let mut shortcut_mode_stream = proxy.receive_shortcut_mode_changed().await;
     let mut transcriber_stream = proxy.receive_transcriber_config_changed().await;
     let mut error_stream = proxy.receive_last_error_changed().await;
     let mut injection_stream = proxy.receive_injection_config_changed().await;
     let mut preview_stream = proxy.receive_preview_config_changed().await;
     let mut dictionary_stream = proxy.receive_dictionary_config_changed().await;
+    let mut audio_behavior_stream = proxy.receive_audio_behavior_config_changed().await;
+    let mut history_retention_stream = proxy.receive_history_retention_config_changed().await;
+    let mut audio_signal_stream = proxy.receive_audio_signal_changed().await;
+    let mut audio_level_stream = proxy.receive_audio_level_changed().await;
     let mut history_stream = proxy.receive_transcription_history_changed().await;
     let mut audio_input_stream = proxy.receive_audio_input_device_changed().await;
     let mut sample_rate_stream = proxy.receive_sample_rate_changed().await;
@@ -1112,6 +1212,14 @@ async fn try_connect(
                     });
                 }
             }
+            Some(change) = shortcut_mode_stream.next() => {
+                if let Ok(val) = change.get().await {
+                    let _ = update_tx.try_send(DaemonUpdate::PropertyChanged {
+                        name: "shortcut_mode".to_string(),
+                        value: val,
+                    });
+                }
+            }
             Some(change) = transcriber_stream.next() => {
                 if let Ok(val) = change.get().await {
                     let _ = update_tx.try_send(DaemonUpdate::PropertyChanged {
@@ -1149,6 +1257,38 @@ async fn try_connect(
                     let _ = update_tx.try_send(DaemonUpdate::PropertyChanged {
                         name: "dictionary_config".to_string(),
                         value: val,
+                    });
+                }
+            }
+            Some(change) = audio_behavior_stream.next() => {
+                if let Ok(val) = change.get().await {
+                    let _ = update_tx.try_send(DaemonUpdate::PropertyChanged {
+                        name: "audio_behavior_config".to_string(),
+                        value: val,
+                    });
+                }
+            }
+            Some(change) = history_retention_stream.next() => {
+                if let Ok(val) = change.get().await {
+                    let _ = update_tx.try_send(DaemonUpdate::PropertyChanged {
+                        name: "history_retention_config".to_string(),
+                        value: val,
+                    });
+                }
+            }
+            Some(change) = audio_signal_stream.next() => {
+                if let Ok(val) = change.get().await {
+                    let _ = update_tx.try_send(DaemonUpdate::PropertyChanged {
+                        name: "audio_signal".to_string(),
+                        value: val,
+                    });
+                }
+            }
+            Some(change) = audio_level_stream.next() => {
+                if let Ok(val) = change.get().await {
+                    let _ = update_tx.try_send(DaemonUpdate::PropertyChanged {
+                        name: "audio_level".to_string(),
+                        value: val.to_string(),
                     });
                 }
             }
@@ -1357,10 +1497,13 @@ async fn publish_authoritative_property(
 ) {
     let value = match property {
         "shortcut_trigger" => proxy.shortcut_trigger().await,
+        "shortcut_mode" => proxy.shortcut_mode().await,
         "transcriber_config" => proxy.transcriber_config().await,
         "injection_config" => proxy.injection_config().await,
         "preview_config" => proxy.preview_config().await,
         "dictionary_config" => proxy.dictionary_config().await,
+        "audio_behavior_config" => proxy.audio_behavior_config().await,
+        "history_retention_config" => proxy.history_retention_config().await,
         "audio_input_device" => proxy.audio_input_device().await,
         _ => return,
     };
@@ -1405,7 +1548,14 @@ async fn handle_deferred_command(
             let check_proxy = DaemonProxy::new(&connection).await?;
             let result_json = check_proxy.check_transcriber_endpoint(&config_json).await?;
             let result = serde_json::from_str::<voxkey_ipc::EndpointCheckResult>(&result_json)?;
-            Ok((Some(result), None))
+            Ok((Some(CommandValue::EndpointCheck(result)), None))
+        }
+        DaemonCommand::TestMicrophone(duration_ms) => {
+            let connection = microphone_test_connection().await?;
+            let test_proxy = DaemonProxy::new(&connection).await?;
+            let result_json = test_proxy.test_microphone(duration_ms).await?;
+            let result = serde_json::from_str::<voxkey_ipc::MicrophoneTestResult>(&result_json)?;
+            Ok((Some(CommandValue::MicrophoneTest(result)), None))
         }
         DaemonCommand::SetApiKey { service, key } => {
             let connection = keyring_connection().await?;
@@ -1482,6 +1632,9 @@ async fn handle_command(
         DaemonCommand::SetShortcut(trigger) => {
             proxy.set_shortcut(&trigger).await?;
         }
+        DaemonCommand::SetShortcutMode(mode) => {
+            proxy.set_shortcut_mode(&mode).await?;
+        }
         DaemonCommand::SetTranscriberConfig(config_json) => {
             proxy.set_transcriber_config(&config_json).await?;
         }
@@ -1500,6 +1653,12 @@ async fn handle_command(
         DaemonCommand::SetDictionaryConfig(config_json) => {
             proxy.set_dictionary_config(&config_json).await?;
         }
+        DaemonCommand::SetAudioBehaviorConfig(config_json) => {
+            proxy.set_audio_behavior_config(&config_json).await?;
+        }
+        DaemonCommand::SetHistoryRetentionConfig(config_json) => {
+            proxy.set_history_retention_config(&config_json).await?;
+        }
         DaemonCommand::SetAudioInputDevice(device_name) => {
             proxy.set_audio_input_device(&device_name).await?;
         }
@@ -1511,8 +1670,17 @@ async fn handle_command(
                 selected_device,
             });
         }
+        DaemonCommand::TestMicrophone(_) => {
+            unreachable!("microphone tests must use their deferred command lane")
+        }
         DaemonCommand::DeleteHistoryEntry(id) => {
             proxy.delete_history_entry(id).await?;
+        }
+        DaemonCommand::SetHistoryEntryPinned { id, pinned } => {
+            proxy.set_history_entry_pinned(id, pinned).await?;
+        }
+        DaemonCommand::UpdateHistoryEntryText { id, text } => {
+            proxy.update_history_entry_text(id, &text).await?;
         }
         DaemonCommand::ClearHistory => {
             proxy.clear_transcription_history().await?;
@@ -1607,6 +1775,19 @@ async fn endpoint_check_connection() -> Result<zbus::Connection, Box<dyn std::er
         })??)
 }
 
+async fn microphone_test_connection() -> Result<zbus::Connection, Box<dyn std::error::Error>> {
+    let builder =
+        zbus::connection::Builder::session()?.method_timeout(MICROPHONE_TEST_CALL_TIMEOUT);
+    Ok(tokio::time::timeout(DAEMON_CALL_TIMEOUT, builder.build())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Session bus connection for microphone test timed out",
+            )
+        })??)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1655,9 +1836,36 @@ mod tests {
         let completion = handle.send(DaemonCommand::CheckEndpoint("{}".to_string()));
         let request = cmd_rx.recv().await.expect("command must be queued");
         let expected = voxkey_ipc::EndpointCheckResult::reachable("Server responded in 12 ms.");
-        request.completion.send(Ok(Some(expected.clone()))).unwrap();
+        request
+            .completion
+            .send(Ok(Some(CommandValue::EndpointCheck(expected.clone()))))
+            .unwrap();
 
         assert_eq!(completion.wait_endpoint_check().await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn microphone_test_completion_returns_signal_metrics() {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(1);
+        let (lifecycle_tx, _lifecycle_rx) = tokio::sync::mpsc::channel(1);
+        let handle = DaemonHandle {
+            cmd_tx,
+            lifecycle_tx,
+        };
+        let completion = handle.send(DaemonCommand::TestMicrophone(4_000));
+        let request = cmd_rx.recv().await.expect("command must be queued");
+        let expected = voxkey_ipc::MicrophoneTestResult {
+            quality: voxkey_ipc::AudioSignalQuality::Good,
+            peak: 0.5,
+            average_rms: 0.1,
+            duration_ms: 4_000,
+            device_name: "USB microphone".to_string(),
+        };
+        request
+            .completion
+            .send(Ok(Some(CommandValue::MicrophoneTest(expected.clone()))))
+            .unwrap();
+        assert_eq!(completion.wait_microphone_test().await.unwrap(), expected);
     }
 
     #[test]
@@ -1665,6 +1873,10 @@ mod tests {
         assert_eq!(
             DaemonCommand::CheckEndpoint("{}".to_string()).deferred_lane(),
             Some(DeferredCommandLane::Endpoint)
+        );
+        assert_eq!(
+            DaemonCommand::TestMicrophone(4_000).deferred_lane(),
+            Some(DeferredCommandLane::Microphone)
         );
         for command in [
             DaemonCommand::SetApiKey {

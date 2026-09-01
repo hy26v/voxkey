@@ -14,6 +14,8 @@ use crate::state::State;
 
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MODEL_DOWNLOAD_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+const MIN_MICROPHONE_TEST_MS: u32 = 1_000;
+const MAX_MICROPHONE_TEST_MS: u32 = 10_000;
 
 /// User actions accepted by the daemon's serialized session event loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +100,7 @@ struct SharedStateInner {
     session_generation: u64,
     shortcut_description: String,
     audio_level: f64,
+    audio_signal: voxkey_ipc::AudioSignalQuality,
     live_transcript: String,
     live_transcript_generation: u64,
     last_transcript: String,
@@ -134,7 +137,12 @@ impl ActiveModelDownload {
 
 impl SharedState {
     pub fn new(config: Config) -> Self {
-        let transcription_history = crate::history::load();
+        let mut transcription_history = crate::history::load();
+        if let Err(error) =
+            crate::history::enforce_retention(&mut transcription_history, &config.history)
+        {
+            tracing::warn!("Could not apply History retention at startup: {error}");
+        }
         let latest_transcript = transcription_history
             .iter()
             .find(|entry| !entry.text.is_empty());
@@ -151,6 +159,7 @@ impl SharedState {
                 session_generation: 0,
                 shortcut_description: String::new(),
                 audio_level: 0.0,
+                audio_signal: voxkey_ipc::AudioSignalQuality::Silent,
                 live_transcript: String::new(),
                 live_transcript_generation: 0,
                 last_transcript,
@@ -242,6 +251,7 @@ impl SharedState {
         if !connected {
             inner.shortcut_description.clear();
             inner.audio_level = 0.0;
+            inner.audio_signal = voxkey_ipc::AudioSignalQuality::Silent;
         }
     }
 
@@ -262,6 +272,15 @@ impl SharedState {
             return false;
         }
         inner.audio_level = level;
+        true
+    }
+
+    pub fn set_audio_signal(&self, signal: voxkey_ipc::AudioSignalQuality) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.audio_signal == signal {
+            return false;
+        }
+        inner.audio_signal = signal;
         true
     }
 
@@ -297,28 +316,58 @@ impl SharedState {
         outcome: voxkey_ipc::TranscriptOutcome,
         pending_insertion: Option<String>,
     ) -> std::io::Result<u64> {
+        self.record_transcript_with_metrics(
+            text,
+            completed_with,
+            outcome,
+            pending_insertion,
+            voxkey_ipc::HistoryMetrics::default(),
+        )
+    }
+
+    pub fn record_transcript_with_metrics(
+        &self,
+        text: String,
+        completed_with: &voxkey_ipc::TranscriberConfig,
+        outcome: voxkey_ipc::TranscriptOutcome,
+        pending_insertion: Option<String>,
+        metrics: voxkey_ipc::HistoryMetrics,
+    ) -> std::io::Result<u64> {
         self.record_transcript_with(
             text,
             completed_with,
             outcome,
             pending_insertion,
-            crate::history::append,
+            move |entries, text, config, outcome, pending, retention| {
+                crate::history::append_with_policy(
+                    entries, text, config, outcome, pending, metrics, retention,
+                )
+            },
         )
     }
 
-    pub fn record_failed_transcription(
+    pub fn record_failed_transcription_with_metrics(
         &self,
         audio_path: &std::path::Path,
         completed_with: &voxkey_ipc::TranscriberConfig,
         error: String,
+        metrics: voxkey_ipc::HistoryMetrics,
     ) -> Result<u64, crate::history::PreserveFailedRecordingError> {
         let _serial = self.persistence_lock.lock().unwrap();
-        let mut history = self.inner.lock().unwrap().transcription_history.clone();
-        let id = crate::history::append_failed_recording(
+        let (mut history, retention) = {
+            let inner = self.inner.lock().unwrap();
+            (
+                inner.transcription_history.clone(),
+                inner.config.history.clone(),
+            )
+        };
+        let id = crate::history::append_failed_recording_with_policy(
             &mut history,
             audio_path,
             completed_with,
             error,
+            metrics,
+            &retention,
         )?;
         self.inner.lock().unwrap().transcription_history = history;
         Ok(id)
@@ -339,16 +388,24 @@ impl SharedState {
             &voxkey_ipc::TranscriberConfig,
             voxkey_ipc::TranscriptOutcome,
             Option<String>,
+            &voxkey_ipc::HistoryRetentionConfig,
         ) -> std::io::Result<u64>,
     {
         let _serial = self.persistence_lock.lock().unwrap();
-        let mut history = self.inner.lock().unwrap().transcription_history.clone();
+        let (mut history, retention) = {
+            let inner = self.inner.lock().unwrap();
+            (
+                inner.transcription_history.clone(),
+                inner.config.history.clone(),
+            )
+        };
         let id = append(
             &mut history,
             text.clone(),
             completed_with,
             outcome,
             pending_insertion,
+            &retention,
         )?;
         let mut inner = self.inner.lock().unwrap();
         inner.transcription_history = history;
@@ -394,10 +451,6 @@ impl SharedState {
 
     pub fn config(&self) -> Config {
         self.inner.lock().unwrap().config.clone()
-    }
-
-    pub fn update_config(&self, config: Config) {
-        self.inner.lock().unwrap().config = config;
     }
 
     fn update_config_with<F, P, E>(&self, update: F, persist: P) -> Result<Config, E>
@@ -454,7 +507,24 @@ impl SharedState {
     /// Apply a reloaded config and request a session restart so the recorder,
     /// transcriber, and injector are rebuilt from the new values.
     fn apply_reloaded_config(&self, config: Config) {
-        self.update_config(config);
+        let _serial = self.persistence_lock.lock().unwrap();
+        let mut history = self.inner.lock().unwrap().transcription_history.clone();
+        if let Err(error) = crate::history::enforce_retention(&mut history, &config.history) {
+            tracing::warn!("Could not apply reloaded History retention: {error}");
+        }
+        let latest = history
+            .iter()
+            .find(|entry| !entry.text.is_empty())
+            .map(|entry| (entry.id, entry.text.clone()));
+        let mut inner = self.inner.lock().unwrap();
+        inner.config = config;
+        inner.transcription_history = history;
+        inner.last_transcript = latest
+            .as_ref()
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default();
+        inner.last_transcript_entry_id = latest.map(|(id, _)| id);
+        drop(inner);
         self.request_session_restart();
     }
 
@@ -468,6 +538,10 @@ impl SharedState {
 
     fn audio_level(&self) -> f64 {
         self.inner.lock().unwrap().audio_level
+    }
+
+    fn audio_signal(&self) -> voxkey_ipc::AudioSignalQuality {
+        self.inner.lock().unwrap().audio_signal
     }
 
     pub fn last_transcript(&self) -> String {
@@ -514,6 +588,88 @@ impl SharedState {
         crate::history::recording_path(&self.inner.lock().unwrap().transcription_history, id)
     }
 
+    pub fn history_metrics(&self, id: u64) -> voxkey_ipc::HistoryMetrics {
+        self.inner
+            .lock()
+            .unwrap()
+            .transcription_history
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| voxkey_ipc::HistoryMetrics {
+                audio_duration_ms: entry.audio_duration_ms,
+                processing_duration_ms: entry.processing_duration_ms,
+            })
+            .unwrap_or_default()
+    }
+
+    fn set_history_entry_pinned(&self, id: u64, pinned: bool) -> std::io::Result<bool> {
+        let _serial = self.persistence_lock.lock().unwrap();
+        let (mut history, retention) = {
+            let inner = self.inner.lock().unwrap();
+            (
+                inner.transcription_history.clone(),
+                inner.config.history.clone(),
+            )
+        };
+        let changed = crate::history::set_pinned(&mut history, id, pinned, &retention)?;
+        if changed {
+            self.inner.lock().unwrap().transcription_history = history;
+        }
+        Ok(changed)
+    }
+
+    fn update_history_entry_text(&self, id: u64, text: &str) -> Result<bool, String> {
+        let _serial = self.persistence_lock.lock().unwrap();
+        let mut history = self.inner.lock().unwrap().transcription_history.clone();
+        let changed = crate::history::update_text(&mut history, id, text)?;
+        if changed {
+            let latest = history
+                .iter()
+                .find(|entry| !entry.text.is_empty())
+                .map(|entry| (entry.id, entry.text.clone()));
+            let mut inner = self.inner.lock().unwrap();
+            inner.transcription_history = history;
+            inner.last_transcript = latest
+                .as_ref()
+                .map(|(_, text)| text.clone())
+                .unwrap_or_default();
+            inner.last_transcript_entry_id = latest.map(|(id, _)| id);
+        }
+        Ok(changed)
+    }
+
+    fn update_history_retention(
+        &self,
+        retention: voxkey_ipc::HistoryRetentionConfig,
+    ) -> Result<usize, String> {
+        let retention = retention.normalized();
+        let _serial = self.persistence_lock.lock().unwrap();
+        let previous = self.inner.lock().unwrap().config.clone();
+        let mut config = previous.clone();
+        config.history = retention.clone();
+        Config::save_delta(&previous, &config)
+            .map_err(|error| format!("Failed to save config: {error}"))?;
+
+        let mut history = self.inner.lock().unwrap().transcription_history.clone();
+        let removed = crate::history::enforce_retention(&mut history, &retention)
+            .map_err(|error| format!("Failed to clean up History: {error}"));
+        let mut inner = self.inner.lock().unwrap();
+        inner.config = config;
+        if removed.is_ok() {
+            let latest = history
+                .iter()
+                .find(|entry| !entry.text.is_empty())
+                .map(|entry| (entry.id, entry.text.clone()));
+            inner.transcription_history = history;
+            inner.last_transcript = latest
+                .as_ref()
+                .map(|(_, text)| text.clone())
+                .unwrap_or_default();
+            inner.last_transcript_entry_id = latest.map(|(id, _)| id);
+        }
+        removed
+    }
+
     fn delete_history_entry(&self, id: u64) -> std::io::Result<bool> {
         self.delete_history_entry_with(id, crate::history::delete)
     }
@@ -552,10 +708,17 @@ impl SharedState {
         let _serial = self.persistence_lock.lock().unwrap();
         let mut history = self.inner.lock().unwrap().transcription_history.clone();
         clear(&mut history)?;
+        let latest = history
+            .iter()
+            .find(|entry| !entry.text.is_empty())
+            .map(|entry| (entry.id, entry.text.clone()));
         let mut inner = self.inner.lock().unwrap();
         inner.transcription_history = history;
-        inner.last_transcript.clear();
-        inner.last_transcript_entry_id = None;
+        inner.last_transcript = latest
+            .as_ref()
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default();
+        inner.last_transcript_entry_id = latest.map(|(id, _)| id);
         Ok(())
     }
 
@@ -1016,6 +1179,21 @@ impl DaemonInterface {
             .audio_level_changed(iface_ref.signal_emitter())
             .await;
     }
+
+    pub async fn notify_audio_signal(connection: &zbus::Connection) {
+        let Ok(iface_ref) = connection
+            .object_server()
+            .interface::<_, DaemonInterface>(voxkey_ipc::OBJECT_PATH)
+            .await
+        else {
+            return;
+        };
+        let _ = iface_ref
+            .get()
+            .await
+            .audio_signal_changed(iface_ref.signal_emitter())
+            .await;
+    }
 }
 
 /// Attach daemon lifetime to the GTK application's well-known D-Bus name.
@@ -1177,10 +1355,35 @@ impl DaemonInterface {
         self.shared.shortcut_description()
     }
 
+    #[zbus(property)]
+    fn shortcut_mode(&self) -> String {
+        self.shared
+            .config()
+            .shortcut
+            .mode
+            .as_wire_value()
+            .to_string()
+    }
+
     /// Current normalized microphone level, from 0.0 (silence) to 1.0.
     #[zbus(property)]
     fn audio_level(&self) -> f64 {
         self.shared.audio_level()
+    }
+
+    #[zbus(property)]
+    fn audio_signal(&self) -> String {
+        self.shared.audio_signal().as_wire_value().to_string()
+    }
+
+    #[zbus(property)]
+    fn audio_behavior_config(&self) -> String {
+        serde_json::to_string(&self.shared.config().audio.behavior).unwrap_or_default()
+    }
+
+    #[zbus(property)]
+    fn history_retention_config(&self) -> String {
+        serde_json::to_string(&self.shared.config().history).unwrap_or_default()
     }
 
     #[zbus(property)]
@@ -1342,6 +1545,39 @@ impl DaemonInterface {
 
         self.shared.request_session_restart();
 
+        Ok(())
+    }
+
+    async fn set_shortcut_mode(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        mode: &str,
+    ) -> zbus::fdo::Result<()> {
+        let mode = voxkey_ipc::ShortcutMode::from_wire_value(mode).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs(
+                "Shortcut mode must be 'toggle' or 'push-to-talk'".to_string(),
+            )
+        })?;
+        let _change = self.reserve_idle_configuration_change()?;
+        if self.shared.config().shortcut.mode == mode {
+            return Ok(());
+        }
+        self.shared
+            .update_config_with(|config| config.shortcut.mode = mode, Config::save_delta)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Failed to save config: {e}")))?;
+
+        if let Ok(iface_ref) = connection
+            .object_server()
+            .interface::<_, DaemonInterface>(voxkey_ipc::OBJECT_PATH)
+            .await
+        {
+            let _ = iface_ref
+                .get()
+                .await
+                .shortcut_mode_changed(iface_ref.signal_emitter())
+                .await;
+        }
+        self.shared.request_session_restart();
         Ok(())
     }
 
@@ -1528,6 +1764,75 @@ impl DaemonInterface {
         Ok(())
     }
 
+    async fn set_audio_behavior_config(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        config_json: &str,
+    ) -> zbus::fdo::Result<()> {
+        let behavior: voxkey_ipc::AudioBehaviorConfig =
+            serde_json::from_str(config_json).map_err(|error| {
+                zbus::fdo::Error::InvalidArgs(format!(
+                    "Invalid audio behavior config JSON: {error}"
+                ))
+            })?;
+        let behavior = behavior.normalized();
+        let _change = self.reserve_idle_configuration_change()?;
+        self.shared
+            .update_config_with(
+                move |config| config.audio.behavior = behavior,
+                Config::save_delta,
+            )
+            .map_err(|error| zbus::fdo::Error::Failed(format!("Failed to save config: {error}")))?;
+
+        if let Ok(iface_ref) = connection
+            .object_server()
+            .interface::<_, DaemonInterface>(voxkey_ipc::OBJECT_PATH)
+            .await
+        {
+            let _ = iface_ref
+                .get()
+                .await
+                .audio_behavior_config_changed(iface_ref.signal_emitter())
+                .await;
+        }
+
+        self.shared.request_session_restart();
+        Ok(())
+    }
+
+    async fn set_history_retention_config(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        config_json: &str,
+    ) -> zbus::fdo::Result<()> {
+        let retention: voxkey_ipc::HistoryRetentionConfig = serde_json::from_str(config_json)
+            .map_err(|error| {
+                zbus::fdo::Error::InvalidArgs(format!(
+                    "Invalid History retention config JSON: {error}"
+                ))
+            })?;
+        let removed = self
+            .shared
+            .update_history_retention(retention)
+            .map_err(zbus::fdo::Error::Failed)?;
+
+        if let Ok(iface_ref) = connection
+            .object_server()
+            .interface::<_, DaemonInterface>(voxkey_ipc::OBJECT_PATH)
+            .await
+        {
+            let _ = iface_ref
+                .get()
+                .await
+                .history_retention_config_changed(iface_ref.signal_emitter())
+                .await;
+        }
+        if removed != 0 {
+            Self::notify_last_transcript(connection).await;
+        }
+        Ok(())
+    }
+
     async fn set_audio_input_device(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
@@ -1565,6 +1870,113 @@ impl DaemonInterface {
         Ok(())
     }
 
+    async fn test_microphone(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        duration_ms: u32,
+    ) -> zbus::fdo::Result<String> {
+        if !(MIN_MICROPHONE_TEST_MS..=MAX_MICROPHONE_TEST_MS).contains(&duration_ms) {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "Microphone test duration must be between {MIN_MICROPHONE_TEST_MS} and {MAX_MICROPHONE_TEST_MS} milliseconds"
+            )));
+        }
+        let _change = self.reserve_idle_configuration_change()?;
+        let mut audio = self.shared.config().audio;
+        audio.tail_capture_ms = 0;
+        audio.mute_output_while_recording = false;
+        // Leave one callback interval of headroom so the recorder's hard
+        // duration cap cannot race the diagnostic timer at the same boundary.
+        audio.max_recording_seconds = duration_ms.div_ceil(1_000).saturating_add(1);
+        let device_name = if audio.input_device.is_empty() {
+            "System default".to_string()
+        } else {
+            audio.input_device.clone()
+        };
+        let sample_rate = audio.sample_rate;
+        let channels = audio.channels;
+
+        struct ResetSignal(SharedState);
+        impl Drop for ResetSignal {
+            fn drop(&mut self) {
+                self.0.set_audio_level(0.0);
+                self.0
+                    .set_audio_signal(voxkey_ipc::AudioSignalQuality::Silent);
+            }
+        }
+        let _reset = ResetSignal(self.shared.clone());
+        let recorder = crate::recorder::Recorder::new(&audio);
+        let mut handle = recorder
+            .start(crate::recorder::PreviewCapture::Disabled)
+            .await
+            .map_err(|error| {
+                zbus::fdo::Error::Failed(format!("Could not start the microphone test: {error}"))
+            })?;
+        let mut capture_errors = handle.take_capture_error_rx().ok_or_else(|| {
+            zbus::fdo::Error::Failed("Could not monitor the microphone test capture".to_string())
+        })?;
+        let mut interval = tokio::time::interval(Duration::from_millis(50));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let finish = tokio::time::sleep(Duration::from_millis(u64::from(duration_ms)));
+        tokio::pin!(finish);
+        loop {
+            tokio::select! {
+                _ = &mut finish => break,
+                changed = capture_errors.changed() => {
+                    let error = match changed {
+                        Ok(()) => capture_errors.borrow().clone(),
+                        Err(_) => Some("the audio capture monitor stopped unexpectedly".to_string()),
+                    };
+                    if let Some(error) = error {
+                        return Err(zbus::fdo::Error::Failed(format!(
+                            "Microphone test capture failed: {error}"
+                        )));
+                    }
+                }
+                _ = interval.tick() => {
+                    let signal = handle.signal_snapshot();
+                    if self.shared.set_audio_level(signal.latest_peak) {
+                        Self::notify_audio_level(connection).await;
+                    }
+                    let quality = signal.quality(sample_rate, channels);
+                    if self.shared.set_audio_signal(quality) {
+                        Self::notify_audio_signal(connection).await;
+                    }
+                }
+            }
+        }
+
+        let recording = handle.stop_with_summary().await.map_err(|error| {
+            zbus::fdo::Error::Failed(format!("Microphone test failed: {error}"))
+        })?;
+        let signal = recording.signal;
+        if let Err(error) = std::fs::remove_file(&recording.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(zbus::fdo::Error::Failed(format!(
+                "Microphone test finished, but its temporary recording could not be removed: {error}"
+            )));
+        }
+        let result = voxkey_ipc::MicrophoneTestResult {
+            quality: signal.quality(sample_rate, channels),
+            peak: signal.max_peak,
+            average_rms: signal.average_rms,
+            duration_ms,
+            device_name,
+        };
+        if self.shared.set_audio_level(0.0) {
+            Self::notify_audio_level(connection).await;
+        }
+        if self
+            .shared
+            .set_audio_signal(voxkey_ipc::AudioSignalQuality::Silent)
+        {
+            Self::notify_audio_signal(connection).await;
+        }
+        serde_json::to_string(&result).map_err(|error| {
+            zbus::fdo::Error::Failed(format!("Could not encode microphone test result: {error}"))
+        })
+    }
+
     async fn delete_history_entry(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
@@ -1575,6 +1987,46 @@ impl DaemonInterface {
         })? {
             Self::notify_last_transcript(connection).await;
         }
+        Ok(())
+    }
+
+    async fn set_history_entry_pinned(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        id: u64,
+        pinned: bool,
+    ) -> zbus::fdo::Result<()> {
+        let found = self
+            .shared
+            .set_history_entry_pinned(id, pinned)
+            .map_err(|error| {
+                zbus::fdo::Error::Failed(format!("Failed to update History pin: {error}"))
+            })?;
+        if !found {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "The History entry no longer exists".to_string(),
+            ));
+        }
+        Self::notify_last_transcript(connection).await;
+        Ok(())
+    }
+
+    async fn update_history_entry_text(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        id: u64,
+        text: &str,
+    ) -> zbus::fdo::Result<()> {
+        let found = self
+            .shared
+            .update_history_entry_text(id, text)
+            .map_err(zbus::fdo::Error::InvalidArgs)?;
+        if !found {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "The History entry no longer exists".to_string(),
+            ));
+        }
+        Self::notify_last_transcript(connection).await;
         Ok(())
     }
 
@@ -1613,10 +2065,15 @@ impl DaemonInterface {
             let iface = iface_ref.get().await;
             let emitter = iface_ref.signal_emitter();
             let _ = iface.shortcut_trigger_changed(emitter).await;
+            let _ = iface.shortcut_mode_changed(emitter).await;
             let _ = iface.transcriber_config_changed(emitter).await;
             let _ = iface.injection_config_changed(emitter).await;
             let _ = iface.dictionary_config_changed(emitter).await;
             let _ = iface.preview_config_changed(emitter).await;
+            let _ = iface.audio_behavior_config_changed(emitter).await;
+            let _ = iface.history_retention_config_changed(emitter).await;
+            let _ = iface.transcription_history_changed(emitter).await;
+            let _ = iface.last_transcript_changed(emitter).await;
             let _ = iface.sample_rate_changed(emitter).await;
             let _ = iface.channels_changed(emitter).await;
             let _ = iface.audio_input_device_changed(emitter).await;
@@ -2095,7 +2552,7 @@ mod tests {
                 &voxkey_ipc::TranscriberConfig::default(),
                 voxkey_ipc::TranscriptOutcome::Completed,
                 None,
-                |entries, text, config, outcome, pending| {
+                |entries, text, config, outcome, pending, _retention| {
                     entered_tx.send(()).unwrap();
                     let (open, wake) = &*writer_gate;
                     let mut open = open.lock().unwrap();
@@ -2113,6 +2570,7 @@ mod tests {
                             pending_insertion: pending,
                             audio_path: None,
                             error: None,
+                            ..Default::default()
                         },
                     );
                     Ok(7)
@@ -2529,6 +2987,7 @@ mod tests {
                     pending_insertion: None,
                     audio_path: None,
                     error: None,
+                    ..Default::default()
                 },
                 voxkey_ipc::HistoryEntry {
                     id: 1,
@@ -2539,6 +2998,7 @@ mod tests {
                     pending_insertion: None,
                     audio_path: None,
                     error: None,
+                    ..Default::default()
                 },
             ];
             inner.last_transcript = "newest".to_string();
@@ -2571,7 +3031,7 @@ mod tests {
                 &completed_with,
                 voxkey_ipc::TranscriptOutcome::Completed,
                 None,
-                |_, _, recorded_config, _, _| {
+                |_, _, recorded_config, _, _, _retention| {
                     assert_eq!(recorded_config.provider, completed_with.provider);
                     Ok(1)
                 },

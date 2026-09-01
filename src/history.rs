@@ -5,9 +5,13 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use voxkey_ipc::{HistoryEntry, TranscriberConfig, TranscriberProvider, TranscriptOutcome};
+use voxkey_ipc::{
+    HistoryEntry, HistoryMetrics, HistoryRetentionConfig, TranscriberConfig, TranscriberProvider,
+    TranscriptOutcome,
+};
 
-const MAX_HISTORY_ENTRIES: usize = 500;
+const MILLIS_PER_DAY: i64 = 86_400_000;
+const MAX_HISTORY_TEXT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub struct PreserveFailedRecordingError {
@@ -44,44 +48,61 @@ pub fn load() -> Vec<HistoryEntry> {
     load_from(&history_path())
 }
 
-pub fn append(
+pub fn append_with_policy(
     entries: &mut Vec<HistoryEntry>,
     text: String,
     config: &TranscriberConfig,
     outcome: TranscriptOutcome,
     pending_insertion: Option<String>,
+    metrics: HistoryMetrics,
+    retention: &HistoryRetentionConfig,
 ) -> std::io::Result<u64> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
+    let now_ms = now.as_millis().min(i64::MAX as u128) as i64;
     let timestamp_id = now.as_nanos().min(u64::MAX as u128) as u64;
     let entry = HistoryEntry {
         id: next_entry_id(entries, timestamp_id),
-        recorded_at_unix_ms: now.as_millis().min(i64::MAX as u128) as i64,
+        recorded_at_unix_ms: now_ms,
         text,
         provider: provider_label(config),
         outcome,
         pending_insertion,
         audio_path: None,
         error: None,
+        pinned: false,
+        edited_at_unix_ms: None,
+        audio_duration_ms: metrics.audio_duration_ms,
+        processing_duration_ms: metrics.processing_duration_ms,
     };
 
     let id = entry.id;
     let mut updated = entries.clone();
-    let removed = push_entry(&mut updated, entry);
+    let removed = push_entry(&mut updated, entry, retention, now_ms);
     persist(&updated)?;
     *entries = updated;
     remove_managed_recordings(&removed, &history_path());
     Ok(id)
 }
 
-pub fn append_failed_recording(
+pub fn append_failed_recording_with_policy(
     entries: &mut Vec<HistoryEntry>,
     source_audio: &Path,
     config: &TranscriberConfig,
     error: String,
+    metrics: HistoryMetrics,
+    retention: &HistoryRetentionConfig,
 ) -> Result<u64, PreserveFailedRecordingError> {
-    append_failed_recording_to(entries, source_audio, config, error, &history_path())
+    append_failed_recording_to(
+        entries,
+        source_audio,
+        config,
+        error,
+        metrics,
+        retention,
+        &history_path(),
+    )
 }
 
 fn append_failed_recording_to(
@@ -89,12 +110,15 @@ fn append_failed_recording_to(
     source_audio: &Path,
     config: &TranscriberConfig,
     error: String,
+    metrics: HistoryMetrics,
+    retention: &HistoryRetentionConfig,
     history_path: &Path,
 ) -> Result<u64, PreserveFailedRecordingError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let timestamp_id = now.as_nanos().min(u64::MAX as u128) as u64;
+    let now_ms = now.as_millis().min(i64::MAX as u128) as i64;
     let id = next_recording_id(entries, timestamp_id, history_path);
     let saved_audio = managed_recording_path(history_path, id);
 
@@ -107,16 +131,20 @@ fn append_failed_recording_to(
 
     let entry = HistoryEntry {
         id,
-        recorded_at_unix_ms: now.as_millis().min(i64::MAX as u128) as i64,
+        recorded_at_unix_ms: now_ms,
         text: String::new(),
         provider: provider_label(config),
         outcome: TranscriptOutcome::Failed,
         pending_insertion: None,
         audio_path: Some(saved_audio.to_string_lossy().into_owned()),
         error: Some(error),
+        pinned: false,
+        edited_at_unix_ms: None,
+        audio_duration_ms: metrics.audio_duration_ms,
+        processing_duration_ms: metrics.processing_duration_ms,
     };
     let mut updated = entries.clone();
-    let removed = push_entry(&mut updated, entry);
+    let removed = push_entry(&mut updated, entry, retention, now_ms);
     if let Err(error) = persist_to(history_path, &updated) {
         return Err(PreserveFailedRecordingError {
             error,
@@ -144,9 +172,137 @@ fn next_recording_id(entries: &[HistoryEntry], timestamp_id: u64, history_path: 
     candidate
 }
 
-fn push_entry(entries: &mut Vec<HistoryEntry>, entry: HistoryEntry) -> Vec<HistoryEntry> {
+fn push_entry(
+    entries: &mut Vec<HistoryEntry>,
+    entry: HistoryEntry,
+    retention: &HistoryRetentionConfig,
+    now_ms: i64,
+) -> Vec<HistoryEntry> {
     entries.insert(0, entry);
-    entries.split_off(entries.len().min(MAX_HISTORY_ENTRIES))
+    prune_entries_at(entries, retention, now_ms)
+}
+
+fn prune_entries_at(
+    entries: &mut Vec<HistoryEntry>,
+    retention: &HistoryRetentionConfig,
+    now_ms: i64,
+) -> Vec<HistoryEntry> {
+    let retention = retention.clone().normalized();
+    let cutoff = (retention.max_age_days != 0).then(|| {
+        now_ms.saturating_sub(i64::from(retention.max_age_days).saturating_mul(MILLIS_PER_DAY))
+    });
+    let max_entries = retention.max_entries as usize;
+    let mut kept = Vec::with_capacity(entries.len());
+    let mut removed = Vec::new();
+    let mut unpinned_kept = 0_usize;
+
+    for entry in std::mem::take(entries) {
+        let expired = cutoff.is_some_and(|cutoff| entry.recorded_at_unix_ms < cutoff);
+        if entry.pinned {
+            kept.push(entry);
+        } else if expired || unpinned_kept >= max_entries {
+            removed.push(entry);
+        } else {
+            unpinned_kept += 1;
+            kept.push(entry);
+        }
+    }
+    *entries = kept;
+    removed
+}
+
+/// Apply retention immediately and delete any managed failed recordings whose
+/// entries were removed. Pinned entries are always preserved.
+pub fn enforce_retention(
+    entries: &mut Vec<HistoryEntry>,
+    retention: &HistoryRetentionConfig,
+) -> std::io::Result<usize> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    let mut updated = entries.clone();
+    let removed = prune_entries_at(&mut updated, retention, now_ms);
+    if removed.is_empty() {
+        return Ok(0);
+    }
+    persist(&updated)?;
+    *entries = updated;
+    remove_managed_recordings(&removed, &history_path());
+    Ok(removed.len())
+}
+
+pub fn set_pinned(
+    entries: &mut Vec<HistoryEntry>,
+    id: u64,
+    pinned: bool,
+    retention: &HistoryRetentionConfig,
+) -> std::io::Result<bool> {
+    let mut updated = entries.clone();
+    let Some(entry) = updated.iter_mut().find(|entry| entry.id == id) else {
+        return Ok(false);
+    };
+    if entry.pinned == pinned {
+        return Ok(true);
+    }
+    entry.pinned = pinned;
+    let removed = if pinned {
+        Vec::new()
+    } else {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        prune_entries_at(&mut updated, retention, now_ms)
+    };
+    persist(&updated)?;
+    *entries = updated;
+    remove_managed_recordings(&removed, &history_path());
+    Ok(true)
+}
+
+pub fn update_text(entries: &mut Vec<HistoryEntry>, id: u64, text: &str) -> Result<bool, String> {
+    let edited_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    update_text_at_with(entries, id, text, edited_at_unix_ms, persist)
+}
+
+fn update_text_at_with<F>(
+    entries: &mut Vec<HistoryEntry>,
+    id: u64,
+    text: &str,
+    edited_at_unix_ms: i64,
+    persist: F,
+) -> Result<bool, String>
+where
+    F: FnOnce(&[HistoryEntry]) -> std::io::Result<()>,
+{
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("A saved transcription cannot be empty".to_string());
+    }
+    if text.len() > MAX_HISTORY_TEXT_BYTES {
+        return Err(format!(
+            "A saved transcription cannot exceed {MAX_HISTORY_TEXT_BYTES} bytes"
+        ));
+    }
+    let mut updated = entries.clone();
+    let Some(entry) = updated.iter_mut().find(|entry| entry.id == id) else {
+        return Ok(false);
+    };
+    entry.text = text.to_string();
+    entry.edited_at_unix_ms = Some(edited_at_unix_ms);
+    // A correction becomes the authoritative content for the next explicit
+    // insertion, replacing any stale suffix from the original text.
+    entry.pending_insertion = None;
+    persist(&updated).map_err(|error| error.to_string())?;
+    *entries = updated;
+    Ok(true)
 }
 
 pub fn set_pending_insertion(
@@ -193,7 +349,11 @@ fn remove_entry(entries: &mut Vec<HistoryEntry>, id: u64) -> bool {
 }
 
 pub fn clear(entries: &mut Vec<HistoryEntry>) -> std::io::Result<()> {
-    let removed = entries.clone();
+    let removed = entries
+        .iter()
+        .filter(|entry| !entry.pinned)
+        .cloned()
+        .collect::<Vec<_>>();
     clear_with(entries, persist)?;
     remove_managed_recordings(&removed, &history_path());
     Ok(())
@@ -203,8 +363,13 @@ fn clear_with<F>(entries: &mut Vec<HistoryEntry>, persist: F) -> std::io::Result
 where
     F: FnOnce(&[HistoryEntry]) -> std::io::Result<()>,
 {
-    persist(&[])?;
-    entries.clear();
+    let kept = entries
+        .iter()
+        .filter(|entry| entry.pinned)
+        .cloned()
+        .collect::<Vec<_>>();
+    persist(&kept)?;
+    *entries = kept;
     Ok(())
 }
 
@@ -362,7 +527,6 @@ fn load_from(path: &Path) -> Vec<HistoryEntry> {
         return Vec::new();
     };
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.recorded_at_unix_ms));
-    entries.truncate(MAX_HISTORY_ENTRIES);
     repair_duplicate_ids(&mut entries);
     entries
 }
@@ -482,6 +646,7 @@ mod tests {
             pending_insertion: None,
             audio_path: None,
             error: None,
+            ..Default::default()
         }
     }
 
@@ -520,6 +685,8 @@ mod tests {
             &source,
             &TranscriberConfig::default(),
             "provider rejected the request".to_string(),
+            HistoryMetrics::default(),
+            &HistoryRetentionConfig::default(),
             &history_path,
         )
         .unwrap();
@@ -564,6 +731,8 @@ mod tests {
             &source,
             &TranscriberConfig::default(),
             "provider failure".to_string(),
+            HistoryMetrics::default(),
+            &HistoryRetentionConfig::default(),
             &history_path,
         )
         .unwrap_err();
@@ -830,13 +999,83 @@ mod tests {
 
     #[test]
     fn new_entries_are_first_and_history_is_bounded() {
-        let mut entries = (0..MAX_HISTORY_ENTRIES as u64)
+        let retention = HistoryRetentionConfig::default();
+        let limit = retention.max_entries as usize;
+        let mut entries = (0..limit as u64)
             .map(|id| entry(id, id as i64))
             .collect::<Vec<_>>();
-        let removed = push_entry(&mut entries, entry(9999, 9999));
-        assert_eq!(entries.len(), MAX_HISTORY_ENTRIES);
+        let removed = push_entry(&mut entries, entry(9999, 9999), &retention, 9999);
+        assert_eq!(entries.len(), limit);
         assert_eq!(entries[0].id, 9999);
         assert_eq!(removed.len(), 1);
+    }
+
+    #[test]
+    fn retention_preserves_pins_while_applying_age_and_count_limits() {
+        let now = 100 * MILLIS_PER_DAY;
+        let mut pinned_old = entry(1, now - 90 * MILLIS_PER_DAY);
+        pinned_old.pinned = true;
+        let mut entries = (0..27)
+            .map(|offset| entry(100 - offset, now - offset as i64 * MILLIS_PER_DAY))
+            .collect::<Vec<_>>();
+        entries.push(pinned_old);
+        entries.push(entry(5, now - 60 * MILLIS_PER_DAY));
+        let removed = prune_entries_at(
+            &mut entries,
+            &HistoryRetentionConfig {
+                max_entries: HistoryRetentionConfig::MIN_ENTRIES,
+                max_age_days: 30,
+            },
+            now,
+        );
+
+        assert_eq!(
+            entries.len(),
+            HistoryRetentionConfig::MIN_ENTRIES as usize + 1
+        );
+        assert_eq!(entries.first().map(|entry| entry.id), Some(100));
+        assert_eq!(
+            entries[HistoryRetentionConfig::MIN_ENTRIES as usize - 1].id,
+            76
+        );
+        assert!(entries.iter().any(|entry| entry.id == 1 && entry.pinned));
+        assert_eq!(removed.len(), 3);
+        assert!(removed.iter().any(|entry| entry.id == 75));
+        assert!(removed.iter().any(|entry| entry.id == 74));
+        assert!(removed.iter().any(|entry| entry.id == 5));
+    }
+
+    #[test]
+    fn bulk_clear_keeps_pinned_entries() {
+        let mut pinned = entry(2, 200);
+        pinned.pinned = true;
+        let mut entries = vec![entry(3, 300), pinned.clone(), entry(1, 100)];
+        let mut persisted = Vec::new();
+
+        clear_with(&mut entries, |updated| {
+            persisted = updated.to_vec();
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(entries, vec![pinned.clone()]);
+        assert_eq!(persisted, vec![pinned]);
+    }
+
+    #[test]
+    fn correcting_text_replaces_stale_insertion_content() {
+        let mut original = entry(7, 100);
+        original.pending_insertion = Some("old suffix".to_string());
+        let mut entries = vec![original];
+
+        assert!(
+            update_text_at_with(&mut entries, 7, "  corrected text  ", 900, |_| Ok(())).unwrap()
+        );
+        assert_eq!(entries[0].text, "corrected text");
+        assert_eq!(entries[0].edited_at_unix_ms, Some(900));
+        assert_eq!(entries[0].pending_insertion, None);
+        assert_eq!(entries[0].text_for_insertion(), Some("corrected text"));
+        assert!(update_text_at_with(&mut entries, 7, "  ", 901, |_| Ok(())).is_err());
     }
 
     #[test]
