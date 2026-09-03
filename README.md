@@ -33,8 +33,15 @@ replacement, or the GNOME IBus input path.
     large download safely, checks storage before transferring it, and uses the
     streaming models to show text while you speak without sending audio away.
   - [whisper.cpp](https://github.com/ggerganov/whisper.cpp) - local, offline
-  - [Mistral](https://docs.mistral.ai/) - cloud batch API
+  - [OpenAI](https://platform.openai.com/docs/api-reference/audio/createTranscription),
+    [Groq](https://console.groq.com/docs/speech-to-text),
+    [Mistral](https://docs.mistral.ai/),
+    [Deepgram](https://developers.deepgram.com/docs/pre-recorded-audio),
+    [AssemblyAI](https://www.assemblyai.com/docs/api-reference/transcripts), and
+    [ElevenLabs Scribe](https://elevenlabs.io/docs/api-reference/speech-to-text) - each on its live cloud protocol
   - [Mistral Realtime](https://docs.mistral.ai/) - cloud streaming via WebSocket (text appears as you speak)
+  - **OpenAI-compatible servers** - Speaches, LocalAI, whisper.cpp's compatible
+    route, and any other `POST /v1/audio/transcriptions` service
 - **Adaptive GNOME settings app** with dedicated History, Transcription, Audio
   Input, Dictionary, Permissions, and General sections
 - **Local dictation history** with search, copy, individual deletion, and clear-all;
@@ -171,26 +178,47 @@ Configuration lives at `~/.config/voxkey/config.toml`. All fields are optional -
 trigger = "<Super><Alt>d"
 
 [transcriber]
-provider = "parakeet"  # or "whisper-cpp", "mistral", "mistral-realtime"
+provider = "parakeet"  # or "whisper-cpp", "openai", "groq", "mistral",
+                       # "mistral-realtime", "deepgram", "assemblyai",
+                       # "elevenlabs", "openai-compatible"
 
 [transcriber.parakeet]
 model = "nemotron-3.5-asr-streaming-0.6b"
-backend = "local"  # "http" uses an OpenAI-compatible transcription server
-endpoint = "https://speech.example.com/v1/audio/transcriptions"
-# allow_insecure_http = true  # private IPs only; audio, transcripts, and keys are unencrypted
-# execution_provider = "cuda"  # local backend only: "auto", "cpu", or "cuda"
+# execution_provider = "cuda"  # "auto", "cpu", or "cuda"
+# preload_model = false
 
 [transcriber.whisper_cpp]
 command = "whisper-cpp"
 args = ["-m", "/path/to/model.bin", "{audio_file}"]
 
+[transcriber.openai]
+# model = "whisper-1"
+# endpoint = ""  # empty uses OpenAI's transcriptions API
+
+[transcriber.groq]
+# model = "whisper-large-v3-turbo"
+
 [transcriber.mistral]
-# model = "voxtral-mini-2602"       # optional, shown as default
-# endpoint = ""  # optional Mistral-compatible override; empty uses the Mistral API
+# model = "voxtral-mini-2602"
+# endpoint = ""  # empty uses the Mistral API
 
 [transcriber.mistral_realtime]
 # model = "voxtral-mini-transcribe-realtime-2602"
 # endpoint = ""
+
+[transcriber.deepgram]
+# model = "nova-3"
+
+[transcriber.assemblyai]
+# model = "universal-3-5-pro"
+
+[transcriber.elevenlabs]
+# model = "scribe_v2"
+
+[transcriber.openai_compatible]
+# endpoint = "https://speech.example.com/v1/audio/transcriptions"
+# model = "whisper-1"
+# allow_insecure_http = true  # private IPs only; audio, transcripts, and keys are unencrypted
 
 [audio]
 sample_rate = 16000
@@ -218,12 +246,12 @@ They are stored in the desktop keyring, not in `config.toml`. Existing
 plaintext keys are supported only for migration; Voxkey makes the
 configuration private before reading them.
 
-When you add or change a Mistral Batch, Mistral Realtime, or transcription-server
-endpoint in Settings, Voxkey checks that exact address before saving it. The
+When you add or change a cloud or transcription-server endpoint in Settings,
+Voxkey checks that exact address before saving it. The
 check sends no recording or API key. If the server cannot be reached, the
 address stays in the field so you can correct it or try again.
 
-Voxkey blocks unencrypted model-server HTTP outside this computer by default. If a
+Voxkey blocks unencrypted transcription-server HTTP outside this computer by default. If a
 trusted server on your private network does not support HTTPS, turn on **Allow
 unencrypted LAN audio** beside its endpoint, then run **Check & Save**. This
 permission accepts only literal private IPv4 addresses (such as `192.168.x.x`)

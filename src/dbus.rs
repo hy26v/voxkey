@@ -1306,14 +1306,28 @@ fn validate_audio_format(sample_rate: u32, channels: u16) -> zbus::fdo::Result<(
 }
 
 fn validate_api_key_service(service: &str) -> zbus::fdo::Result<()> {
-    match service {
-        voxkey_ipc::API_KEY_SERVICE_MISTRAL
-        | voxkey_ipc::API_KEY_SERVICE_MISTRAL_REALTIME
-        | voxkey_ipc::API_KEY_SERVICE_MODEL_SERVER => Ok(()),
-        _ => Err(zbus::fdo::Error::InvalidArgs(format!(
+    if voxkey_ipc::cloud::is_api_key_service(service) {
+        Ok(())
+    } else {
+        Err(zbus::fdo::Error::InvalidArgs(format!(
             "Unknown API key service: {service}"
-        ))),
+        )))
     }
+}
+
+fn clear_plaintext_api_key(config: &mut Config, service: &str) -> bool {
+    let Some(key) = config.transcriber.plaintext_api_key_mut(service) else {
+        return false;
+    };
+    let changed = !key.is_empty();
+    key.clear();
+    changed
+}
+
+fn public_transcriber_config_json(config: &voxkey_ipc::TranscriberConfig) -> String {
+    let mut public = config.clone();
+    public.clear_all_plaintext_api_keys();
+    serde_json::to_string(&public).unwrap_or_default()
 }
 
 fn validate_api_key_value(key: &str) -> zbus::fdo::Result<&str> {
@@ -1324,28 +1338,6 @@ fn validate_api_key_value(key: &str) -> zbus::fdo::Result<&str> {
         ));
     }
     Ok(key)
-}
-
-fn clear_plaintext_api_key(config: &mut Config, service: &str) -> bool {
-    let key = match service {
-        voxkey_ipc::API_KEY_SERVICE_MISTRAL => &mut config.transcriber.mistral.api_key,
-        voxkey_ipc::API_KEY_SERVICE_MISTRAL_REALTIME => {
-            &mut config.transcriber.mistral_realtime.api_key
-        }
-        voxkey_ipc::API_KEY_SERVICE_MODEL_SERVER => &mut config.transcriber.parakeet.api_key,
-        _ => return false,
-    };
-    let changed = !key.is_empty();
-    key.clear();
-    changed
-}
-
-fn public_transcriber_config_json(config: &voxkey_ipc::TranscriberConfig) -> String {
-    let mut public = config.clone();
-    public.mistral.api_key.clear();
-    public.mistral_realtime.api_key.clear();
-    public.parakeet.api_key.clear();
-    serde_json::to_string(&public).unwrap_or_default()
 }
 
 #[zbus::interface(name = "io.github.hy26v.Voxkey.Daemon1")]
@@ -1606,6 +1598,7 @@ impl DaemonInterface {
                 zbus::fdo::Error::InvalidArgs(format!("Invalid transcriber config JSON: {e}"))
             })?;
         crate::config::normalize_transcriber_config(&mut transcriber_config);
+        transcriber_config.migrate_nested_http_server();
         let _change = self.reserve_idle_configuration_change()?;
         self.shared
             .update_transcriber_config_with(transcriber_config, Config::save_delta)
@@ -1636,6 +1629,7 @@ impl DaemonInterface {
                 ))
             })?;
         crate::config::normalize_transcriber_config(&mut candidate);
+        candidate.migrate_nested_http_server();
         let result = crate::endpoint_check::check(&candidate).await;
         serde_json::to_string(&result).map_err(|error| {
             zbus::fdo::Error::Failed(format!("Could not encode endpoint-check result: {error}"))
@@ -3137,9 +3131,13 @@ mod tests {
 
     #[test]
     fn api_key_methods_reject_unknown_services() {
-        assert!(validate_api_key_service(voxkey_ipc::API_KEY_SERVICE_MISTRAL).is_ok());
-        assert!(validate_api_key_service(voxkey_ipc::API_KEY_SERVICE_MISTRAL_REALTIME).is_ok());
-        assert!(validate_api_key_service(voxkey_ipc::API_KEY_SERVICE_MODEL_SERVER).is_ok());
+        for cloud in voxkey_ipc::cloud::CLOUD_PROVIDERS {
+            assert!(
+                validate_api_key_service(cloud.keyring_service).is_ok(),
+                "{}",
+                cloud.id
+            );
+        }
         assert!(validate_api_key_service("unrelated-secret").is_err());
     }
 
@@ -3148,10 +3146,12 @@ mod tests {
         let batch_secret = "sk-batch-never-publish";
         let realtime_secret = "sk-realtime-never-publish";
         let server_secret = "sk-server-never-publish";
+        let openai_secret = "sk-openai-never-publish";
         let mut config = Config::default();
         config.transcriber.mistral.api_key = batch_secret.to_string();
         config.transcriber.mistral_realtime.api_key = realtime_secret.to_string();
         config.transcriber.parakeet.api_key = server_secret.to_string();
+        config.transcriber.openai.api_key = openai_secret.to_string();
         let (control_tx, _control_rx) = mpsc::channel(1);
         let interface = DaemonInterface::new(SharedState::new(config), control_tx);
 
@@ -3160,10 +3160,12 @@ mod tests {
         assert!(!published.contains(batch_secret));
         assert!(!published.contains(realtime_secret));
         assert!(!published.contains(server_secret));
+        assert!(!published.contains(openai_secret));
         let published: voxkey_ipc::TranscriberConfig = serde_json::from_str(&published).unwrap();
         assert!(published.mistral.api_key.is_empty());
         assert!(published.mistral_realtime.api_key.is_empty());
         assert!(published.parakeet.api_key.is_empty());
+        assert!(published.openai.api_key.is_empty());
     }
 
     #[test]

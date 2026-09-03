@@ -1703,33 +1703,32 @@ async fn migrate_plaintext_api_keys(config: &mut Config) {
     let previous = config.clone();
     let mut migrated = false;
 
-    if let Some(api_key) = plaintext_api_key_for_migration(&config.transcriber.mistral.api_key) {
-        match secret_store::set(secret_store::SERVICE_MISTRAL, api_key).await {
+    for cloud in voxkey_ipc::cloud::CLOUD_PROVIDERS {
+        let Some(api_key) = config
+            .transcriber
+            .plaintext_api_key_mut(cloud.keyring_service)
+            .and_then(|value| plaintext_api_key_for_migration(value).map(str::to_owned))
+        else {
+            continue;
+        };
+        match secret_store::set(cloud.keyring_service, &api_key).await {
             Ok(()) => {
-                tracing::info!("Migrated Mistral API key from config.toml to keyring");
-                config.transcriber.mistral.api_key.clear();
-                migrated = true;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Could not migrate Mistral API key to keyring (leaving in config.toml): {e}"
+                tracing::info!(
+                    "Migrated {} API key from config.toml to keyring",
+                    cloud.name
                 );
-            }
-        }
-    }
-
-    if let Some(api_key) =
-        plaintext_api_key_for_migration(&config.transcriber.mistral_realtime.api_key)
-    {
-        match secret_store::set(secret_store::SERVICE_MISTRAL_REALTIME, api_key).await {
-            Ok(()) => {
-                tracing::info!("Migrated Mistral Realtime API key from config.toml to keyring");
-                config.transcriber.mistral_realtime.api_key.clear();
+                if let Some(slot) = config
+                    .transcriber
+                    .plaintext_api_key_mut(cloud.keyring_service)
+                {
+                    slot.clear();
+                }
                 migrated = true;
             }
             Err(e) => {
                 tracing::warn!(
-                    "Could not migrate Mistral Realtime API key to keyring (leaving in config.toml): {e}"
+                    "Could not migrate {} API key to keyring (leaving in config.toml): {e}",
+                    cloud.name
                 );
             }
         }
@@ -1759,19 +1758,11 @@ async fn migrate_plaintext_api_keys(config: &mut Config) {
 /// from the keyring. Persisted config never carries the keys; this populates
 /// them in memory only, fresh for every session start.
 fn selected_api_key_service(config: &voxkey_ipc::TranscriberConfig) -> Option<&'static str> {
-    match config.provider {
-        voxkey_ipc::TranscriberProvider::Mistral => Some(secret_store::SERVICE_MISTRAL),
-        voxkey_ipc::TranscriberProvider::MistralRealtime => {
-            Some(secret_store::SERVICE_MISTRAL_REALTIME)
-        }
-        voxkey_ipc::TranscriberProvider::Parakeet
-            if config.parakeet.backend == voxkey_ipc::ParakeetBackend::Http =>
-        {
-            Some(secret_store::SERVICE_MODEL_SERVER)
-        }
-        voxkey_ipc::TranscriberProvider::Parakeet => None,
-        voxkey_ipc::TranscriberProvider::WhisperCpp => None,
-    }
+    config.provider.api_key_service().or_else(|| {
+        (config.provider == voxkey_ipc::TranscriberProvider::Parakeet
+            && config.parakeet.backend == voxkey_ipc::ParakeetBackend::Http)
+            .then_some(secret_store::SERVICE_MODEL_SERVER)
+    })
 }
 
 async fn resolve_runtime_transcriber_config(
@@ -1782,16 +1773,7 @@ async fn resolve_runtime_transcriber_config(
         return runtime;
     };
     if let Some(key) = secret_store::get(service).await {
-        match &persisted.provider {
-            voxkey_ipc::TranscriberProvider::Mistral => runtime.mistral.api_key = key,
-            voxkey_ipc::TranscriberProvider::MistralRealtime => {
-                runtime.mistral_realtime.api_key = key;
-            }
-            voxkey_ipc::TranscriberProvider::Parakeet => runtime.parakeet.api_key = key,
-            voxkey_ipc::TranscriberProvider::WhisperCpp => {
-                unreachable!("providers without credentials return before querying the keyring")
-            }
-        }
+        runtime.set_cloud_api_key(key);
     }
     runtime
 }
@@ -2001,6 +1983,14 @@ mod tests {
         assert_eq!(
             selected_api_key_service(&server),
             Some(secret_store::SERVICE_MODEL_SERVER)
+        );
+        let openai = voxkey_ipc::TranscriberConfig {
+            provider: TranscriberProvider::OpenAi,
+            ..Default::default()
+        };
+        assert_eq!(
+            selected_api_key_service(&openai),
+            Some(voxkey_ipc::API_KEY_SERVICE_OPENAI)
         );
     }
 }

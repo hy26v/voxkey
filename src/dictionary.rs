@@ -289,12 +289,17 @@ const STYLE_PROMPT: &str = "Hello, how are you doing? Nice to meet you.";
 /// Parakeet HTTP servers validate this prefix exactly, so punctuation/style
 /// examples belong only in the Whisper-specific prompt below. Sending a style
 /// prompt when the vocabulary is empty makes an otherwise valid request fail.
-pub fn vocabulary_prompt(words: &[String]) -> Option<String> {
-    let words: Vec<&str> = words
+pub fn vocabulary_terms(words: &[String]) -> Vec<String> {
+    words
         .iter()
         .map(|word| word.trim())
         .filter(|word| !word.is_empty())
-        .collect();
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn vocabulary_prompt(words: &[String]) -> Option<String> {
+    let words = vocabulary_terms(words);
     if words.is_empty() {
         return None;
     }
@@ -813,6 +818,10 @@ mod tests {
         assert_eq!(
             vocabulary_prompt(&words).unwrap(),
             "Important Vocabulary: Voxkey, Barduhn"
+        );
+        assert_eq!(
+            vocabulary_terms(&words),
+            vec!["Voxkey".to_string(), "Barduhn".to_string()]
         );
     }
 

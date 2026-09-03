@@ -1,7 +1,7 @@
-// ABOUTME: Dispatches transcription to local engines, cloud APIs, or model-specific HTTP servers.
+// ABOUTME: Dispatches transcription to local engines, cloud APIs, or OpenAI-compatible HTTP servers.
 // ABOUTME: Captures transcript text from either stdout or JSON response.
 
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -71,16 +71,9 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// accepts the connection but never responds cannot hang the daemon either.
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_HTTP_SUCCESS_BODY_BYTES: usize = 1024 * 1024;
+const MAX_HTTP_ERROR_BODY_BYTES: usize = 8 * 1024;
+const MAX_OPENAI_ERROR_MESSAGE_CHARS: usize = 200;
 const MAX_BATCH_AUDIO_BYTES: u64 = 64 * 1024 * 1024;
-/// The deployed Parakeet HTTP service accepts at most 120 seconds per WAV.
-/// Stay below that boundary and overlap adjacent chunks so a word crossing a
-/// split is heard in full by at least one request.
-const PARAKEET_HTTP_CHUNK_DURATION: Duration = Duration::from_secs(115);
-const PARAKEET_HTTP_CHUNK_OVERLAP: Duration = Duration::from_secs(5);
-/// Upload a few independent chunks at once so long recordings do not take the
-/// sum of every server round trip. `buffered` keeps the results in source order.
-const PARAKEET_HTTP_CHUNK_CONCURRENCY: usize = 3;
-const MAX_TRANSCRIPT_OVERLAP_WORDS: usize = 64;
 /// Maximum transcript bytes retained from a whisper.cpp subprocess.
 const MAX_WHISPER_STDOUT_BYTES: usize = 1024 * 1024;
 /// Maximum diagnostic bytes retained from a failed whisper.cpp subprocess.
@@ -160,9 +153,20 @@ pub enum Transcriber {
         api_key: String,
         model: String,
         endpoint: String,
-        prompt: Option<String>,
+        vocabulary: Vec<String>,
     },
     MistralRealtime,
+    CloudBatch {
+        client: reqwest::Client,
+        protocol: voxkey_ipc::cloud::CloudProtocol,
+        name: &'static str,
+        api_key: String,
+        model: String,
+        endpoint: String,
+        allow_insecure_http: bool,
+        prompt: Option<String>,
+        vocabulary: Vec<String>,
+    },
     ParakeetHttp {
         client: reqwest::Client,
         api_key: String,
@@ -399,9 +403,12 @@ pub(crate) fn batch_endpoint(
     }
     if url.scheme() == "http" {
         match policy {
-            BatchEndpointPolicy::Authenticated => {
-                return Err("Cloud transcription requires an https:// address".into());
-            }
+            BatchEndpointPolicy::Authenticated => match endpoint_host_scope(&url) {
+                EndpointHostScope::Loopback => {}
+                _ => {
+                    return Err("Cloud transcription requires an https:// address".into());
+                }
+            },
             BatchEndpointPolicy::Unauthenticated {
                 allow_insecure_http,
             } => match endpoint_host_scope(&url) {
@@ -430,7 +437,7 @@ fn batch_authorization_value(api_key: &str) -> std::io::Result<String> {
     if api_key.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "Add a Mistral API key in Voxkey settings before dictating",
+            "Add an API key in Voxkey settings before dictating",
         ));
     }
     Ok(format!("Bearer {api_key}"))
@@ -529,14 +536,20 @@ impl Transcriber {
                 api_key: config.mistral.api_key.clone(),
                 model: config.mistral.model.clone(),
                 endpoint: config.mistral.endpoint.clone(),
-                prompt: crate::dictionary::vocabulary_prompt(vocabulary),
+                vocabulary: crate::dictionary::vocabulary_terms(vocabulary),
             },
             TranscriberProvider::MistralRealtime => Self::MistralRealtime,
+            TranscriberProvider::OpenAi
+            | TranscriberProvider::Groq
+            | TranscriberProvider::Deepgram
+            | TranscriberProvider::AssemblyAi
+            | TranscriberProvider::ElevenLabs
+            | TranscriberProvider::OpenAiCompatible => cloud_batch_from_config(config, vocabulary),
             TranscriberProvider::Parakeet => match config.parakeet.backend {
                 voxkey_ipc::ParakeetBackend::Http => Self::ParakeetHttp {
                     client: transcription_http_client(),
                     api_key: config.parakeet.api_key.clone(),
-                    model: config.parakeet.model.clone(),
+                    model: openai_compatible_model_name(&config.parakeet),
                     endpoint: config.parakeet.endpoint.clone(),
                     allow_insecure_http: config.parakeet.allow_insecure_http,
                     prompt: crate::dictionary::vocabulary_prompt(vocabulary),
@@ -594,6 +607,18 @@ impl Transcriber {
                 format!("Mistral batch (model {model}, endpoint {endpoint})")
             }
             Self::MistralRealtime => "Mistral realtime streaming".to_string(),
+            Self::CloudBatch {
+                name,
+                model,
+                endpoint,
+                allow_insecure_http,
+                protocol,
+                ..
+            } => {
+                let policy = cloud_endpoint_policy(*protocol, *allow_insecure_http);
+                let endpoint = endpoint_for_log(endpoint, policy);
+                format!("{name} (model {model}, endpoint {endpoint})")
+            }
             Self::ParakeetHttp {
                 model,
                 endpoint,
@@ -815,21 +840,41 @@ impl Transcriber {
                 api_key,
                 model,
                 endpoint,
-                prompt,
+                vocabulary,
             } => {
                 transcribe_mistral(
-                    client,
-                    api_key,
-                    model,
-                    endpoint,
-                    prompt.as_deref(),
-                    purpose,
-                    audio_path,
+                    client, api_key, model, endpoint, vocabulary, purpose, audio_path,
                 )
                 .await
             }
             Self::MistralRealtime { .. } => {
                 Err("Live streaming cannot transcribe a saved audio file".into())
+            }
+            Self::CloudBatch {
+                client,
+                protocol,
+                name,
+                api_key,
+                model,
+                endpoint,
+                allow_insecure_http,
+                prompt,
+                vocabulary,
+            } => {
+                transcribe_cloud_batch(CloudBatchRequest {
+                    client,
+                    protocol: *protocol,
+                    name,
+                    api_key,
+                    model,
+                    endpoint,
+                    allow_insecure_http: *allow_insecure_http,
+                    prompt: prompt.as_deref(),
+                    vocabulary,
+                    purpose,
+                    audio_path,
+                })
+                .await
             }
             Self::LocalStreaming(_) => {
                 Err("A local streaming model cannot transcribe a saved audio file".into())
@@ -1005,10 +1050,28 @@ where
     Ok((retained, exceeded))
 }
 
-/// Mistral audio transcription API response.
+/// OpenAI Audio Transcriptions JSON (`json` or `verbose_json`).
 #[derive(serde::Deserialize)]
-struct MistralTranscriptionResponse {
-    text: String,
+struct OpenAiTranscriptionResponse {
+    text: Option<String>,
+    #[serde(default)]
+    segments: Vec<OpenAiTranscriptionSegment>,
+    error: Option<OpenAiErrorBody>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiTranscriptionSegment {
+    text: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiErrorEnvelope {
+    error: OpenAiErrorBody,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiErrorBody {
+    message: Option<String>,
 }
 
 async fn transcribe_mistral(
@@ -1016,7 +1079,7 @@ async fn transcribe_mistral(
     api_key: &str,
     model: &str,
     endpoint: &str,
-    prompt: Option<&str>,
+    vocabulary: &[String],
     purpose: Purpose,
     audio_path: &Path,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -1028,7 +1091,9 @@ async fn transcribe_mistral(
         endpoint_policy: BatchEndpointPolicy::Authenticated,
         model,
         url,
-        prompt,
+        prompt: None,
+        vocabulary,
+        form: HttpBatchForm::Mistral,
         purpose,
         audio_path,
     })
@@ -1065,54 +1130,6 @@ async fn transcribe_parakeet_http(
             "Set a transcription server address in Voxkey settings before dictating".into(),
         );
     }
-    let server = ModelServer { endpoint, ..server };
-    if tokio::fs::metadata(audio_path).await?.len() > MAX_BATCH_AUDIO_BYTES {
-        return Err(format!(
-            "Recorded audio exceeds the {} MiB upload limit",
-            MAX_BATCH_AUDIO_BYTES / (1024 * 1024)
-        )
-        .into());
-    }
-
-    let source = audio_path.to_path_buf();
-    let chunks = tokio::task::spawn_blocking(move || split_parakeet_http_wav(&source))
-        .await
-        .map_err(|error| {
-            std::io::Error::other(format!("Server audio preparation task failed: {error}"))
-        })??;
-    let Some(chunks) = chunks else {
-        return transcribe_parakeet_http_chunk(server, purpose, audio_path).await;
-    };
-
-    progress!(
-        purpose,
-        "Transcribing a long recording as {} overlapping server chunks",
-        chunks.len()
-    );
-    let chunk_paths = chunks
-        .iter()
-        .map(|chunk| chunk.path().to_path_buf())
-        .collect::<Vec<_>>();
-    let chunk_results =
-        futures_util::stream::iter(chunk_paths.into_iter().map(|audio_path| async move {
-            transcribe_parakeet_http_chunk(server, purpose, &audio_path).await
-        }))
-        .buffered(PARAKEET_HTTP_CHUNK_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?;
-
-    let mut transcript = String::new();
-    for next in chunk_results {
-        transcript = merge_overlapping_transcripts(&transcript, &next);
-    }
-    Ok(transcript)
-}
-
-async fn transcribe_parakeet_http_chunk(
-    server: ModelServer<'_>,
-    purpose: Purpose,
-    audio_path: &Path,
-) -> Result<String, DynError> {
     transcribe_http_batch(HttpBatchRequest {
         client: server.client,
         backend_name: "Transcription server",
@@ -1121,145 +1138,550 @@ async fn transcribe_parakeet_http_chunk(
             allow_insecure_http: server.allow_insecure_http,
         },
         model: server.model,
-        url: server.endpoint,
+        url: endpoint,
         prompt: server.prompt,
+        vocabulary: &[],
+        form: HttpBatchForm::OpenAi,
         purpose,
         audio_path,
     })
     .await
 }
 
-/// Return private overlapping WAV chunks when a valid recorder WAV is longer
-/// than the Parakeet server's request budget. Invalid WAVs stay untouched so
-/// the configured server remains responsible for reporting format errors.
-fn split_parakeet_http_wav(
-    audio_path: &Path,
-) -> Result<Option<Vec<tempfile::NamedTempFile>>, DynError> {
-    let reader = match hound::WavReader::open(audio_path) {
-        Ok(reader) => reader,
-        Err(_) => return Ok(None),
-    };
-    let spec = reader.spec();
-    let duration_frames = u64::from(reader.duration());
-    let max_frames =
-        u64::from(spec.sample_rate).saturating_mul(PARAKEET_HTTP_CHUNK_DURATION.as_secs());
-    if duration_frames <= max_frames {
-        return Ok(None);
+fn cloud_batch_from_config(config: &TranscriberConfig, vocabulary: &[String]) -> Transcriber {
+    let cloud = config
+        .provider
+        .cloud()
+        .expect("cloud_batch_from_config is only called for catalogued cloud providers");
+    let (model, endpoint, api_key, insecure) = config
+        .cloud_fields()
+        .expect("catalogued cloud providers expose model and endpoint fields");
+    Transcriber::CloudBatch {
+        client: transcription_http_client(),
+        protocol: cloud.protocol,
+        name: cloud.name,
+        api_key: api_key.to_string(),
+        model: cloud.resolved_model(model),
+        endpoint: cloud.resolved_endpoint(endpoint),
+        allow_insecure_http: cloud.allows_insecure_http && insecure,
+        prompt: crate::dictionary::vocabulary_prompt(vocabulary),
+        vocabulary: crate::dictionary::vocabulary_terms(vocabulary),
     }
-    if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
-        return Err("Long server recordings must be 16-bit PCM WAV files".into());
-    }
-
-    let overlap_frames =
-        u64::from(spec.sample_rate).saturating_mul(PARAKEET_HTTP_CHUNK_OVERLAP.as_secs());
-    if max_frames == 0 || overlap_frames >= max_frames {
-        return Err("Invalid server audio chunk configuration".into());
-    }
-
-    let mut chunks = Vec::new();
-    let mut start_frame = 0_u64;
-    while start_frame < duration_frames {
-        let end_frame = start_frame.saturating_add(max_frames).min(duration_frames);
-        let mut source = hound::WavReader::open(audio_path)?;
-        source.seek(u32::try_from(start_frame).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "WAV chunk start exceeds the supported range",
-            )
-        })?)?;
-
-        let chunk = tempfile::Builder::new()
-            .prefix("voxkey_parakeet_chunk_")
-            .suffix(".wav")
-            .tempfile()?;
-        let mut writer = hound::WavWriter::create(chunk.path(), spec)?;
-        let values = end_frame
-            .saturating_sub(start_frame)
-            .saturating_mul(u64::from(spec.channels));
-        let values = usize::try_from(values).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "WAV chunk exceeds the supported memory range",
-            )
-        })?;
-        for sample in source.samples::<i16>().take(values) {
-            writer.write_sample(sample?)?;
-        }
-        writer.finalize()?;
-        chunks.push(chunk);
-
-        if end_frame == duration_frames {
-            break;
-        }
-        start_frame = end_frame - overlap_frames;
-    }
-    Ok(Some(chunks))
 }
 
-fn transcript_word_spans(text: &str) -> Vec<std::ops::Range<usize>> {
-    let mut spans = Vec::new();
-    let mut start = None;
-    for (offset, character) in text.char_indices() {
-        if character.is_whitespace() {
-            if let Some(start) = start.take() {
-                spans.push(start..offset);
+fn cloud_endpoint_policy(
+    protocol: voxkey_ipc::cloud::CloudProtocol,
+    allow_insecure_http: bool,
+) -> BatchEndpointPolicy {
+    match protocol {
+        voxkey_ipc::cloud::CloudProtocol::OpenAiTranscriptions => {
+            // Loopback HTTP is accepted without the LAN permission; private-network
+            // HTTP still requires it. Named cloud APIs keep HTTPS-only defaults.
+            BatchEndpointPolicy::Unauthenticated {
+                allow_insecure_http,
             }
-        } else if start.is_none() {
-            start = Some(offset);
         }
+        voxkey_ipc::cloud::CloudProtocol::MistralTranscriptions
+        | voxkey_ipc::cloud::CloudProtocol::DeepgramListen
+        | voxkey_ipc::cloud::CloudProtocol::AssemblyAiPreRecorded
+        | voxkey_ipc::cloud::CloudProtocol::ElevenLabsScribe
+        | voxkey_ipc::cloud::CloudProtocol::MistralRealtime => BatchEndpointPolicy::Authenticated,
     }
-    if let Some(start) = start {
-        spans.push(start..text.len());
-    }
-    spans
 }
 
-fn normalized_overlap_word(word: &str) -> String {
-    word.chars()
-        .filter(|character| character.is_alphanumeric())
-        .flat_map(char::to_lowercase)
+struct CloudBatchRequest<'a> {
+    client: &'a reqwest::Client,
+    protocol: voxkey_ipc::cloud::CloudProtocol,
+    name: &'a str,
+    api_key: &'a str,
+    model: &'a str,
+    endpoint: &'a str,
+    allow_insecure_http: bool,
+    prompt: Option<&'a str>,
+    vocabulary: &'a [String],
+    purpose: Purpose,
+    audio_path: &'a Path,
+}
+
+async fn transcribe_cloud_batch(
+    request: CloudBatchRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    match request.protocol {
+        voxkey_ipc::cloud::CloudProtocol::OpenAiTranscriptions => {
+            let endpoint = request.endpoint.trim();
+            if endpoint.is_empty() {
+                return Err(
+                    "Set a transcription server address in Voxkey settings before dictating".into(),
+                );
+            }
+            let optional_key = request.allow_insecure_http && request.api_key.trim().is_empty();
+            transcribe_http_batch(HttpBatchRequest {
+                client: request.client,
+                backend_name: request.name,
+                api_key: if optional_key {
+                    None
+                } else {
+                    Some(request.api_key)
+                },
+                endpoint_policy: cloud_endpoint_policy(
+                    request.protocol,
+                    request.allow_insecure_http,
+                ),
+                model: request.model,
+                url: endpoint,
+                prompt: request.prompt,
+                vocabulary: request.vocabulary,
+                form: HttpBatchForm::OpenAi,
+                purpose: request.purpose,
+                audio_path: request.audio_path,
+            })
+            .await
+        }
+        voxkey_ipc::cloud::CloudProtocol::MistralTranscriptions => {
+            transcribe_mistral(
+                request.client,
+                request.api_key,
+                request.model,
+                request.endpoint,
+                request.vocabulary,
+                request.purpose,
+                request.audio_path,
+            )
+            .await
+        }
+        voxkey_ipc::cloud::CloudProtocol::DeepgramListen => transcribe_deepgram(request).await,
+        voxkey_ipc::cloud::CloudProtocol::AssemblyAiPreRecorded => {
+            transcribe_assemblyai(request).await
+        }
+        voxkey_ipc::cloud::CloudProtocol::ElevenLabsScribe => transcribe_elevenlabs(request).await,
+        voxkey_ipc::cloud::CloudProtocol::MistralRealtime => {
+            Err("Live streaming cannot transcribe a saved audio file".into())
+        }
+    }
+}
+
+async fn transcribe_deepgram(
+    request: CloudBatchRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let url = deepgram_listen_url(request.endpoint, request.model, request.vocabulary)?;
+    let authorization = format!("Token {}", require_api_key(request.api_key, request.name)?);
+    progress!(
+        request.purpose,
+        "Sending audio to {} (model: {}, endpoint: {})",
+        request.name,
+        request.model,
+        endpoint_for_log(url.as_str(), BatchEndpointPolicy::Authenticated)
+    );
+    let audio = tokio::fs::read(request.audio_path).await?;
+    reject_oversized_audio(audio.len() as u64)?;
+    let response = request
+        .client
+        .post(url)
+        .header("Authorization", authorization)
+        .header("Content-Type", "audio/wav")
+        .body(audio)
+        .send()
+        .await
+        .map_err(|error| cloud_transport_error(request.name, error))?;
+    let body = cloud_success_body(request.name, response).await?;
+    parse_deepgram_transcript(&body)
+}
+
+fn deepgram_listen_url(
+    endpoint: &str,
+    model: &str,
+    vocabulary: &[String],
+) -> Result<reqwest::Url, DynError> {
+    let mut url = batch_endpoint(endpoint, BatchEndpointPolicy::Authenticated)?;
+    if url.query().is_none() {
+        let mut pairs = url.query_pairs_mut();
+        pairs
+            .append_pair("model", model)
+            .append_pair("smart_format", "true");
+        if let Some(param) = deepgram_vocabulary_query_param(model) {
+            for term in vocabulary {
+                pairs.append_pair(param, term);
+            }
+        }
+    }
+    Ok(url)
+}
+
+fn deepgram_vocabulary_query_param(model: &str) -> Option<&'static str> {
+    let model = model.trim().to_ascii_lowercase();
+    if model.starts_with("nova-3") || model.contains("flux") {
+        Some("keyterm")
+    } else if model.starts_with("nova-2")
+        || model.starts_with("nova-1")
+        || model == "nova"
+        || model.starts_with("enhanced")
+        || model == "base"
+    {
+        Some("keywords")
+    } else {
+        None
+    }
+}
+
+fn parse_deepgram_transcript(body: &[u8]) -> Result<String, DynError> {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        results: Option<Results>,
+        err_msg: Option<String>,
+        error: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Results {
+        channels: Vec<Channel>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Channel {
+        alternatives: Vec<Alternative>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Alternative {
+        transcript: Option<String>,
+    }
+    let parsed: Envelope =
+        serde_json::from_slice(body).map_err(|_| "Deepgram returned JSON without a transcript")?;
+    if let Some(error) = parsed.err_msg.or(parsed.error) {
+        return Err(format!("Deepgram reported an error: {error}").into());
+    }
+    let text = parsed
+        .results
+        .and_then(|results| results.channels.into_iter().next())
+        .and_then(|channel| channel.alternatives.into_iter().next())
+        .and_then(|alternative| alternative.transcript)
+        .unwrap_or_default();
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("Deepgram returned an empty transcript".into());
+    }
+    Ok(text)
+}
+
+async fn transcribe_assemblyai(
+    request: CloudBatchRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let root = assemblyai_root(request.endpoint)?;
+    let authorization = require_api_key(request.api_key, request.name)?;
+    progress!(
+        request.purpose,
+        "Sending audio to {} (model: {}, endpoint: {})",
+        request.name,
+        request.model,
+        root
+    );
+    let audio = tokio::fs::read(request.audio_path).await?;
+    reject_oversized_audio(audio.len() as u64)?;
+    let upload = request
+        .client
+        .post(format!("{root}/v2/upload"))
+        .header("Authorization", authorization)
+        .header("Content-Type", "application/octet-stream")
+        .body(audio)
+        .send()
+        .await
+        .map_err(|error| cloud_transport_error(request.name, error))?;
+    let upload_body = cloud_success_body(request.name, upload).await?;
+    let upload_url = serde_json::from_slice::<serde_json::Value>(&upload_body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("upload_url")
+                .and_then(|url| url.as_str())
+                .map(str::to_string)
+        })
+        .ok_or("AssemblyAI did not return an upload URL")?;
+    let create = request
+        .client
+        .post(format!("{root}/v2/transcript"))
+        .header("Authorization", authorization)
+        .json(&assemblyai_transcript_body(
+            request.model,
+            &upload_url,
+            request.vocabulary,
+        ))
+        .send()
+        .await
+        .map_err(|error| cloud_transport_error(request.name, error))?;
+    let created = cloud_success_body(request.name, create).await?;
+    let id = serde_json::from_slice::<serde_json::Value>(&created)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        })
+        .ok_or("AssemblyAI did not return a transcript id")?;
+    poll_assemblyai_transcript(request.client, request.name, &root, authorization, &id).await
+}
+
+fn assemblyai_root(endpoint: &str) -> Result<String, DynError> {
+    let url = batch_endpoint(endpoint, BatchEndpointPolicy::Authenticated)?;
+    let mut root = url;
+    root.set_path("");
+    root.set_query(None);
+    root.set_fragment(None);
+    Ok(root.as_str().trim_end_matches('/').to_string())
+}
+
+fn assemblyai_speech_models(configured: &str) -> Vec<String> {
+    let trimmed = configured.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("universal")
+        || trimmed.eq_ignore_ascii_case("best")
+        || trimmed == "universal-3-5-pro"
+    {
+        return vec!["universal-3-5-pro".to_string(), "universal-2".to_string()];
+    }
+    trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
         .collect()
 }
 
-fn merge_overlapping_transcripts(previous: &str, next: &str) -> String {
-    let previous = previous.trim();
-    let next = next.trim();
-    if previous.is_empty() {
-        return next.to_string();
+fn assemblyai_transcript_body(
+    model: &str,
+    audio_url: &str,
+    vocabulary: &[String],
+) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "audio_url".to_string(),
+        serde_json::Value::String(audio_url.to_string()),
+    );
+    body.insert(
+        "speech_models".to_string(),
+        serde_json::Value::Array(
+            assemblyai_speech_models(model)
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    body.insert(
+        "language_detection".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    let keyterms: Vec<serde_json::Value> = vocabulary
+        .iter()
+        .filter(|term| !term.is_empty() && term.split_whitespace().count() <= 6)
+        .take(1000)
+        .map(|term| serde_json::Value::String(term.clone()))
+        .collect();
+    if !keyterms.is_empty() {
+        body.insert(
+            "keyterms_prompt".to_string(),
+            serde_json::Value::Array(keyterms),
+        );
     }
-    if next.is_empty() {
-        return previous.to_string();
-    }
+    serde_json::Value::Object(body)
+}
 
-    let previous_spans = transcript_word_spans(previous);
-    let next_spans = transcript_word_spans(next);
-    let maximum = previous_spans
-        .len()
-        .min(next_spans.len())
-        .min(MAX_TRANSCRIPT_OVERLAP_WORDS);
-    let overlap = (1..=maximum).rev().find(|count| {
-        let previous_words = &previous_spans[previous_spans.len() - count..];
-        let next_words = &next_spans[..*count];
-        previous_words.iter().zip(next_words).all(|(left, right)| {
-            let left = normalized_overlap_word(&previous[left.clone()]);
-            let right = normalized_overlap_word(&next[right.clone()]);
-            !left.is_empty() && left == right
-        })
-    });
-
-    let remainder = match overlap {
-        Some(count) if count == next_spans.len() => "",
-        Some(count) => next[next_spans[count].start..].trim_start(),
-        None => next,
-    };
-    if remainder.is_empty() {
-        previous.to_string()
-    } else {
-        format!("{previous} {remainder}")
+async fn poll_assemblyai_transcript(
+    client: &reqwest::Client,
+    name: &str,
+    root: &str,
+    authorization: &str,
+    id: &str,
+) -> Result<String, DynError> {
+    let deadline = tokio::time::Instant::now() + TRANSCRIBE_TIMEOUT;
+    loop {
+        let response = client
+            .get(format!("{root}/v2/transcript/{id}"))
+            .header("Authorization", authorization)
+            .send()
+            .await
+            .map_err(|error| cloud_transport_error(name, error))?;
+        let body = cloud_success_body(name, response).await?;
+        let parsed: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| "AssemblyAI returned JSON without a transcript")?;
+        match parsed.get("status").and_then(|status| status.as_str()) {
+            Some("completed") => {
+                let text = parsed
+                    .get("text")
+                    .and_then(|text| text.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if text.is_empty() {
+                    return Err("AssemblyAI returned an empty transcript".into());
+                }
+                return Ok(text);
+            }
+            Some("error") => {
+                let error = parsed
+                    .get("error")
+                    .and_then(|error| error.as_str())
+                    .unwrap_or("transcription failed");
+                return Err(format!("AssemblyAI reported an error: {error}").into());
+            }
+            _ if tokio::time::Instant::now() >= deadline => {
+                return Err("AssemblyAI transcription timed out".into());
+            }
+            _ => tokio::time::sleep(Duration::from_secs(1)).await,
+        }
     }
 }
 
-/// One OpenAI-compatible batch transcription request.
+async fn transcribe_elevenlabs(
+    request: CloudBatchRequest<'_>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let url = batch_endpoint(request.endpoint, BatchEndpointPolicy::Authenticated)?;
+    let api_key = require_api_key(request.api_key, request.name)?;
+    progress!(
+        request.purpose,
+        "Sending audio to {} (model: {}, endpoint: {})",
+        request.name,
+        request.model,
+        endpoint_for_log(url.as_str(), BatchEndpointPolicy::Authenticated)
+    );
+    let file_length = tokio::fs::metadata(request.audio_path).await?.len();
+    reject_oversized_audio(file_length)?;
+    let file = tokio::fs::File::open(request.audio_path).await?;
+    let file_name = request
+        .audio_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "audio.wav".to_string());
+    let file_stream = tokio_util::io::ReaderStream::new(file);
+    let file_part = reqwest::multipart::Part::stream_with_length(
+        reqwest::Body::wrap_stream(file_stream),
+        file_length,
+    )
+    .file_name(file_name)
+    .mime_str("audio/wav")?;
+    let mut form = reqwest::multipart::Form::new()
+        .part("file", file_part)
+        .text("model_id", request.model.to_string());
+    if let Some(keyterms) = elevenlabs_keyterms_field(request.vocabulary) {
+        form = form.text("keyterms", keyterms);
+    }
+    let response = request
+        .client
+        .post(url)
+        .header("xi-api-key", api_key)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| cloud_transport_error(request.name, error))?;
+    let body = cloud_success_body(request.name, response).await?;
+    parse_openai_transcription_body(&body)
+}
+
+fn elevenlabs_keyterms_field(vocabulary: &[String]) -> Option<String> {
+    let terms: Vec<&str> = vocabulary
+        .iter()
+        .map(String::as_str)
+        .filter(|term| {
+            !term.is_empty()
+                && term.len() <= 50
+                && term.split_whitespace().count() <= 5
+                && !term.contains(['<', '>', '{', '}', '[', ']', '\\'])
+        })
+        .take(1000)
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&terms).ok()
+    }
+}
+
+fn mistral_context_bias(vocabulary: &[String]) -> Option<String> {
+    const MAX_TERMS: usize = 100;
+    if vocabulary.is_empty() {
+        None
+    } else {
+        Some(
+            vocabulary
+                .iter()
+                .take(MAX_TERMS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
+}
+
+fn require_api_key<'a>(api_key: &'a str, name: &str) -> Result<&'a str, DynError> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err(format!("Add a {name} API key in Voxkey settings before dictating").into());
+    }
+    Ok(api_key)
+}
+
+fn reject_oversized_audio(file_length: u64) -> Result<(), DynError> {
+    if file_length > MAX_BATCH_AUDIO_BYTES {
+        return Err(format!(
+            "Recorded audio exceeds the {} MiB upload limit",
+            MAX_BATCH_AUDIO_BYTES / (1024 * 1024)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn cloud_transport_error(name: &str, error: reqwest::Error) -> std::io::Error {
+    let error = error.without_url();
+    tracing::debug!("{name} transport diagnostic: {error}");
+    let public = if error.is_timeout() {
+        format!("{name} request timed out")
+    } else if error.is_connect() {
+        format!("Could not connect to {name}")
+    } else {
+        format!("{name} request failed")
+    };
+    std::io::Error::other(public)
+}
+
+async fn cloud_success_body(name: &str, response: reqwest::Response) -> Result<Vec<u8>, DynError> {
+    if !response.status().is_success() {
+        let status = response.status();
+        let advertised_length = response.content_length();
+        let body = collect_bounded_body(
+            response.bytes_stream(),
+            advertised_length,
+            MAX_HTTP_ERROR_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_default();
+        let mut message = format!("{name} rejected the request ({status})");
+        if let Some(detail) = openai_error_message(&body) {
+            message = format!("{message}: {detail}");
+        }
+        return Err(message.into());
+    }
+    let advertised_length = response.content_length();
+    collect_bounded_body(
+        response.bytes_stream(),
+        advertised_length,
+        MAX_HTTP_SUCCESS_BODY_BYTES,
+    )
+    .await
+}
+
+fn openai_compatible_model_name(parakeet: &voxkey_ipc::ParakeetConfig) -> String {
+    let named = parakeet.server_model.trim();
+    if named.is_empty() {
+        voxkey_ipc::ParakeetConfig::DEFAULT_SERVER_MODEL.to_string()
+    } else {
+        named.to_string()
+    }
+}
+
+/// One OpenAI Audio Transcriptions request (`POST /v1/audio/transcriptions`).
+#[derive(Clone, Copy)]
+enum HttpBatchForm {
+    OpenAi,
+    Mistral,
+}
+
 struct HttpBatchRequest<'a> {
     client: &'a reqwest::Client,
     backend_name: &'a str,
@@ -1268,6 +1690,8 @@ struct HttpBatchRequest<'a> {
     model: &'a str,
     url: &'a str,
     prompt: Option<&'a str>,
+    vocabulary: &'a [String],
+    form: HttpBatchForm,
     purpose: Purpose,
     audio_path: &'a Path,
 }
@@ -1283,6 +1707,8 @@ async fn transcribe_http_batch(
         model,
         url,
         prompt,
+        vocabulary,
+        form,
         purpose,
         audio_path,
     } = request;
@@ -1316,16 +1742,37 @@ async fn transcribe_http_batch(
     .file_name(file_name)
     .mime_str("audio/wav")?;
 
-    let mut form = reqwest::multipart::Form::new()
-        .text("model", model.to_string())
-        .part("file", file_part);
-    if let Some(p) = prompt {
-        form = form.text("prompt", p.to_string());
+    let mut form_body = reqwest::multipart::Form::new().part("file", file_part);
+    match form {
+        HttpBatchForm::OpenAi => {
+            form_body = form_body.text("response_format", "json");
+            if !model.trim().is_empty() {
+                form_body = form_body.text("model", model.to_string());
+            }
+            if let Some(p) = prompt {
+                form_body = form_body.text("prompt", p.to_string());
+            }
+        }
+        HttpBatchForm::Mistral => {
+            if !model.trim().is_empty() {
+                form_body = form_body.text("model", model.to_string());
+            }
+            if let Some(bias) = mistral_context_bias(vocabulary) {
+                form_body = form_body.text("context_bias", bias);
+            }
+        }
     }
 
-    let mut request = client.post(url).multipart(form);
+    let mut request = client.post(url).multipart(form_body);
     if let Some(authorization) = authorization {
         request = request.header("Authorization", authorization);
+    }
+    // Mistral's API reference uses Bearer; cookbook examples use `x-api-key`.
+    // Send both so either documented header is present on the same request.
+    if matches!(form, HttpBatchForm::Mistral)
+        && let Some(key) = api_key.map(str::trim).filter(|key| !key.is_empty())
+    {
+        request = request.header("x-api-key", key);
     }
     let response = request.send().await.map_err(|error| {
         let error = error.without_url();
@@ -1342,7 +1789,19 @@ async fn transcribe_http_batch(
 
     if !response.status().is_success() {
         let status = response.status();
-        return Err(format!("{backend_name} rejected the request ({status})").into());
+        let advertised_length = response.content_length();
+        let body = collect_bounded_body(
+            response.bytes_stream(),
+            advertised_length,
+            MAX_HTTP_ERROR_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_default();
+        let mut message = format!("{backend_name} rejected the request ({status})");
+        if let Some(detail) = openai_error_message(&body) {
+            message = format!("{message}: {detail}");
+        }
+        return Err(message.into());
     }
 
     let advertised_length = response.content_length();
@@ -1352,10 +1811,79 @@ async fn transcribe_http_batch(
         MAX_HTTP_SUCCESS_BODY_BYTES,
     )
     .await?;
-    let parsed: MistralTranscriptionResponse = serde_json::from_slice(&body)?;
-    let transcript = parsed.text.trim().to_string();
+    let transcript = parse_openai_transcription_body(&body)?;
     tracing::info!("Transcription complete ({} chars)", transcript.len());
     Ok(transcript)
+}
+
+fn parse_openai_transcription_body(body: &[u8]) -> Result<String, DynError> {
+    if let Ok(parsed) = serde_json::from_slice::<OpenAiTranscriptionResponse>(body) {
+        if let Some(error) = parsed
+            .error
+            .as_ref()
+            .and_then(|error| error.message.as_deref())
+        {
+            let detail = sanitize_openai_error_message(error)
+                .unwrap_or_else(|| "the server reported an error".to_string());
+            return Err(format!("Transcription server reported an error: {detail}").into());
+        }
+        return Ok(openai_transcript_text(parsed));
+    }
+    let as_text = std::str::from_utf8(body)
+        .map_err(|_| "Transcription server returned a non-UTF-8 body")?
+        .trim();
+    if as_text.starts_with('{') {
+        return Err("Transcription server returned JSON without a transcript".into());
+    }
+    Ok(as_text.to_string())
+}
+
+fn openai_transcript_text(parsed: OpenAiTranscriptionResponse) -> String {
+    if let Some(text) = parsed.text {
+        return text.trim().to_string();
+    }
+    parsed
+        .segments
+        .into_iter()
+        .filter_map(|segment| segment.text)
+        .collect::<Vec<_>>()
+        .join("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn openai_error_message(body: &[u8]) -> Option<String> {
+    let message = serde_json::from_slice::<OpenAiErrorEnvelope>(body)
+        .ok()
+        .and_then(|envelope| envelope.error.message)
+        .or_else(|| {
+            serde_json::from_slice::<OpenAiTranscriptionResponse>(body)
+                .ok()
+                .and_then(|parsed| parsed.error)
+                .and_then(|error| error.message)
+        })?;
+    sanitize_openai_error_message(&message)
+}
+
+fn sanitize_openai_error_message(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut compact = String::new();
+    for character in trimmed.chars() {
+        if compact.chars().count() >= MAX_OPENAI_ERROR_MESSAGE_CHARS {
+            break;
+        }
+        if character.is_control() {
+            compact.push(' ');
+        } else {
+            compact.push(character);
+        }
+    }
+    let compact = compact.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!compact.is_empty()).then_some(compact)
 }
 
 async fn collect_bounded_body<S, B, E>(
@@ -2187,12 +2715,6 @@ async fn transcribe_parakeet_samples_detailed(
 }
 
 #[cfg(test)]
-fn parse_mistral_response(json: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let parsed: MistralTranscriptionResponse = serde_json::from_str(json)?;
-    Ok(parsed.text)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use voxkey_ipc::{MistralConfig, MistralRealtimeConfig, ParakeetConfig, WhisperCppConfig};
@@ -2220,6 +2742,45 @@ mod tests {
         writer.write_sample(123_i16).unwrap();
         writer.finalize().unwrap();
         path
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = socket.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    async fn write_json_response(socket: &mut tokio::net::TcpStream, body: &str) {
+        use tokio::io::AsyncWriteExt;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
     }
 
     #[tokio::test]
@@ -2267,6 +2828,7 @@ mod tests {
             mistral: MistralConfig::default(),
             mistral_realtime: MistralRealtimeConfig::default(),
             parakeet: ParakeetConfig::default(),
+            ..Default::default()
         };
         let t = Transcriber::from_config(&config, 16000, &[]);
         match t {
@@ -2298,12 +2860,26 @@ mod tests {
             },
             mistral_realtime: MistralRealtimeConfig::default(),
             parakeet: ParakeetConfig::default(),
+            ..Default::default()
         };
-        let t = Transcriber::from_config(&config, 16000, &[]);
+        let t = Transcriber::from_config(
+            &config,
+            16000,
+            &["VoxKey".to_string(), " Siobhan ".to_string()],
+        );
         match t {
-            Transcriber::Mistral { api_key, model, .. } => {
+            Transcriber::Mistral {
+                api_key,
+                model,
+                vocabulary,
+                ..
+            } => {
                 assert_eq!(api_key, "sk-test");
                 assert_eq!(model, "voxtral-mini-2602");
+                assert_eq!(
+                    vocabulary,
+                    vec!["VoxKey".to_string(), "Siobhan".to_string()]
+                );
             }
             _ => panic!("Expected Mistral variant"),
         }
@@ -2316,7 +2892,7 @@ mod tests {
             api_key: "test-key".to_string(),
             model: MistralConfig::DEFAULT_MODEL.to_string(),
             endpoint: "   \t".to_string(),
-            prompt: None,
+            vocabulary: vec![],
         };
 
         assert_eq!(
@@ -2341,9 +2917,148 @@ mod tests {
                 endpoint: String::new(),
             },
             parakeet: ParakeetConfig::default(),
+            ..Default::default()
         };
         let t = Transcriber::from_config(&config, 16000, &[]);
         assert!(matches!(t, Transcriber::MistralRealtime));
+    }
+
+    #[test]
+    fn from_config_creates_catalogued_cloud_batch_providers() {
+        for cloud in voxkey_ipc::cloud::CLOUD_PROVIDERS {
+            if matches!(
+                cloud.provider,
+                TranscriberProvider::Mistral | TranscriberProvider::MistralRealtime
+            ) {
+                continue;
+            }
+            let mut config = TranscriberConfig {
+                provider: cloud.provider,
+                ..Default::default()
+            };
+            config.set_cloud_api_key("sk-test".to_string());
+            if cloud.endpoint_required {
+                config.set_cloud_endpoint(
+                    "https://speech.example.test/v1/audio/transcriptions".to_string(),
+                );
+            }
+            let transcriber = Transcriber::from_config(&config, 16_000, &[]);
+            match transcriber {
+                Transcriber::CloudBatch {
+                    protocol,
+                    name,
+                    model,
+                    endpoint,
+                    ..
+                } => {
+                    assert_eq!(protocol, cloud.protocol, "{}", cloud.id);
+                    assert_eq!(name, cloud.name, "{}", cloud.id);
+                    assert_eq!(model, cloud.default_model, "{}", cloud.id);
+                    assert_eq!(
+                        endpoint,
+                        cloud.resolved_endpoint(config.cloud_endpoint().unwrap_or("")),
+                        "{}",
+                        cloud.id
+                    );
+                }
+                _ => panic!("{} did not create a cloud batch transcriber", cloud.id),
+            }
+        }
+    }
+
+    #[test]
+    fn deepgram_transcript_parser_reads_the_first_alternative() {
+        let body =
+            br#"{"results":{"channels":[{"alternatives":[{"transcript":" Hello there. "}]}]}}"#;
+        assert_eq!(parse_deepgram_transcript(body).unwrap(), "Hello there.");
+    }
+
+    #[test]
+    fn deepgram_transcript_parser_surfaces_provider_errors() {
+        let body = br#"{"err_msg":"insufficient credits"}"#;
+        let error = parse_deepgram_transcript(body).unwrap_err();
+        assert!(error.to_string().contains("insufficient credits"));
+    }
+
+    #[test]
+    fn assemblyai_sends_speech_models_array_and_keyterms() {
+        assert_eq!(
+            assemblyai_speech_models(""),
+            ["universal-3-5-pro", "universal-2"]
+        );
+        assert_eq!(
+            assemblyai_speech_models("universal"),
+            ["universal-3-5-pro", "universal-2"]
+        );
+        assert_eq!(
+            assemblyai_speech_models("universal-3-5-pro"),
+            ["universal-3-5-pro", "universal-2"]
+        );
+        assert_eq!(assemblyai_speech_models("universal-2"), ["universal-2"]);
+        assert_eq!(
+            assemblyai_speech_models("universal-3-5-pro, universal-2"),
+            ["universal-3-5-pro", "universal-2"]
+        );
+
+        let body = assemblyai_transcript_body(
+            "universal-3-5-pro",
+            "https://example.test/audio",
+            &["VoxKey".to_string(), "Siobhan".to_string()],
+        );
+        assert_eq!(body["audio_url"], "https://example.test/audio");
+        assert_eq!(
+            body["speech_models"],
+            serde_json::json!(["universal-3-5-pro", "universal-2"])
+        );
+        assert_eq!(body["language_detection"], true);
+        assert_eq!(
+            body["keyterms_prompt"],
+            serde_json::json!(["VoxKey", "Siobhan"])
+        );
+        assert!(body.get("speech_model").is_none());
+    }
+
+    #[test]
+    fn deepgram_listen_url_uses_token_query_and_nova3_keyterms() {
+        let url = deepgram_listen_url(
+            "https://api.deepgram.com/v1/listen",
+            "nova-3",
+            &["VoxKey".to_string(), "customer service".to_string()],
+        )
+        .unwrap();
+        let query = url.query().unwrap();
+        assert!(query.contains("model=nova-3"));
+        assert!(query.contains("smart_format=true"));
+        assert!(query.contains("keyterm=VoxKey"));
+        assert!(
+            query.contains("keyterm=customer+service")
+                || query.contains("keyterm=customer%20service")
+        );
+        assert!(!query.contains("keywords="));
+
+        let nova2 = deepgram_listen_url(
+            "https://api.deepgram.com/v1/listen",
+            "nova-2",
+            &["VoxKey".to_string()],
+        )
+        .unwrap();
+        let query = nova2.query().unwrap();
+        assert!(query.contains("keywords=VoxKey"));
+        assert!(!query.contains("keyterm="));
+    }
+
+    #[test]
+    fn elevenlabs_and_mistral_encode_documented_vocabulary_fields() {
+        assert_eq!(
+            elevenlabs_keyterms_field(&["VoxKey".to_string(), "Siobhan".to_string()]).unwrap(),
+            r#"["VoxKey","Siobhan"]"#
+        );
+        assert_eq!(
+            mistral_context_bias(&["Chicago".to_string(), "Joplin".to_string()]).unwrap(),
+            "Chicago,Joplin"
+        );
+        assert!(mistral_context_bias(&[]).is_none());
+        assert!(elevenlabs_keyterms_field(&[]).is_none());
     }
 
     #[test]
@@ -2392,7 +3107,7 @@ mod tests {
             api_key: String::new(),
             model: String::new(),
             endpoint: String::new(),
-            prompt: None,
+            vocabulary: vec![],
         };
         assert!(!mistral.is_streaming());
 
@@ -2573,7 +3288,7 @@ mod tests {
             api_key: "sk-super-secret".to_string(),
             model: "voxtral-mini-2602".to_string(),
             endpoint: String::new(),
-            prompt: None,
+            vocabulary: vec![],
         };
 
         let description = mistral.describe();
@@ -2593,7 +3308,7 @@ mod tests {
             api_key: String::new(),
             model: "voxtral-mini-2602".to_string(),
             endpoint: "https://alice:secret@transcribe.example.test/v1".to_string(),
-            prompt: None,
+            vocabulary: vec![],
         };
 
         let description = mistral.describe();
@@ -2689,13 +3404,26 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_batch_endpoint_never_allows_plaintext() {
-        let error = batch_endpoint(
-            "http://127.0.0.1:8000/v1/audio/transcriptions",
+    fn authenticated_batch_endpoint_allows_loopback_http_only() {
+        assert!(
+            batch_endpoint(
+                "http://127.0.0.1:8000/v1/audio/transcriptions",
+                BatchEndpointPolicy::Authenticated,
+            )
+            .is_ok()
+        );
+        let remote = batch_endpoint(
+            "http://api.example.test/v1/audio/transcriptions",
             BatchEndpointPolicy::Authenticated,
         )
-        .expect_err("a bearer credential must never cross plaintext HTTP");
-        assert!(error.to_string().contains("https://"), "{error}");
+        .expect_err("a bearer credential must not cross plaintext HTTP off-machine");
+        assert!(remote.to_string().contains("https://"), "{remote}");
+        let lan = batch_endpoint(
+            "http://192.168.1.132:8000/v1/audio/transcriptions",
+            BatchEndpointPolicy::Authenticated,
+        )
+        .expect_err("cloud API keys must not cross a plaintext LAN");
+        assert!(lan.to_string().contains("https://"), "{lan}");
         assert!(
             batch_endpoint(
                 "https://transcribe.example.test/v1/audio/transcriptions",
@@ -2711,7 +3439,7 @@ mod tests {
             let error = batch_authorization_value(api_key)
                 .expect_err("blank credentials must not reach a batch request");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-            assert!(error.to_string().contains("Add a Mistral API key"));
+            assert!(error.to_string().contains("Add an API key"));
         }
         assert_eq!(
             batch_authorization_value("  sk-batch-key \n").unwrap(),
@@ -2772,7 +3500,7 @@ mod tests {
                 api_key: String::new(),
                 model: String::new(),
                 endpoint: String::new(),
-                prompt: None,
+                vocabulary: vec![],
             }
             .runs_locally()
         );
@@ -2803,11 +3531,13 @@ mod tests {
                 model: "voxkey-test-model-that-does-not-exist".to_string(),
                 backend: voxkey_ipc::ParakeetBackend::Local,
                 endpoint: String::new(),
+                server_model: String::new(),
                 api_key: String::new(),
                 allow_insecure_http: false,
                 execution_provider: voxkey_ipc::ExecutionProviderChoice::Cpu,
                 preload_model: false,
             },
+            ..Default::default()
         };
         let t = Transcriber::from_config(&config, 16000, &[]);
         assert!(!t.is_streaming());
@@ -2852,6 +3582,7 @@ mod tests {
                 model: "parakeet-tdt-0.6b-v3".to_string(),
                 backend: voxkey_ipc::ParakeetBackend::Http,
                 endpoint: "http://192.168.1.132:8000/v1/audio/transcriptions".to_string(),
+                server_model: String::new(),
                 api_key: "server-token".to_string(),
                 allow_insecure_http: true,
                 execution_provider: voxkey_ipc::ExecutionProviderChoice::Cuda,
@@ -2870,7 +3601,7 @@ mod tests {
                 prompt,
                 ..
             } => {
-                assert_eq!(model, "parakeet-tdt-0.6b-v3");
+                assert_eq!(model, "whisper-1");
                 assert_eq!(
                     endpoint,
                     "http://192.168.1.132:8000/v1/audio/transcriptions"
@@ -2884,6 +3615,29 @@ mod tests {
     }
 
     #[test]
+    fn from_config_uses_the_configured_openai_server_model() {
+        let config = TranscriberConfig {
+            provider: TranscriberProvider::Parakeet,
+            parakeet: voxkey_ipc::ParakeetConfig {
+                model: "parakeet-tdt-0.6b-v3".to_string(),
+                backend: voxkey_ipc::ParakeetBackend::Http,
+                endpoint: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+                server_model: "whisper-large-v3".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let transcriber = Transcriber::from_config(&config, 16_000, &[]);
+        match transcriber {
+            Transcriber::ParakeetHttp { model, .. } => {
+                assert_eq!(model, "whisper-large-v3");
+            }
+            _ => panic!("Expected ParakeetHttp variant"),
+        }
+    }
+
+    #[test]
     fn parakeet_http_omits_prompt_without_vocabulary() {
         let config = TranscriberConfig {
             provider: TranscriberProvider::Parakeet,
@@ -2891,6 +3645,7 @@ mod tests {
                 model: "parakeet-tdt-0.6b-v3".to_string(),
                 backend: voxkey_ipc::ParakeetBackend::Http,
                 endpoint: "http://192.168.1.132:8000/v1/audio/transcriptions".to_string(),
+                server_model: String::new(),
                 api_key: String::new(),
                 allow_insecure_http: false,
                 execution_provider: voxkey_ipc::ExecutionProviderChoice::Cpu,
@@ -2907,16 +3662,41 @@ mod tests {
     }
 
     #[test]
-    fn parse_mistral_response_extracts_text() {
-        let json = r#"{"text": " Hello, world! "}"#;
-        let text = parse_mistral_response(json).unwrap();
-        assert_eq!(text, " Hello, world! ");
+    fn openai_json_response_extracts_text() {
+        let text = parse_openai_transcription_body(br#"{"text": " Hello, world! "}"#).unwrap();
+        assert_eq!(text, "Hello, world!");
     }
 
     #[test]
-    fn parse_mistral_response_rejects_invalid_json() {
-        let json = r#"{"error": "unauthorized"}"#;
-        assert!(parse_mistral_response(json).is_err());
+    fn openai_verbose_json_uses_segments_when_text_is_missing() {
+        let text = parse_openai_transcription_body(
+            br#"{"segments":[{"text":"Hello "},{"text":"world"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(text, "Hello world");
+    }
+
+    #[test]
+    fn openai_plain_text_response_is_accepted() {
+        let text = parse_openai_transcription_body(b"plain transcript").unwrap();
+        assert_eq!(text, "plain transcript");
+    }
+
+    #[test]
+    fn openai_error_object_is_not_treated_as_a_transcript() {
+        let error = parse_openai_transcription_body(br#"{"error":{"message":"invalid model"}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid model"), "{error}");
+    }
+
+    #[test]
+    fn openai_error_message_is_bounded_and_ignores_raw_bodies() {
+        assert_eq!(
+            openai_error_message(br#"{"error":{"message":"model not found"}}"#).as_deref(),
+            Some("model not found")
+        );
+        assert!(openai_error_message("provider error details ".repeat(200).as_bytes()).is_none());
     }
 
     #[tokio::test]
@@ -3276,6 +4056,8 @@ mod tests {
         assert!(request.contains("Content-Type: audio/wav"));
         assert!(request.contains("name=\"model\""));
         assert!(request.contains("parakeet-tdt-0.6b-v3"));
+        assert!(request.contains("name=\"response_format\""));
+        assert!(request.contains("json"));
         assert!(request.contains("name=\"prompt\""));
         assert!(request.contains("Important Vocabulary: VoxKey, Siobhan"));
         assert!(
@@ -3286,10 +4068,230 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parakeet_http_chunks_recordings_beyond_the_server_duration_limit() {
+    async fn mistral_batch_sends_bearer_auth_and_context_bias() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            write_json_response(&mut socket, r#"{"text":"Mistral result"}"#).await;
+            let _ = request_tx.send(request);
+        });
+
+        let audio = persistent_test_wav("voxkey_mistral_http_");
+        let endpoint = format!("http://{addr}/v1/audio/transcriptions");
+        let client = reqwest::Client::new();
+        let result = transcribe_mistral(
+            &client,
+            "mistral-key",
+            "voxtral-mini-2602",
+            &endpoint,
+            &["Chicago".to_string(), "Joplin".to_string()],
+            Purpose::Final,
+            &audio,
+        )
+        .await
+        .unwrap();
+        let request = request_rx.await.unwrap();
+        let _ = std::fs::remove_file(audio);
+
+        assert_eq!(result, "Mistral result");
+        assert!(request.contains("name=\"file\""));
+        assert!(request.contains("name=\"model\""));
+        assert!(request.contains("voxtral-mini-2602"));
+        assert!(request.contains("name=\"context_bias\""));
+        assert!(request.contains("Chicago,Joplin"));
+        assert!(!request.contains("name=\"prompt\""));
+        assert!(!request.contains("name=\"response_format\""));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer mistral-key")
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-api-key: mistral-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn deepgram_sends_token_auth_and_keyterm_query() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            write_json_response(
+                &mut socket,
+                r#"{"results":{"channels":[{"alternatives":[{"transcript":"Hello Deepgram"}]}]}}"#,
+            )
+            .await;
+            let _ = request_tx.send(request);
+        });
+
+        let audio = persistent_test_wav("voxkey_deepgram_http_");
+        let endpoint = format!("http://{addr}/v1/listen");
+        let client = reqwest::Client::new();
+        let result = transcribe_deepgram(CloudBatchRequest {
+            client: &client,
+            protocol: voxkey_ipc::cloud::CloudProtocol::DeepgramListen,
+            name: "Deepgram",
+            api_key: "dg-key",
+            model: "nova-3",
+            endpoint: &endpoint,
+            allow_insecure_http: false,
+            prompt: None,
+            vocabulary: &["VoxKey".to_string()],
+            purpose: Purpose::Final,
+            audio_path: &audio,
+        })
+        .await
+        .unwrap();
+        let request = request_rx.await.unwrap();
+        let _ = std::fs::remove_file(audio);
+
+        assert_eq!(result, "Hello Deepgram");
+        assert!(request.starts_with("POST /v1/listen?"));
+        assert!(request.contains("model=nova-3"));
+        assert!(request.contains("smart_format=true"));
+        assert!(request.contains("keyterm=VoxKey"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: token dg-key")
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("content-type: audio/wav")
+        );
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_sends_xi_api_key_and_scribe_model() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            write_json_response(&mut socket, r#"{"text":"Hello Scribe"}"#).await;
+            let _ = request_tx.send(request);
+        });
+
+        let audio = persistent_test_wav("voxkey_elevenlabs_http_");
+        let endpoint = format!("http://{addr}/v1/speech-to-text");
+        let client = reqwest::Client::new();
+        let result = transcribe_elevenlabs(CloudBatchRequest {
+            client: &client,
+            protocol: voxkey_ipc::cloud::CloudProtocol::ElevenLabsScribe,
+            name: "ElevenLabs",
+            api_key: "el-key",
+            model: "scribe_v2",
+            endpoint: &endpoint,
+            allow_insecure_http: false,
+            prompt: None,
+            vocabulary: &["VoxKey".to_string()],
+            purpose: Purpose::Final,
+            audio_path: &audio,
+        })
+        .await
+        .unwrap();
+        let request = request_rx.await.unwrap();
+        let _ = std::fs::remove_file(audio);
+
+        assert_eq!(result, "Hello Scribe");
+        assert!(request.contains("name=\"file\""));
+        assert!(request.contains("name=\"model_id\""));
+        assert!(request.contains("scribe_v2"));
+        assert!(request.contains("name=\"keyterms\""));
+        assert!(request.contains(r#"["VoxKey"]"#));
+        assert!(request.to_ascii_lowercase().contains("xi-api-key: el-key"));
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
+    }
+
+    #[tokio::test]
+    async fn assemblyai_uploads_then_creates_transcript_with_speech_models() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            for step in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                let body = match step {
+                    0 => r#"{"upload_url":"https://assembly.example/audio"}"#,
+                    1 => r#"{"id":"tx_1","status":"queued"}"#,
+                    _ => r#"{"id":"tx_1","status":"completed","text":"Hello Assembly"}"#,
+                };
+                write_json_response(&mut socket, body).await;
+                let _ = request_tx.send(request).await;
+            }
+        });
+
+        let audio = persistent_test_wav("voxkey_assemblyai_http_");
+        let endpoint = format!("http://{addr}");
+        let client = reqwest::Client::new();
+        let result = transcribe_assemblyai(CloudBatchRequest {
+            client: &client,
+            protocol: voxkey_ipc::cloud::CloudProtocol::AssemblyAiPreRecorded,
+            name: "AssemblyAI",
+            api_key: "aa-key",
+            model: "universal-3-5-pro",
+            endpoint: &endpoint,
+            allow_insecure_http: false,
+            prompt: None,
+            vocabulary: &["VoxKey".to_string()],
+            purpose: Purpose::Final,
+            audio_path: &audio,
+        })
+        .await
+        .unwrap();
+        let upload = request_rx.recv().await.unwrap();
+        let create = request_rx.recv().await.unwrap();
+        let poll = request_rx.recv().await.unwrap();
+        let _ = std::fs::remove_file(audio);
+
+        assert_eq!(result, "Hello Assembly");
+        assert!(upload.starts_with("POST /v2/upload "));
+        assert!(
+            upload
+                .to_ascii_lowercase()
+                .contains("authorization: aa-key")
+        );
+        assert!(
+            upload
+                .to_ascii_lowercase()
+                .contains("content-type: application/octet-stream")
+        );
+        assert!(
+            !upload
+                .to_ascii_lowercase()
+                .contains("authorization: bearer")
+        );
+        assert!(create.starts_with("POST /v2/transcript "));
+        assert!(create.contains("\"speech_models\""));
+        assert!(create.contains("\"universal-3-5-pro\""));
+        assert!(create.contains("\"language_detection\":true"));
+        assert!(create.contains("\"keyterms_prompt\""));
+        assert!(create.contains("\"VoxKey\""));
+        assert!(!create.contains("\"speech_model\""));
+        assert!(poll.starts_with("GET /v2/transcript/tx_1 "));
+        assert!(poll.to_ascii_lowercase().contains("authorization: aa-key"));
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_http_sends_a_long_recording_as_one_request() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        async fn read_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
             let mut buffer = [0_u8; 4096];
             loop {
@@ -3316,62 +4318,15 @@ mod tests {
                     break;
                 }
             }
-            request
-        }
-
-        fn uploaded_wav_duration(request: &[u8]) -> f64 {
-            let wav_start = request
-                .windows(4)
-                .position(|part| part == b"RIFF")
-                .expect("multipart request did not contain a WAV file");
-            let reader = hound::WavReader::new(std::io::Cursor::new(&request[wav_start..]))
-                .expect("uploaded file was not a readable WAV");
-            f64::from(reader.duration()) / f64::from(reader.spec().sample_rate)
-        }
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let durations = Arc::new(Mutex::new(Vec::new()));
-        let server_durations = durations.clone();
-        tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for _ in 0..2 {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let request = read_request(&mut socket).await;
-                let duration = uploaded_wav_duration(&request);
-                server_durations.lock().unwrap().push(duration);
-                requests.push((socket, duration));
-            }
-
-            // Wait for both uploads before answering either one. This models a
-            // server that processes independent chunks concurrently and makes
-            // a sequential client hit the timeout below.
-            for (mut socket, duration) in requests {
-                let successful_text = if duration > 100.0 {
-                    "alpha boundary words"
-                } else {
-                    "boundary words omega"
-                };
-                let (status, body) = if duration > 120.0 {
-                    (
-                        "422 Unprocessable Entity",
-                        r#"{"error":{"message":"The WAV duration exceeds the configured limit."}}"#
-                            .to_string(),
-                    )
-                } else {
-                    ("200 OK", format!(r#"{{"text":"{successful_text}"}}"#))
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
+            let body = r#"{"text":"one request"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = request_tx.send(request.len());
         });
 
-        // A low sample rate keeps this 121-second regression fixture tiny.
-        // The real server rejects anything above 120 seconds regardless of
-        // byte size, which is exactly the production failure being replayed.
         let wav = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
         let spec = hound::WavSpec {
             channels: 1,
@@ -3387,34 +4342,23 @@ mod tests {
 
         let client = reqwest::Client::new();
         let endpoint = format!("http://{address}/v1/audio/transcriptions");
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            transcribe_parakeet_http(ModelServerTranscription {
-                server: ModelServer {
-                    client: &client,
-                    api_key: "",
-                    model: "parakeet-tdt-0.6b-v3",
-                    endpoint: &endpoint,
-                    allow_insecure_http: false,
-                    prompt: None,
-                },
-                purpose: Purpose::Final,
-                audio_path: wav.path(),
-            }),
-        )
+        let transcript = transcribe_parakeet_http(ModelServerTranscription {
+            server: ModelServer {
+                client: &client,
+                api_key: "",
+                model: "whisper-1",
+                endpoint: &endpoint,
+                allow_insecure_http: false,
+                prompt: None,
+            },
+            purpose: Purpose::Final,
+            audio_path: wav.path(),
+        })
         .await
-        .expect("chunk uploads did not run concurrently");
-        let transcript =
-            result.unwrap_or_else(|error| panic!("long recording was not transcribed: {error}"));
+        .unwrap();
 
-        assert_eq!(transcript, "alpha boundary words omega");
-        let durations = durations.lock().unwrap();
-        assert_eq!(durations.len(), 2, "expected two bounded uploads");
-        assert!(durations.iter().all(|duration| *duration <= 120.0));
-        assert!(
-            durations.iter().sum::<f64>() > 121.0,
-            "chunks need overlap so words at a boundary are not cut off"
-        );
+        assert_eq!(transcript, "one request");
+        let _ = request_rx.await.unwrap();
     }
 
     #[tokio::test]

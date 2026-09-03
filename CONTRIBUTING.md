@@ -10,11 +10,14 @@ files in order:
 
 ### 1. Define config types (`voxkey-ipc/src/lib.rs`)
 
-- Add a config struct (e.g. `DeepgramConfig`) with non-secret fields such as
-  `model` and `endpoint`
+- Add an entry to `CLOUD_PROVIDERS` in `voxkey-ipc/src/cloud.rs` with the live
+  protocol, default endpoint, model, and keyring service
+- Add a variant to the `TranscriberProvider` enum if this is a named service
+- Reuse `CloudSttConfig` for non-secret fields (`model`, `endpoint`) unless the
+  provider needs a dedicated struct
 - Implement `Default` with sensible defaults
-- Add a variant to the `TranscriberProvider` enum
-- Add the config struct as a field on `TranscriberConfig`
+- Add the config struct as a field on `TranscriberConfig` if it is not already
+  covered by the shared cloud catalog
 
 ### 2. Implement the backend (`src/transcriber.rs`)
 

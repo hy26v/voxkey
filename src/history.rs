@@ -440,19 +440,45 @@ where
 }
 
 fn provider_label(config: &TranscriberConfig) -> String {
+    if let Some(cloud) = config.cloud() {
+        return if cloud.provider == TranscriberProvider::OpenAiCompatible {
+            let model = config
+                .cloud_model()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .unwrap_or(cloud.default_model);
+            if model == cloud.default_model {
+                "Transcription server".to_string()
+            } else {
+                format!("{model} Server")
+            }
+        } else {
+            cloud.name.to_string()
+        };
+    }
     match config.provider {
         TranscriberProvider::WhisperCpp => "Whisper.cpp".to_string(),
-        TranscriberProvider::Mistral => "Mistral".to_string(),
-        TranscriberProvider::MistralRealtime => "Mistral Realtime".to_string(),
         TranscriberProvider::Parakeet => {
             let model = voxkey_ipc::model_library::local_model(&config.parakeet.model)
                 .map(|model| model.name)
                 .unwrap_or(&config.parakeet.model);
             match config.parakeet.backend {
                 voxkey_ipc::ParakeetBackend::Local => model.to_string(),
-                voxkey_ipc::ParakeetBackend::Http => format!("{model} Server"),
+                voxkey_ipc::ParakeetBackend::Http => {
+                    let server_model = config.parakeet.server_model.trim();
+                    if server_model.is_empty() {
+                        "Transcription server".to_string()
+                    } else {
+                        format!("{server_model} Server")
+                    }
+                }
             }
         }
+        _ => config
+            .provider
+            .cloud()
+            .map(|cloud| cloud.name.to_string())
+            .unwrap_or_else(|| "Transcription".to_string()),
     }
 }
 
@@ -1170,6 +1196,27 @@ mod tests {
     #[test]
     fn provider_label_uses_the_name_shown_in_settings() {
         assert_eq!(provider_label(&TranscriberConfig::default()), "Whisper.cpp");
+        assert_eq!(
+            provider_label(&TranscriberConfig {
+                provider: TranscriberProvider::OpenAi,
+                ..Default::default()
+            }),
+            "OpenAI"
+        );
+        assert_eq!(
+            provider_label(&TranscriberConfig {
+                provider: TranscriberProvider::Deepgram,
+                ..Default::default()
+            }),
+            "Deepgram"
+        );
+        assert_eq!(
+            provider_label(&TranscriberConfig {
+                provider: TranscriberProvider::OpenAiCompatible,
+                ..Default::default()
+            }),
+            "Transcription server"
+        );
     }
 
     #[test]
@@ -1184,6 +1231,34 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(provider_label(&config), "Parakeet v3 Server");
+        assert_eq!(provider_label(&config), "Transcription server");
+
+        let named = TranscriberConfig {
+            provider: TranscriberProvider::Parakeet,
+            parakeet: voxkey_ipc::ParakeetConfig {
+                model: "parakeet-tdt-0.6b-v3".to_string(),
+                backend: voxkey_ipc::ParakeetBackend::Http,
+                server_model: "whisper-large-v3".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(provider_label(&named), "whisper-large-v3 Server");
+    }
+
+    #[test]
+    fn provider_label_names_catalogued_cloud_services() {
+        for cloud in voxkey_ipc::cloud::CLOUD_PROVIDERS {
+            let config = TranscriberConfig {
+                provider: cloud.provider,
+                ..Default::default()
+            };
+            let expected = if cloud.provider == TranscriberProvider::OpenAiCompatible {
+                "Transcription server"
+            } else {
+                cloud.name
+            };
+            assert_eq!(provider_label(&config), expected, "{}", cloud.id);
+        }
     }
 }

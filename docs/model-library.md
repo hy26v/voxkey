@@ -82,21 +82,52 @@ This is a compatibility decision, not a quality ranking. A model becomes a
 library candidate when Voxkey can install it safely and run it end to end from
 the RPM without asking the user to assemble a second toolchain.
 
-## Transcription server contract
+## Cloud and transcription servers
 
-Every catalog model can instead be selected with **Run model → On a server**.
-Voxkey sends an OpenAI-compatible multipart `POST` to the configured address:
+Choose a named cloud engine in **Transcription** to connect OpenAI, Groq,
+Mistral, Mistral Realtime, Deepgram, AssemblyAI, or ElevenLabs on that
+provider's live API. Each stores its own model name, endpoint override, and
+desktop-keyring credential. None of these daemon integrations use OAuth;
+browser-only tokens (`rt_*`, ElevenLabs single-use frontend tokens) are not
+required because Voxkey can set HTTP and WebSocket headers directly.
+
+| Engine | Auth | Live request |
+| --- | --- | --- |
+| OpenAI, Groq | `Authorization: Bearer` | multipart `file`, `model`, `response_format=json`, optional `prompt` |
+| Mistral | `Authorization: Bearer` and `x-api-key` | multipart `file`, `model`, optional `context_bias` |
+| Mistral Realtime | `Authorization: Bearer` on the WebSocket | `session.update` (`pcm_s16le`), `input_audio.append`, `input_audio.end` |
+| Deepgram | `Authorization: Token` | raw WAV, `model` + `smart_format=true`, optional repeated `keyterm` |
+| AssemblyAI | `authorization` with the raw key (no `Bearer`) | upload as `application/octet-stream`, then JSON `speech_models` and optional `keyterms_prompt` |
+| ElevenLabs | `xi-api-key` | multipart `file`, `model_id`, optional `keyterms` |
+
+Choose **OpenAI-compatible server** to connect any speech-to-text
+service that implements the [OpenAI Audio Transcriptions](https://platform.openai.com/docs/api-reference/audio/createTranscription)
+HTTP format (`POST /v1/audio/transcriptions`). Compatible servers include
+Speaches, LocalAI, and whisper.cpp's OpenAI-compatible route.
+
+Voxkey sends one multipart request to that compatible contract:
 
 - `file`: the recorded WAV
-- `model`: the selected catalog ID (or a preserved custom ID)
+- `model`: the name the server expects (default `whisper-1`; set **Model name**
+  or `openai_compatible.model` in config)
+- `response_format`: `json`
 - `prompt`: optional important vocabulary
 - `Authorization: Bearer …`: optional, when a server API key is saved
 
-The server returns JSON containing a `text` field. Voxkey stores the optional
-key in the desktop keyring, checks the route without sending audio or the key,
-requires HTTPS for public servers, and allows plain HTTP only for loopback or
-an explicitly approved literal private-network address. Long recordings are
-split into bounded overlapping requests and merged at word boundaries.
+The catalog local-model IDs are not sent. A custom HTTP service can still be
+used by choosing **OpenAI-compatible server** and setting **Model name** to
+that service's model id.
+
+The server may return JSON `{"text":"..."}`, `verbose_json` with `segments`,
+or plain UTF-8 text. An OpenAI-style `{"error":{"message":"..."}}` body is
+treated as a failure. Voxkey stores the optional key in the desktop keyring,
+checks the route without sending audio or the key, requires HTTPS for public
+servers, and allows plain HTTP only for loopback or an explicitly approved
+literal private-network address. The whole recording is sent in one request
+(up to 64 MiB).
+
+Downloadable catalog models always run on this computer. Voxkey downloads their
+sherpa-onnx artifacts, verifies checksums, and hosts the recognizer in-process.
 
 ## Catalog maintenance rules
 

@@ -27,9 +27,9 @@ const SHELL_EXTENSION_RESTART_ACTION: &str = "Log Out…";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointKind {
-    MistralBatch,
+    CloudHttp,
     MistralRealtime,
-    ParakeetHttp,
+    OpenAiCompatible,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,10 +66,26 @@ impl LastErrorState {
     }
 }
 
-const LOCAL_MODEL_CHOICE_START: u32 = 3;
+const WHISPER_CHOICE: u32 = 0;
+const CLOUD_CHOICE_START: u32 = 1;
+const LOCAL_MODEL_CHOICE_START: u32 =
+    CLOUD_CHOICE_START + voxkey_ipc::cloud::CLOUD_PROVIDERS.len() as u32;
 const STANDARD_TRANSCRIBER_CHOICES: u32 =
     LOCAL_MODEL_CHOICE_START + voxkey_ipc::model_library::LOCAL_MODELS.len() as u32;
 const CUSTOM_PARAKEET_CHOICE: u32 = STANDARD_TRANSCRIBER_CHOICES;
+
+fn cloud_for_choice(choice: u32) -> Option<&'static voxkey_ipc::cloud::CloudProvider> {
+    choice
+        .checked_sub(CLOUD_CHOICE_START)
+        .and_then(|index| voxkey_ipc::cloud::CLOUD_PROVIDERS.get(index as usize))
+}
+
+fn choice_for_cloud(provider: voxkey_ipc::TranscriberProvider) -> Option<u32> {
+    voxkey_ipc::cloud::CLOUD_PROVIDERS
+        .iter()
+        .position(|cloud| cloud.provider == provider)
+        .map(|index| CLOUD_CHOICE_START + index as u32)
+}
 
 fn local_model_for_choice(choice: u32) -> Option<&'static voxkey_ipc::model_library::LocalModel> {
     choice
@@ -84,6 +100,10 @@ fn choice_for_local_model(model_id: &str) -> Option<u32> {
         .map(|index| LOCAL_MODEL_CHOICE_START + index as u32)
 }
 
+fn transcriber_choice_is_local_model(choice: u32) -> bool {
+    local_model_for_choice(choice).is_some() || choice == CUSTOM_PARAKEET_CHOICE
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TranscriberChoicePresentation {
     selected: u32,
@@ -96,46 +116,36 @@ struct TranscriberSetupCopy {
     description: &'static str,
 }
 
-fn transcriber_setup_copy(selected: u32, parakeet_backend_selected: u32) -> TranscriberSetupCopy {
-    match selected {
-        0 => TranscriberSetupCopy {
+fn transcriber_setup_copy(selected: u32) -> TranscriberSetupCopy {
+    if selected == WHISPER_CHOICE {
+        return TranscriberSetupCopy {
             title: "Whisper.cpp setup",
             description: "Choose its executable and model; expert mode adds command arguments",
-        },
-        1 => TranscriberSetupCopy {
-            title: "Mistral setup",
-            description: "Store your API key and choose the batch transcription model",
-        },
-        2 => TranscriberSetupCopy {
-            title: "Mistral Realtime setup",
-            description: "Store your API key and choose the realtime transcription model",
-        },
-        3.. if parakeet_backend_selected == 1 => TranscriberSetupCopy {
-            title: "Model server setup",
-            description: "Connect an OpenAI-compatible endpoint for finished recordings",
-        },
-        _ => TranscriberSetupCopy {
-            title: "Local model setup",
-            description: "Download and run speech models privately on this computer",
-        },
+        };
+    }
+    if let Some(cloud) = cloud_for_choice(selected) {
+        return TranscriberSetupCopy {
+            title: cloud.setup_title,
+            description: cloud.setup_description,
+        };
+    }
+    TranscriberSetupCopy {
+        title: "Local model setup",
+        description: "Download and run speech models privately on this computer",
     }
 }
 
-fn apply_transcriber_setup_copy(
-    group: &adw::PreferencesGroup,
-    selected: u32,
-    parakeet_backend_selected: u32,
-) {
-    let copy = transcriber_setup_copy(selected, parakeet_backend_selected);
+fn apply_transcriber_setup_copy(group: &adw::PreferencesGroup, selected: u32) {
+    let copy = transcriber_setup_copy(selected);
     group.set_title(copy.title);
     group.set_description(Some(copy.description));
 }
 
-fn transcriber_location_icon_name(selected: u32, parakeet_backend_selected: u32) -> &'static str {
-    match selected {
-        1 | 2 => "network-server-symbolic",
-        3.. if parakeet_backend_selected == 1 => "network-server-symbolic",
-        _ => "computer-symbolic",
+fn transcriber_location_icon_name(selected: u32) -> &'static str {
+    if selected == WHISPER_CHOICE || transcriber_choice_is_local_model(selected) {
+        "computer-symbolic"
+    } else {
+        "network-server-symbolic"
     }
 }
 
@@ -151,12 +161,11 @@ fn transcriber_choice_presentation(
     config: &voxkey_ipc::TranscriberConfig,
 ) -> TranscriberChoicePresentation {
     let selected = match config.provider {
-        voxkey_ipc::TranscriberProvider::WhisperCpp => 0,
-        voxkey_ipc::TranscriberProvider::Mistral => 1,
-        voxkey_ipc::TranscriberProvider::MistralRealtime => 2,
+        voxkey_ipc::TranscriberProvider::WhisperCpp => WHISPER_CHOICE,
         voxkey_ipc::TranscriberProvider::Parakeet => {
             choice_for_local_model(&config.parakeet.model).unwrap_or(CUSTOM_PARAKEET_CHOICE)
         }
+        provider => choice_for_cloud(provider).unwrap_or(WHISPER_CHOICE),
     };
     TranscriberChoicePresentation {
         selected,
@@ -208,7 +217,7 @@ impl EndpointEditor {
         let entry_icon = gtk4::Image::from_icon_name("network-server-symbolic");
         entry_icon.add_css_class("dim-label");
         entry.add_prefix(&entry_icon);
-        let insecure_http_row = (kind == EndpointKind::ParakeetHttp).then(|| {
+        let insecure_http_row = (kind == EndpointKind::OpenAiCompatible).then(|| {
             let row = adw::SwitchRow::builder()
                 .title("Allow unencrypted LAN audio")
                 .subtitle(
@@ -321,7 +330,7 @@ impl EndpointEditor {
     }
 
     fn show_saved(&self) {
-        if self.kind == EndpointKind::ParakeetHttp && self.entry.text().trim().is_empty() {
+        if self.kind == EndpointKind::OpenAiCompatible && self.entry.text().trim().is_empty() {
             self.status.set_title("Server address needed");
             self.status
                 .set_subtitle("Enter the transcription server address, then check and save it");
@@ -409,27 +418,11 @@ impl EndpointEditor {
 /// Return the keyring service used by the active transcription path. Local
 /// models deliberately return None so they never wake or prompt the keyring.
 fn transcriber_api_service(config: &voxkey_ipc::TranscriberConfig) -> Option<&'static str> {
-    match config.provider {
-        voxkey_ipc::TranscriberProvider::Mistral => Some(voxkey_ipc::API_KEY_SERVICE_MISTRAL),
-        voxkey_ipc::TranscriberProvider::MistralRealtime => {
-            Some(voxkey_ipc::API_KEY_SERVICE_MISTRAL_REALTIME)
-        }
-        voxkey_ipc::TranscriberProvider::Parakeet
-            if config.parakeet.backend == voxkey_ipc::ParakeetBackend::Http =>
-        {
-            Some(voxkey_ipc::API_KEY_SERVICE_MODEL_SERVER)
-        }
-        _ => None,
-    }
+    config.provider.api_key_service()
 }
 
 fn api_key_provider_name(provider: &voxkey_ipc::TranscriberProvider) -> Option<&'static str> {
-    match provider {
-        voxkey_ipc::TranscriberProvider::Mistral => Some("Mistral"),
-        voxkey_ipc::TranscriberProvider::MistralRealtime => Some("Mistral Realtime"),
-        voxkey_ipc::TranscriberProvider::Parakeet => Some("Model server"),
-        _ => None,
-    }
+    provider.cloud().map(|cloud| cloud.name)
 }
 
 fn api_key_saved_message(provider: &voxkey_ipc::TranscriberProvider) -> Option<String> {
@@ -564,11 +557,10 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         .description("Choose where and how Voxkey turns speech into text")
         .build();
 
-    let provider_model = gtk4::StringList::new(&[
-        "Whisper.cpp (local)",
-        "Mistral (cloud)",
-        "Mistral Realtime (cloud)",
-    ]);
+    let provider_model = gtk4::StringList::new(&["Whisper.cpp (local)"]);
+    for cloud in voxkey_ipc::cloud::CLOUD_PROVIDERS {
+        provider_model.append(cloud.combo_label);
+    }
     for model in voxkey_ipc::model_library::LOCAL_MODELS {
         provider_model.append(&format!("{} ({})", model.name, model.language_summary));
     }
@@ -584,7 +576,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     transcription_group.add(&provider_row);
 
     let model_configuration_group = adw::PreferencesGroup::new();
-    apply_transcriber_setup_copy(&model_configuration_group, provider_row.selected(), 0);
+    apply_transcriber_setup_copy(&model_configuration_group, provider_row.selected());
 
     let command_row = adw::EntryRow::builder()
         .title("Whisper executable")
@@ -639,7 +631,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         .show_apply_button(true)
         .build();
     set_monospace_entry_text(&model_row);
-    let batch_endpoint = EndpointEditor::new(EndpointKind::MistralBatch, "Mistral batch server");
+    let batch_endpoint = EndpointEditor::new(EndpointKind::CloudHttp, "API server");
     let realtime_endpoint =
         EndpointEditor::new(EndpointKind::MistralRealtime, "Mistral Realtime server");
     model_configuration_group.add(&api_key_status_row);
@@ -653,52 +645,23 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     // Downloadable local-model sub-rows
     let parakeet_backend_model = gtk4::StringList::new(&["On this computer", "On a server"]);
     let parakeet_backend_row = adw::ComboRow::builder()
-        .title("Run model")
+        .title("Where to transcribe")
         .model(&parakeet_backend_model)
         .build();
     {
         let model_configuration_group = model_configuration_group.clone();
-        let parakeet_backend_row = parakeet_backend_row.clone();
         provider_row.connect_selected_notify(move |row| {
-            apply_transcriber_setup_copy(
-                &model_configuration_group,
-                row.selected(),
-                parakeet_backend_row.selected(),
-            );
-        });
-    }
-    {
-        let model_configuration_group = model_configuration_group.clone();
-        let provider_row = provider_row.clone();
-        parakeet_backend_row.connect_selected_notify(move |row| {
-            apply_transcriber_setup_copy(
-                &model_configuration_group,
-                provider_row.selected(),
-                row.selected(),
-            );
+            apply_transcriber_setup_copy(&model_configuration_group, row.selected());
         });
     }
     {
         let provider_icon = provider_icon.clone();
-        let parakeet_backend_row = parakeet_backend_row.clone();
         provider_row.connect_selected_notify(move |row| {
-            provider_icon.set_icon_name(Some(transcriber_location_icon_name(
-                row.selected(),
-                parakeet_backend_row.selected(),
-            )));
+            provider_icon.set_icon_name(Some(transcriber_location_icon_name(row.selected())));
         });
     }
-    {
-        let provider_icon = provider_icon.clone();
-        let provider_row = provider_row.clone();
-        parakeet_backend_row.connect_selected_notify(move |row| {
-            provider_icon.set_icon_name(Some(transcriber_location_icon_name(
-                provider_row.selected(),
-                row.selected(),
-            )));
-        });
-    }
-    let parakeet_endpoint = EndpointEditor::new(EndpointKind::ParakeetHttp, "Transcription server");
+    let parakeet_endpoint =
+        EndpointEditor::new(EndpointKind::OpenAiCompatible, "Transcription server");
     let execution_provider_model =
         gtk4::StringList::new(&["Automatic", "CPU", "NVIDIA GPU (CUDA)"]);
     let execution_provider_row = adw::ComboRow::builder()
@@ -816,24 +779,8 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     }
     {
         let preload_model_row = preload_model_row.clone();
-        let parakeet_backend_row = parakeet_backend_row.clone();
         provider_row.connect_selected_notify(move |row| {
-            preload_model_row.set_visible(
-                (local_model_for_choice(row.selected()).is_some()
-                    || row.selected() == CUSTOM_PARAKEET_CHOICE)
-                    && parakeet_backend_row.selected() == 0,
-            );
-        });
-    }
-    {
-        let preload_model_row = preload_model_row.clone();
-        let provider_row = provider_row.clone();
-        parakeet_backend_row.connect_selected_notify(move |row| {
-            preload_model_row.set_visible(
-                (local_model_for_choice(provider_row.selected()).is_some()
-                    || provider_row.selected() == CUSTOM_PARAKEET_CHOICE)
-                    && row.selected() == 0,
-            );
+            preload_model_row.set_visible(transcriber_choice_is_local_model(row.selected()));
         });
     }
 
@@ -4522,35 +4469,35 @@ fn transcriber_visibility(
     expert_mode: bool,
 ) -> TranscriberVisibility {
     let is_whisper = config.provider == voxkey_ipc::TranscriberProvider::WhisperCpp;
-    let is_parakeet = config.provider == voxkey_ipc::TranscriberProvider::Parakeet;
-    let is_mistral_batch = config.provider == voxkey_ipc::TranscriberProvider::Mistral;
-    let is_mistral_realtime = config.provider == voxkey_ipc::TranscriberProvider::MistralRealtime;
-    let is_mistral_api = is_mistral_batch || is_mistral_realtime;
-    let is_parakeet_http =
-        is_parakeet && config.parakeet.backend == voxkey_ipc::ParakeetBackend::Http;
-    let is_parakeet_local = is_parakeet && !is_parakeet_http;
-    let custom_mistral_model = if is_mistral_realtime {
-        config.mistral_realtime.model != voxkey_ipc::MistralRealtimeConfig::DEFAULT_MODEL
-    } else {
-        config.mistral.model != voxkey_ipc::MistralConfig::DEFAULT_MODEL
-    };
+    let is_local_model = config.provider == voxkey_ipc::TranscriberProvider::Parakeet;
+    let cloud = config.cloud();
+    let is_realtime = cloud.is_some_and(|item| item.streaming);
+    let is_compatible = config.provider == voxkey_ipc::TranscriberProvider::OpenAiCompatible;
+    let is_http_cloud = cloud.is_some() && !is_realtime && !is_compatible;
+    let custom_model = cloud.is_some_and(|item| {
+        let stored = config.cloud_model().unwrap_or("");
+        !stored.trim().is_empty() && stored.trim() != item.default_model
+    });
+    let custom_endpoint = cloud.is_some_and(|item| {
+        let stored = config.cloud_endpoint().unwrap_or("");
+        !stored.trim().is_empty() && stored.trim() != item.default_endpoint
+    });
 
     TranscriberVisibility {
         whisper_command: is_whisper,
         whisper_model: is_whisper,
         whisper_arguments: is_whisper
             && (expert_mode || whisper_has_advanced_arguments(&config.whisper_cpp.args)),
-        api_key: is_mistral_api || is_parakeet_http,
-        model_name: is_mistral_api && (expert_mode || custom_mistral_model),
-        batch_endpoint: is_mistral_batch && (expert_mode || !config.mistral.endpoint.is_empty()),
-        realtime_endpoint: is_mistral_realtime
-            && (expert_mode || !config.mistral_realtime.endpoint.is_empty()),
-        parakeet_backend: is_parakeet && (expert_mode || is_parakeet_http),
-        parakeet_endpoint: is_parakeet_http,
-        execution_provider: is_parakeet_local
+        api_key: cloud.is_some(),
+        model_name: is_compatible || (cloud.is_some() && (expert_mode || custom_model)),
+        batch_endpoint: is_http_cloud && (expert_mode || custom_endpoint),
+        realtime_endpoint: is_realtime && (expert_mode || custom_endpoint),
+        parakeet_backend: false,
+        parakeet_endpoint: is_compatible,
+        execution_provider: is_local_model
             && (expert_mode
                 || config.parakeet.execution_provider != voxkey_ipc::ExecutionProviderChoice::Auto),
-        model_status: is_parakeet_local,
+        model_status: is_local_model,
     }
 }
 
@@ -4586,6 +4533,37 @@ fn apply_transcriber_visibility(
     model_status_row.set_visible(visibility.model_status);
 }
 
+fn sync_model_name_row(
+    row: &adw::EntryRow,
+    config: &voxkey_ipc::TranscriberConfig,
+    previous: Option<&voxkey_ipc::TranscriberConfig>,
+    preserve_dirty: bool,
+) {
+    let Some(cloud) = config.cloud() else {
+        return;
+    };
+
+    row.set_title(if cloud.endpoint_required {
+        "Model name"
+    } else {
+        "Cloud model"
+    });
+    let active_model = config.cloud_model().unwrap_or("");
+    match previous {
+        Some(previous) => {
+            let previous_model = previous.cloud_model().unwrap_or("");
+            set_entry_with_default_if_clean(
+                row,
+                previous_model,
+                active_model,
+                cloud.default_model,
+                preserve_dirty,
+            );
+        }
+        None => set_entry_with_default(row, active_model, cloud.default_model),
+    }
+}
+
 /// Parse transcriber config JSON and update all transcriber widgets.
 // GTK signal wiring naturally passes the related widget set together. Keeping
 // the concrete widget types visible here makes these updates straightforward
@@ -4616,12 +4594,17 @@ fn apply_transcriber_config_to_widgets(
     expert_mode: &Rc<Cell<bool>>,
     preserve_dirty: bool,
 ) {
-    let Ok(tc) = serde_json::from_str::<voxkey_ipc::TranscriberConfig>(config_json) else {
+    let Ok(mut tc) = serde_json::from_str::<voxkey_ipc::TranscriberConfig>(config_json) else {
         return;
     };
+    tc.migrate_nested_http_server();
+    if tc.provider == voxkey_ipc::TranscriberProvider::Parakeet {
+        tc.parakeet.backend = voxkey_ipc::ParakeetBackend::Local;
+    }
 
     let previous = state.borrow().clone();
     let provider_changed = previous.provider != tc.provider;
+    let backend_changed = previous.parakeet.backend != tc.parakeet.backend;
 
     // Suppress notify handlers from sending config back to daemon while we update widgets.
     updating_widgets.set(true);
@@ -4653,28 +4636,26 @@ fn apply_transcriber_config_to_widgets(
         preserve_dirty,
     );
     update_whisper_model_row(whisper_model_row, &tc);
-    set_entry_with_default_if_clean(
-        &batch_endpoint.entry,
-        &previous.mistral.endpoint,
-        &tc.mistral.endpoint,
-        voxkey_ipc::MistralConfig::DEFAULT_ENDPOINT,
-        preserve_dirty,
-    );
+    sync_http_endpoint_editor(batch_endpoint, &previous, &tc, preserve_dirty);
     set_entry_with_default_if_clean(
         &realtime_endpoint.entry,
-        &previous.mistral_realtime.endpoint,
-        &tc.mistral_realtime.endpoint,
+        previous.cloud_endpoint().unwrap_or(""),
+        tc.cloud_endpoint().unwrap_or(""),
         voxkey_ipc::MistralRealtimeConfig::DEFAULT_ENDPOINT,
         preserve_dirty,
     );
     set_entry_text_if_clean(
         &parakeet_endpoint.entry,
-        &previous.parakeet.endpoint,
-        &tc.parakeet.endpoint,
+        previous
+            .cloud()
+            .filter(|cloud| cloud.endpoint_required)
+            .and_then(|_| previous.cloud_endpoint())
+            .unwrap_or(previous.parakeet.endpoint.as_str()),
+        tc.cloud_endpoint().unwrap_or(""),
         preserve_dirty,
     );
     parakeet_endpoint.sync_insecure_http_permission(
-        tc.parakeet.allow_insecure_http,
+        tc.allow_insecure_http(),
         preserve_dirty && !provider_changed,
     );
     if !preserve_dirty || provider_changed {
@@ -4682,19 +4663,10 @@ fn apply_transcriber_config_to_widgets(
         realtime_endpoint.show_saved();
         parakeet_endpoint.show_saved();
     }
-    parakeet_backend_row.set_selected(match tc.parakeet.backend {
-        voxkey_ipc::ParakeetBackend::Local => 0,
-        voxkey_ipc::ParakeetBackend::Http => 1,
-    });
+    parakeet_backend_row.set_selected(0);
 
-    // Show only controls belonging to the selected model and backend.
-    let is_whisper = tc.provider == voxkey_ipc::TranscriberProvider::WhisperCpp;
-    let is_parakeet = tc.provider == voxkey_ipc::TranscriberProvider::Parakeet;
-    let is_mistral_api = !is_whisper && !is_parakeet;
-    let uses_api_key =
-        is_mistral_api || (is_parakeet && tc.parakeet.backend == voxkey_ipc::ParakeetBackend::Http);
-    let is_parakeet_local =
-        is_parakeet && tc.parakeet.backend == voxkey_ipc::ParakeetBackend::Local;
+    let uses_api_key = transcriber_api_service(&tc).is_some();
+    let is_parakeet_local = tc.provider == voxkey_ipc::TranscriberProvider::Parakeet;
 
     if provider_changed {
         api_key_stored.set(None);
@@ -4711,26 +4683,12 @@ fn apply_transcriber_config_to_widgets(
         );
     }
 
-    if is_mistral_api {
-        let (active_model, default_model) = match tc.provider {
-            voxkey_ipc::TranscriberProvider::MistralRealtime => (
-                &tc.mistral_realtime.model,
-                voxkey_ipc::MistralRealtimeConfig::DEFAULT_MODEL,
-            ),
-            _ => (&tc.mistral.model, voxkey_ipc::MistralConfig::DEFAULT_MODEL),
-        };
-        let previous_model = match previous.provider {
-            voxkey_ipc::TranscriberProvider::MistralRealtime => &previous.mistral_realtime.model,
-            _ => &previous.mistral.model,
-        };
-        set_entry_with_default_if_clean(
-            model_row,
-            previous_model,
-            active_model,
-            default_model,
-            preserve_dirty && !provider_changed,
-        );
-    }
+    sync_model_name_row(
+        model_row,
+        &tc,
+        Some(&previous),
+        preserve_dirty && !provider_changed && !backend_changed,
+    );
 
     if is_parakeet_local {
         let ep_idx = match tc.parakeet.execution_provider {
@@ -4768,10 +4726,7 @@ fn sync_preload_model_widget(config_json: &str, row: &adw::SwitchRow, updating: 
     };
     updating.set(true);
     row.set_active(config.parakeet.preload_model);
-    row.set_visible(
-        config.provider == voxkey_ipc::TranscriberProvider::Parakeet
-            && config.parakeet.backend == voxkey_ipc::ParakeetBackend::Local,
-    );
+    row.set_visible(config.provider == voxkey_ipc::TranscriberProvider::Parakeet);
     updating.set(false);
 }
 
@@ -4787,25 +4742,39 @@ fn send_transcriber_config(
 }
 
 fn transcriber_location_subtitle(config: &voxkey_ipc::TranscriberConfig) -> &'static str {
-    match config.provider {
-        voxkey_ipc::TranscriberProvider::WhisperCpp => {
-            "Runs locally; recorded audio stays on this computer"
-        }
-        voxkey_ipc::TranscriberProvider::Parakeet => match config.parakeet.backend {
-            voxkey_ipc::ParakeetBackend::Local => {
-                "Runs locally; recorded audio stays on this computer"
-            }
-            voxkey_ipc::ParakeetBackend::Http => {
-                "Sends each finished recording to your transcription server"
-            }
-        },
-        voxkey_ipc::TranscriberProvider::Mistral => "Sends each finished recording to Mistral",
-        voxkey_ipc::TranscriberProvider::MistralRealtime => {
-            "Streams audio to Mistral while you speak"
-        }
+    if let Some(cloud) = config.cloud() {
+        return cloud.location_subtitle;
     }
+    "Runs locally; recorded audio stays on this computer"
 }
 
+fn sync_http_endpoint_editor(
+    editor: &EndpointEditor,
+    previous: &voxkey_ipc::TranscriberConfig,
+    current: &voxkey_ipc::TranscriberConfig,
+    preserve_dirty: bool,
+) {
+    let default_endpoint = current
+        .cloud()
+        .filter(|cloud| !cloud.streaming && !cloud.endpoint_required)
+        .map(|cloud| cloud.default_endpoint)
+        .unwrap_or(voxkey_ipc::MistralConfig::DEFAULT_ENDPOINT);
+    if let Some(cloud) = current
+        .cloud()
+        .filter(|cloud| !cloud.streaming && !cloud.endpoint_required)
+    {
+        editor.entry.set_title(&format!("{} server", cloud.name));
+    }
+    set_entry_with_default_if_clean(
+        &editor.entry,
+        previous.cloud_endpoint().unwrap_or(""),
+        current.cloud_endpoint().unwrap_or(""),
+        default_endpoint,
+        preserve_dirty,
+    );
+}
+
+#[cfg(test)]
 fn normalized_endpoint(raw: &str, default_endpoint: &str) -> String {
     let trimmed = raw.trim();
     if trimmed == default_endpoint {
@@ -4818,15 +4787,14 @@ fn normalized_endpoint(raw: &str, default_endpoint: &str) -> String {
 impl EndpointKind {
     fn saved_display(self, config: &voxkey_ipc::TranscriberConfig) -> String {
         match self {
-            Self::MistralBatch => displayed_entry_value(
-                &config.mistral.endpoint,
-                voxkey_ipc::MistralConfig::DEFAULT_ENDPOINT,
-            ),
-            Self::MistralRealtime => displayed_entry_value(
-                &config.mistral_realtime.endpoint,
-                voxkey_ipc::MistralRealtimeConfig::DEFAULT_ENDPOINT,
-            ),
-            Self::ParakeetHttp => config.parakeet.endpoint.clone(),
+            Self::CloudHttp | Self::MistralRealtime => {
+                let default = config
+                    .cloud()
+                    .map(|cloud| cloud.default_endpoint)
+                    .unwrap_or("");
+                displayed_entry_value(config.cloud_endpoint().unwrap_or(""), default)
+            }
+            Self::OpenAiCompatible => config.cloud_endpoint().unwrap_or("").to_string(),
         }
     }
 
@@ -4836,38 +4804,37 @@ impl EndpointKind {
         entered: &str,
     ) -> Result<(voxkey_ipc::TranscriberConfig, String), String> {
         let mut candidate = current.clone();
-        // Connectivity checks never need provider credentials. Keep that
-        // invariant even if a legacy in-memory config somehow contains one.
-        candidate.mistral.api_key.clear();
-        candidate.mistral_realtime.api_key.clear();
-        candidate.parakeet.api_key.clear();
+        candidate.clear_all_plaintext_api_keys();
         let stored = match self {
-            Self::MistralBatch => {
-                candidate.provider = voxkey_ipc::TranscriberProvider::Mistral;
-                let endpoint =
-                    normalized_endpoint(entered, voxkey_ipc::MistralConfig::DEFAULT_ENDPOINT);
-                candidate.mistral.endpoint = endpoint.clone();
+            Self::CloudHttp => {
+                let Some(cloud) = candidate.cloud() else {
+                    return Err("The selected model does not use a network server.".to_string());
+                };
+                if cloud.streaming || cloud.endpoint_required {
+                    return Err("The selected model does not use this server field.".to_string());
+                }
+                let endpoint = cloud.stored_endpoint(entered);
+                candidate.set_cloud_endpoint(endpoint.clone());
                 endpoint
             }
             Self::MistralRealtime => {
                 candidate.provider = voxkey_ipc::TranscriberProvider::MistralRealtime;
-                let endpoint = normalized_endpoint(
-                    entered,
-                    voxkey_ipc::MistralRealtimeConfig::DEFAULT_ENDPOINT,
-                );
-                candidate.mistral_realtime.endpoint = endpoint.clone();
+                let endpoint = candidate
+                    .cloud()
+                    .expect("Mistral Realtime is a catalogued cloud provider")
+                    .stored_endpoint(entered);
+                candidate.set_cloud_endpoint(endpoint.clone());
                 endpoint
             }
-            Self::ParakeetHttp => {
+            Self::OpenAiCompatible => {
                 let endpoint = entered.trim().to_string();
                 if endpoint.is_empty() {
                     return Err(
                         "Enter the transcription server address before checking it.".to_string()
                     );
                 }
-                candidate.provider = voxkey_ipc::TranscriberProvider::Parakeet;
-                candidate.parakeet.backend = voxkey_ipc::ParakeetBackend::Http;
-                candidate.parakeet.endpoint = endpoint.clone();
+                candidate.provider = voxkey_ipc::TranscriberProvider::OpenAiCompatible;
+                candidate.set_cloud_endpoint(endpoint.clone());
                 endpoint
             }
         };
@@ -4875,42 +4842,46 @@ impl EndpointKind {
     }
 
     fn stored_value(self, config: &voxkey_ipc::TranscriberConfig) -> String {
-        match self {
-            Self::MistralBatch => config.mistral.endpoint.clone(),
-            Self::MistralRealtime => config.mistral_realtime.endpoint.clone(),
-            Self::ParakeetHttp => config.parakeet.endpoint.clone(),
-        }
+        config.cloud_endpoint().unwrap_or("").to_string()
     }
 
     fn set_stored_value(self, config: &mut voxkey_ipc::TranscriberConfig, value: String) {
         match self {
-            Self::MistralBatch => config.mistral.endpoint = value,
-            Self::MistralRealtime => config.mistral_realtime.endpoint = value,
-            Self::ParakeetHttp => config.parakeet.endpoint = value,
+            Self::CloudHttp | Self::MistralRealtime | Self::OpenAiCompatible => {
+                if self == Self::OpenAiCompatible {
+                    config.provider = voxkey_ipc::TranscriberProvider::OpenAiCompatible;
+                }
+                config.set_cloud_endpoint(value);
+            }
         }
     }
 
     fn insecure_http_allowed(self, config: &voxkey_ipc::TranscriberConfig) -> bool {
-        self == Self::ParakeetHttp && config.parakeet.allow_insecure_http
+        self == Self::OpenAiCompatible && config.allow_insecure_http()
     }
 
     fn set_insecure_http_allowed(self, config: &mut voxkey_ipc::TranscriberConfig, allowed: bool) {
-        if self == Self::ParakeetHttp {
-            config.parakeet.allow_insecure_http = allowed;
+        if self == Self::OpenAiCompatible {
+            config.provider = voxkey_ipc::TranscriberProvider::OpenAiCompatible;
+            config.set_allow_insecure_http(allowed);
         }
     }
 
-    fn set_saved_entry(self, row: &adw::EntryRow, stored: &str) {
+    fn set_saved_entry(
+        self,
+        row: &adw::EntryRow,
+        stored: &str,
+        config: &voxkey_ipc::TranscriberConfig,
+    ) {
         match self {
-            Self::MistralBatch => {
-                set_entry_with_default(row, stored, voxkey_ipc::MistralConfig::DEFAULT_ENDPOINT)
+            Self::CloudHttp | Self::MistralRealtime => {
+                let default = config
+                    .cloud()
+                    .map(|cloud| cloud.default_endpoint)
+                    .unwrap_or("");
+                set_entry_with_default(row, stored, default);
             }
-            Self::MistralRealtime => set_entry_with_default(
-                row,
-                stored,
-                voxkey_ipc::MistralRealtimeConfig::DEFAULT_ENDPOINT,
-            ),
-            Self::ParakeetHttp => set_entry_text_without_apply(row, stored),
+            Self::OpenAiCompatible => set_entry_text_without_apply(row, stored),
         }
     }
 }
@@ -4967,9 +4938,9 @@ fn wire_endpoint_editor(
             if updating_widgets.get() {
                 return;
             }
-            debug_assert_eq!(editor.kind, EndpointKind::ParakeetHttp);
+            debug_assert_eq!(editor.kind, EndpointKind::OpenAiCompatible);
             let allowed = row.is_active();
-            let persisted = state.borrow().parakeet.allow_insecure_http;
+            let persisted = state.borrow().allow_insecure_http();
             editor.permission_dirty.set(allowed != persisted);
             editor.next_request();
             if allowed == persisted
@@ -4983,7 +4954,7 @@ fn wire_endpoint_editor(
             // passes its check, so consent and address are saved atomically.
             // Revoking consent is applied immediately for safety.
             if !allowed && persisted {
-                state.borrow_mut().parakeet.allow_insecure_http = false;
+                state.borrow_mut().set_allow_insecure_http(false);
                 editor.permission_dirty.set(false);
                 send_transcriber_config(&state, &handle);
             }
@@ -5085,7 +5056,9 @@ fn wire_endpoint_editor(
                     previous_insecure_http,
                     checked_insecure_http,
                 ) {
-                    editor.kind.set_saved_entry(&editor.entry, &stored);
+                    editor
+                        .kind
+                        .set_saved_entry(&editor.entry, &stored, &state.borrow());
                     editor.permission_dirty.set(false);
                     editor.show_reachable(&report.message);
                     return;
@@ -5118,7 +5091,9 @@ fn wire_endpoint_editor(
                 let save = handle.send(DaemonCommand::SaveCheckedEndpoint(config_json));
                 match save.wait().await {
                     Ok(()) => {
-                        editor.kind.set_saved_entry(&editor.entry, &stored);
+                        editor
+                            .kind
+                            .set_saved_entry(&editor.entry, &stored, &state.borrow());
                         editor.permission_dirty.set(false);
                         editor.show_reachable(&report.message);
                     }
@@ -5411,34 +5386,26 @@ fn wire_transcriber_actions(
                 return;
             }
             let selected = row.selected();
-            let selected_model = local_model_for_choice(selected).map(|model| model.id);
-            let is_parakeet = selected_model.is_some() || selected == CUSTOM_PARAKEET_CHOICE;
-
-            if is_parakeet {
+            if let Some(model) = local_model_for_choice(selected) {
                 let mut config = state.borrow_mut();
                 config.provider = voxkey_ipc::TranscriberProvider::Parakeet;
-                if let Some(model_name) = selected_model {
-                    config.parakeet.model = model_name.to_string();
-                }
+                config.parakeet.backend = voxkey_ipc::ParakeetBackend::Local;
+                config.parakeet.model = model.id.to_string();
                 download_button.set_label(parakeet_model_action_label(&config.parakeet.model));
+            } else if selected == CUSTOM_PARAKEET_CHOICE {
+                let mut config = state.borrow_mut();
+                config.provider = voxkey_ipc::TranscriberProvider::Parakeet;
+                config.parakeet.backend = voxkey_ipc::ParakeetBackend::Local;
+                download_button.set_label(parakeet_model_action_label(&config.parakeet.model));
+            } else if let Some(cloud) = cloud_for_choice(selected) {
+                state.borrow_mut().provider = cloud.provider;
             } else {
-                let provider = match selected {
-                    0 => voxkey_ipc::TranscriberProvider::WhisperCpp,
-                    2 => voxkey_ipc::TranscriberProvider::MistralRealtime,
-                    _ => voxkey_ipc::TranscriberProvider::Mistral,
-                };
-                state.borrow_mut().provider = provider;
+                state.borrow_mut().provider = voxkey_ipc::TranscriberProvider::WhisperCpp;
             }
 
-            let provider = state.borrow().provider.clone();
-            let is_mistral_api = matches!(
-                provider,
-                voxkey_ipc::TranscriberProvider::Mistral
-                    | voxkey_ipc::TranscriberProvider::MistralRealtime
-            );
             let uses_api_key = transcriber_api_service(&state.borrow()).is_some();
-            let is_parakeet_local = is_parakeet
-                && state.borrow().parakeet.backend == voxkey_ipc::ParakeetBackend::Local;
+            let is_parakeet_local =
+                state.borrow().provider == voxkey_ipc::TranscriberProvider::Parakeet;
 
             {
                 let config = state.borrow();
@@ -5459,6 +5426,7 @@ fn wire_transcriber_actions(
                     &execution_provider_row,
                     &model_status_row,
                 );
+                sync_model_name_row(&model_row, &config, None, false);
             }
 
             if uses_api_key {
@@ -5471,20 +5439,6 @@ fn wire_transcriber_actions(
                     &api_key_remove_button,
                     None,
                 );
-            }
-
-            if is_mistral_api {
-                let is_realtime = provider == voxkey_ipc::TranscriberProvider::MistralRealtime;
-                let st = state.borrow();
-                let (model, default_model) = if is_realtime {
-                    (
-                        &st.mistral_realtime.model,
-                        voxkey_ipc::MistralRealtimeConfig::DEFAULT_MODEL,
-                    )
-                } else {
-                    (&st.mistral.model, voxkey_ipc::MistralConfig::DEFAULT_MODEL)
-                };
-                set_entry_with_default(&model_row, model, default_model);
             }
 
             if is_parakeet_local {
@@ -5611,7 +5565,7 @@ fn wire_transcriber_actions(
             glib::spawn_future_local(async move {
                 let result = completion.wait().await;
                 let config = state.borrow();
-                let provider = config.provider.clone();
+                let provider = config.provider;
                 if !api_key_operation_is_current(&service, &config, operation_id, request_id.get())
                 {
                     return;
@@ -5657,7 +5611,7 @@ fn wire_transcriber_actions(
         let toast_overlay = toast_overlay.clone();
         api_key_remove_button.connect_clicked(move |button| {
             let config = state.borrow();
-            let provider = config.provider.clone();
+            let provider = config.provider;
             let Some(service) = transcriber_api_service(&config).map(str::to_string) else {
                 return;
             };
@@ -5761,14 +5715,10 @@ fn wire_transcriber_actions(
             }
             let model = row.text().to_string();
             let mut st = state.borrow_mut();
-            match st.provider {
-                voxkey_ipc::TranscriberProvider::MistralRealtime => {
-                    st.mistral_realtime.model = model;
-                }
-                voxkey_ipc::TranscriberProvider::Mistral => {
-                    st.mistral.model = model;
-                }
-                _ => return,
+            if let Some(cloud) = st.cloud() {
+                st.set_cloud_model(cloud.stored_model(&model));
+            } else {
+                return;
             }
             drop(st);
             send_transcriber_config(&state, &handle);
@@ -5779,80 +5729,8 @@ fn wire_transcriber_actions(
     wire_endpoint_editor(realtime_endpoint, state, updating_widgets, handle);
     wire_endpoint_editor(parakeet_endpoint, state, updating_widgets, handle);
 
-    // Parakeet backend selection controls whether inference is local or sent
-    // to the model-specific HTTP endpoint.
-    {
-        let provider_row = provider_row.clone();
-        let parakeet_endpoint = parakeet_endpoint.clone();
-        let api_key_status_row = api_key_status_row.clone();
-        let api_key_row = api_key_row.clone();
-        let api_key_remove_button = api_key_remove_button.clone();
-        let api_key_stored = api_key_stored.clone();
-        let api_key_request_id = api_key_request_id.clone();
-        let execution_provider_row = execution_provider_row.clone();
-        let model_status_row = model_status_row.clone();
-        let model_download_progress = model_download_progress.clone();
-        let download_button = download_button.clone();
-        let delete_model_button = delete_model_button.clone();
-        let open_folder_button = open_folder_button.clone();
-        let state = state.clone();
-        let expert_mode = expert_mode.clone();
-        let handle = handle.clone();
-        let updating_widgets = updating_widgets.clone();
-        parakeet_backend_row.connect_selected_notify(move |row| {
-            if updating_widgets.get() {
-                return;
-            }
-            let backend = if row.selected() == 1 {
-                voxkey_ipc::ParakeetBackend::Http
-            } else {
-                voxkey_ipc::ParakeetBackend::Local
-            };
-            state.borrow_mut().parakeet.backend = backend;
-            let is_active = state.borrow().provider == voxkey_ipc::TranscriberProvider::Parakeet;
-            let is_http = is_active && backend == voxkey_ipc::ParakeetBackend::Http;
-            let is_local = is_active && !is_http;
-            row.set_visible(is_active && (expert_mode.get() || is_http));
-            parakeet_endpoint.set_visible(is_http);
-            api_key_status_row.set_visible(is_http);
-            api_key_row.set_visible(is_http);
-            api_key_stored.set(None);
-            update_api_key_row_state(
-                &api_key_status_row,
-                &api_key_row,
-                &api_key_remove_button,
-                None,
-            );
-            let api_service = is_http.then_some(voxkey_ipc::API_KEY_SERVICE_MODEL_SERVER);
-            request_api_key_status(api_service, &api_key_request_id, &handle);
-            if is_http {
-                parakeet_endpoint.show_saved();
-            }
-            execution_provider_row.set_visible(
-                is_local
-                    && (expert_mode.get()
-                        || state.borrow().parakeet.execution_provider
-                            != voxkey_ipc::ExecutionProviderChoice::Auto),
-            );
-            model_status_row.set_visible(is_local);
-            provider_row.set_subtitle(transcriber_location_subtitle(&state.borrow()));
-            if is_local {
-                let model_name = state.borrow().parakeet.model.clone();
-                apply_model_status(
-                    "checking",
-                    &model_name,
-                    &model_status_row,
-                    &model_download_progress,
-                    &download_button,
-                    &delete_model_button,
-                    &open_folder_button,
-                    expert_mode.get(),
-                );
-                handle.send(DaemonCommand::ModelStatus(model_name));
-            }
-            send_transcriber_config(&state, &handle);
-        });
-    }
+    // Catalog local models always run on this computer. Nested HTTP servers
+    // were migrated onto the OpenAI-compatible provider.
 
     // Execution provider combo (Parakeet)
     {
@@ -6172,18 +6050,11 @@ impl PreviewPreset {
 }
 
 fn transcriber_runs_locally(config: &voxkey_ipc::TranscriberConfig) -> bool {
-    match config.provider {
-        voxkey_ipc::TranscriberProvider::WhisperCpp => true,
-        voxkey_ipc::TranscriberProvider::Parakeet => {
-            config.parakeet.backend == voxkey_ipc::ParakeetBackend::Local
-        }
-        voxkey_ipc::TranscriberProvider::Mistral
-        | voxkey_ipc::TranscriberProvider::MistralRealtime => false,
-    }
+    config.runs_on_device()
 }
 
 fn transcriber_is_realtime(config: &voxkey_ipc::TranscriberConfig) -> bool {
-    config.provider == voxkey_ipc::TranscriberProvider::MistralRealtime
+    config.provider.is_streaming()
 }
 
 fn preview_mode_subtitle(
@@ -6608,24 +6479,139 @@ mod tests {
 
     #[test]
     fn transcription_setup_heading_tracks_the_selected_engine_family() {
-        assert_eq!(transcriber_setup_copy(0, 0).title, "Whisper.cpp setup");
-        assert_eq!(transcriber_setup_copy(1, 0).title, "Mistral setup");
-        assert_eq!(transcriber_setup_copy(2, 0).title, "Mistral Realtime setup");
-        assert_eq!(transcriber_setup_copy(3, 0).title, "Local model setup");
-        assert_eq!(transcriber_setup_copy(5, 0).title, "Local model setup");
-        assert_eq!(transcriber_setup_copy(5, 1).title, "Model server setup");
+        assert_eq!(
+            transcriber_setup_copy(WHISPER_CHOICE).title,
+            "Whisper.cpp setup"
+        );
+        assert_eq!(
+            transcriber_setup_copy(
+                choice_for_cloud(voxkey_ipc::TranscriberProvider::Mistral).unwrap()
+            )
+            .title,
+            "Mistral setup"
+        );
+        assert_eq!(
+            transcriber_setup_copy(
+                choice_for_cloud(voxkey_ipc::TranscriberProvider::MistralRealtime).unwrap()
+            )
+            .title,
+            "Mistral Realtime setup"
+        );
+        assert_eq!(
+            transcriber_setup_copy(
+                choice_for_cloud(voxkey_ipc::TranscriberProvider::OpenAi).unwrap()
+            )
+            .title,
+            "OpenAI setup"
+        );
+        assert_eq!(
+            transcriber_setup_copy(
+                choice_for_cloud(voxkey_ipc::TranscriberProvider::OpenAiCompatible).unwrap()
+            )
+            .title,
+            "Transcription server setup"
+        );
+        assert!(
+            transcriber_setup_copy(
+                choice_for_cloud(voxkey_ipc::TranscriberProvider::OpenAiCompatible).unwrap()
+            )
+            .description
+            .contains("OpenAI speech-to-text HTTP format")
+        );
+        assert_eq!(
+            transcriber_setup_copy(choice_for_local_model("parakeet-tdt-0.6b-v3").unwrap()).title,
+            "Local model setup"
+        );
+    }
+
+    #[test]
+    fn every_cloud_and_local_catalog_entry_has_a_combo_row() {
+        for cloud in voxkey_ipc::cloud::CLOUD_PROVIDERS {
+            let config = voxkey_ipc::TranscriberConfig {
+                provider: cloud.provider,
+                ..Default::default()
+            };
+            let presentation = transcriber_choice_presentation(&config);
+            assert_eq!(
+                presentation.selected,
+                choice_for_cloud(cloud.provider).unwrap(),
+                "{}",
+                cloud.id
+            );
+            assert_eq!(
+                transcriber_setup_copy(presentation.selected).title,
+                cloud.setup_title,
+                "{}",
+                cloud.id
+            );
+            assert_eq!(
+                transcriber_location_subtitle(&config),
+                cloud.location_subtitle,
+                "{}",
+                cloud.id
+            );
+            let visibility = transcriber_visibility(&config, true);
+            assert!(visibility.api_key, "{}", cloud.id);
+            assert!(!visibility.parakeet_backend, "{}", cloud.id);
+            assert!(!visibility.model_status, "{}", cloud.id);
+        }
+
+        for model in voxkey_ipc::model_library::LOCAL_MODELS {
+            let config = voxkey_ipc::TranscriberConfig {
+                provider: voxkey_ipc::TranscriberProvider::Parakeet,
+                parakeet: voxkey_ipc::ParakeetConfig {
+                    model: model.id.to_string(),
+                    backend: voxkey_ipc::ParakeetBackend::Local,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let presentation = transcriber_choice_presentation(&config);
+            assert_eq!(
+                presentation.selected,
+                choice_for_local_model(model.id).unwrap(),
+                "{}",
+                model.id
+            );
+            let visibility = transcriber_visibility(&config, false);
+            assert!(!visibility.parakeet_backend, "{}", model.id);
+            assert!(!visibility.parakeet_endpoint, "{}", model.id);
+            assert!(!visibility.api_key, "{}", model.id);
+            assert!(visibility.model_status, "{}", model.id);
+            assert!(config.runs_on_device(), "{}", model.id);
+        }
+    }
+
+    #[test]
+    fn openai_server_model_default_is_stored_as_empty() {
+        assert!(voxkey_ipc::ParakeetConfig::normalized_server_model("").is_empty());
+        assert!(voxkey_ipc::ParakeetConfig::normalized_server_model(" whisper-1 ").is_empty());
+        assert_eq!(
+            voxkey_ipc::ParakeetConfig::normalized_server_model("whisper-large-v3"),
+            "whisper-large-v3"
+        );
     }
 
     #[test]
     fn transcription_location_icon_distinguishes_computer_and_server_engines() {
-        assert_eq!(transcriber_location_icon_name(0, 0), "computer-symbolic");
         assert_eq!(
-            transcriber_location_icon_name(1, 0),
+            transcriber_location_icon_name(WHISPER_CHOICE),
+            "computer-symbolic"
+        );
+        assert_eq!(
+            transcriber_location_icon_name(
+                choice_for_cloud(voxkey_ipc::TranscriberProvider::Mistral).unwrap()
+            ),
             "network-server-symbolic"
         );
-        assert_eq!(transcriber_location_icon_name(4, 0), "computer-symbolic");
         assert_eq!(
-            transcriber_location_icon_name(4, 1),
+            transcriber_location_icon_name(choice_for_local_model("parakeet-tdt-0.6b-v3").unwrap()),
+            "computer-symbolic"
+        );
+        assert_eq!(
+            transcriber_location_icon_name(
+                choice_for_cloud(voxkey_ipc::TranscriberProvider::OpenAiCompatible).unwrap()
+            ),
             "network-server-symbolic"
         );
     }
@@ -6820,7 +6806,7 @@ mod tests {
         saved.mistral.api_key = "legacy-secret".to_string();
         saved.mistral_realtime.api_key = "other-secret".to_string();
 
-        let (candidate, stored) = EndpointKind::MistralBatch
+        let (candidate, stored) = EndpointKind::CloudHttp
             .candidate(&saved, " https://new.example.test/v1/audio/transcriptions ")
             .unwrap();
 
@@ -6833,10 +6819,10 @@ mod tests {
     }
 
     #[test]
-    fn blank_parakeet_endpoint_is_rejected_before_a_network_request() {
+    fn blank_compatible_endpoint_is_rejected_before_a_network_request() {
         let saved = voxkey_ipc::TranscriberConfig::default();
 
-        let error = EndpointKind::ParakeetHttp
+        let error = EndpointKind::OpenAiCompatible
             .candidate(&saved, " \t ")
             .unwrap_err();
 
@@ -6866,14 +6852,15 @@ mod tests {
     }
 
     #[test]
-    fn insecure_http_permission_belongs_only_to_parakeet() {
+    fn insecure_http_permission_belongs_only_to_openai_compatible_servers() {
         let mut config = voxkey_ipc::TranscriberConfig::default();
 
-        EndpointKind::MistralBatch.set_insecure_http_allowed(&mut config, true);
-        assert!(!config.parakeet.allow_insecure_http);
+        EndpointKind::CloudHttp.set_insecure_http_allowed(&mut config, true);
+        assert!(!config.allow_insecure_http());
 
-        EndpointKind::ParakeetHttp.set_insecure_http_allowed(&mut config, true);
-        assert!(EndpointKind::ParakeetHttp.insecure_http_allowed(&config));
+        EndpointKind::OpenAiCompatible.set_insecure_http_allowed(&mut config, true);
+        assert!(EndpointKind::OpenAiCompatible.insecure_http_allowed(&config));
+        assert!(config.openai_compatible.allow_insecure_http);
     }
 
     #[test]
@@ -7169,12 +7156,11 @@ mod tests {
     }
 
     #[test]
-    fn parakeet_http_preview_requires_always_mode() {
-        let mut transcriber = voxkey_ipc::TranscriberConfig {
-            provider: voxkey_ipc::TranscriberProvider::Parakeet,
+    fn network_preview_requires_always_mode() {
+        let transcriber = voxkey_ipc::TranscriberConfig {
+            provider: voxkey_ipc::TranscriberProvider::OpenAiCompatible,
             ..Default::default()
         };
-        transcriber.parakeet.backend = voxkey_ipc::ParakeetBackend::Http;
         let mut preview = voxkey_ipc::PreviewConfig::default();
 
         assert!(!preview_controls_are_active(&preview, &transcriber));
@@ -7201,12 +7187,11 @@ mod tests {
     }
 
     #[test]
-    fn parakeet_http_backend_has_model_specific_subtitle() {
-        let mut config = voxkey_ipc::TranscriberConfig {
-            provider: voxkey_ipc::TranscriberProvider::Parakeet,
+    fn openai_compatible_provider_has_server_subtitle() {
+        let config = voxkey_ipc::TranscriberConfig {
+            provider: voxkey_ipc::TranscriberProvider::OpenAiCompatible,
             ..Default::default()
         };
-        config.parakeet.backend = voxkey_ipc::ParakeetBackend::Http;
 
         assert_eq!(
             transcriber_location_subtitle(&config),
@@ -7358,17 +7343,30 @@ mod tests {
         whisper.whisper_cpp.args = vec!["--language".to_string(), "en".to_string()];
         assert!(transcriber_visibility(&whisper, false).whisper_arguments);
 
-        let mut parakeet = voxkey_ipc::TranscriberConfig {
+        let mut server = voxkey_ipc::TranscriberConfig {
+            provider: voxkey_ipc::TranscriberProvider::OpenAiCompatible,
+            ..Default::default()
+        };
+        server.openai_compatible.endpoint =
+            "https://speech.example.test/v1/audio/transcriptions".to_string();
+        let server_visibility = transcriber_visibility(&server, false);
+        assert!(!server_visibility.parakeet_backend);
+        assert!(server_visibility.parakeet_endpoint);
+        assert!(server_visibility.api_key);
+        assert!(server_visibility.model_name);
+        assert!(!server_visibility.execution_provider);
+        assert!(!server_visibility.model_status);
+        assert!(!server_visibility.batch_endpoint);
+
+        let local = voxkey_ipc::TranscriberConfig {
             provider: voxkey_ipc::TranscriberProvider::Parakeet,
             ..Default::default()
         };
-        parakeet.parakeet.backend = voxkey_ipc::ParakeetBackend::Http;
-        let server_visibility = transcriber_visibility(&parakeet, false);
-        assert!(server_visibility.parakeet_backend);
-        assert!(server_visibility.parakeet_endpoint);
-        assert!(server_visibility.api_key);
-        assert!(!server_visibility.execution_provider);
-        assert!(!server_visibility.model_status);
+        let local_visibility = transcriber_visibility(&local, false);
+        assert!(!local_visibility.parakeet_backend);
+        assert!(!local_visibility.parakeet_endpoint);
+        assert!(!local_visibility.api_key);
+        assert!(local_visibility.model_status);
     }
 
     #[test]
@@ -7377,11 +7375,10 @@ mod tests {
             provider: voxkey_ipc::TranscriberProvider::MistralRealtime,
             ..Default::default()
         };
-        let mut server = voxkey_ipc::TranscriberConfig {
-            provider: voxkey_ipc::TranscriberProvider::Parakeet,
+        let server = voxkey_ipc::TranscriberConfig {
+            provider: voxkey_ipc::TranscriberProvider::OpenAiCompatible,
             ..Default::default()
         };
-        server.parakeet.backend = voxkey_ipc::ParakeetBackend::Http;
         let local_model = voxkey_ipc::TranscriberConfig {
             provider: voxkey_ipc::TranscriberProvider::Parakeet,
             ..Default::default()
@@ -7389,6 +7386,14 @@ mod tests {
         assert_eq!(
             api_key_provider_name(&voxkey_ipc::TranscriberProvider::MistralRealtime),
             Some("Mistral Realtime")
+        );
+        assert_eq!(
+            api_key_provider_name(&voxkey_ipc::TranscriberProvider::Parakeet),
+            None
+        );
+        assert_eq!(
+            api_key_provider_name(&voxkey_ipc::TranscriberProvider::OpenAiCompatible),
+            Some("OpenAI-compatible server")
         );
         assert_eq!(
             api_key_status_for_provider(
@@ -7434,8 +7439,12 @@ mod tests {
             Some("Mistral Realtime API key saved".to_string())
         );
         assert_eq!(
+            api_key_saved_message(&voxkey_ipc::TranscriberProvider::OpenAiCompatible),
+            Some("OpenAI-compatible server API key saved".to_string())
+        );
+        assert_eq!(
             api_key_saved_message(&voxkey_ipc::TranscriberProvider::Parakeet),
-            Some("Model server API key saved".to_string())
+            None
         );
     }
 

@@ -62,17 +62,15 @@ def daemon_config(isolated_voxkey_home, model_server):
         "\n".join(
             [
                 "[transcriber]",
-                'provider = "parakeet"',
+                'provider = "openai-compatible"',
                 "",
-                "[transcriber.parakeet]",
-                'model = "server-model"',
-                'backend = "http"',
+                "[transcriber.openai_compatible]",
                 (
                     'endpoint = "http://127.0.0.1:'
                     f'{model_server.server_port}/v1/audio/transcriptions"'
                 ),
+                'model = "whisper-large-v3"',
                 "allow_insecure_http = false",
-                'execution_provider = "cpu"',
                 'api_key = "server-token"',
             ]
         )
@@ -106,7 +104,9 @@ async def test_authenticated_model_server_transcribes_and_inserts(
     ).get_interface(IFACE)
 
     public_config = json.loads(await daemon.get_transcriber_config())
-    assert "api_key" not in public_config["parakeet"]
+    assert public_config["provider"] == "openai-compatible"
+    assert "api_key" not in public_config.get("openai_compatible", {})
+    assert "api_key" not in public_config.get("parakeet", {})
 
     completed = asyncio.get_running_loop().create_future()
 
@@ -139,7 +139,10 @@ async def test_authenticated_model_server_transcribes_and_inserts(
     assert b'name="file"' in request["body"]
     assert b"RIFF" in request["body"]
     assert b'name="model"' in request["body"]
-    assert b"server-model" in request["body"]
+    assert b"whisper-large-v3" in request["body"]
+    assert b'server-model' not in request["body"]
+    assert b'name="response_format"' in request["body"]
+    assert b"json" in request["body"]
 
     history = json.loads(await daemon.get_transcription_history())
     saved = next(entry for entry in history if entry["text"] == TRANSCRIPT)

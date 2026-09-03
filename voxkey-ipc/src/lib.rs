@@ -6,6 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use xkbcommon::xkb;
 
+pub mod cloud;
 pub mod model_library;
 
 /// Well-known bus name the daemon registers on the session bus.
@@ -112,6 +113,11 @@ pub const API_KEY_SERVICE_MISTRAL_REALTIME: &str = "mistral-realtime";
 
 /// Service name used for an optional bearer token on a self-hosted model server.
 pub const API_KEY_SERVICE_MODEL_SERVER: &str = "model-server";
+pub const API_KEY_SERVICE_OPENAI: &str = cloud::API_KEY_SERVICE_OPENAI;
+pub const API_KEY_SERVICE_GROQ: &str = cloud::API_KEY_SERVICE_GROQ;
+pub const API_KEY_SERVICE_DEEPGRAM: &str = cloud::API_KEY_SERVICE_DEEPGRAM;
+pub const API_KEY_SERVICE_ASSEMBLYAI: &str = cloud::API_KEY_SERVICE_ASSEMBLYAI;
+pub const API_KEY_SERVICE_ELEVENLABS: &str = cloud::API_KEY_SERVICE_ELEVENLABS;
 
 /// Default global shortcut offered by Voxkey on GNOME.
 pub const DEFAULT_SHORTCUT_TRIGGER: &str = "<Super><Alt>d";
@@ -327,13 +333,23 @@ impl std::str::FromStr for DaemonState {
 }
 
 /// Which transcription backend to use.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum TranscriberProvider {
     #[default]
     WhisperCpp,
     Mistral,
     MistralRealtime,
+    #[serde(rename = "openai")]
+    OpenAi,
+    Groq,
+    Deepgram,
+    #[serde(rename = "assemblyai")]
+    AssemblyAi,
+    #[serde(rename = "elevenlabs")]
+    ElevenLabs,
+    #[serde(rename = "openai-compatible")]
+    OpenAiCompatible,
     Parakeet,
 }
 
@@ -384,7 +400,8 @@ pub enum ParakeetBackend {
     /// Run the downloaded model in-process with sherpa-onnx.
     #[default]
     Local,
-    /// Send recorded audio to an OpenAI-compatible HTTP transcription server.
+    /// Legacy transport. Older configs used this to reach an HTTP server from
+    /// a local-model row; load migrates those settings to `openai-compatible`.
     Http,
 }
 
@@ -397,6 +414,10 @@ pub struct ParakeetConfig {
     /// Endpoint used only when `backend` is `http`.
     #[serde(default)]
     pub endpoint: String,
+    /// Model id the HTTP server expects (OpenAI `model` field), such as
+    /// `whisper-1` or `whisper-large-v3`. Unused for on-device models.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub server_model: String,
     /// Legacy plaintext bearer token. New values are stored in the system
     /// keyring and injected only into the daemon's runtime configuration.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -420,6 +441,7 @@ impl Default for ParakeetConfig {
             model: Self::DEFAULT_MODEL.to_string(),
             backend: ParakeetBackend::Local,
             endpoint: String::new(),
+            server_model: String::new(),
             api_key: String::new(),
             allow_insecure_http: false,
             execution_provider: ExecutionProviderChoice::Auto,
@@ -430,6 +452,19 @@ impl Default for ParakeetConfig {
 
 impl ParakeetConfig {
     pub const DEFAULT_MODEL: &str = "parakeet-tdt-0.6b-v3";
+    /// Default OpenAI Audio Transcriptions `model` when none is configured.
+    pub const DEFAULT_SERVER_MODEL: &str = "whisper-1";
+
+    /// Persist the OpenAI `model` field. The default is omitted so existing
+    /// configs stay quiet and the daemon still sends `whisper-1`.
+    pub fn normalized_server_model(value: &str) -> String {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed == Self::DEFAULT_SERVER_MODEL {
+            String::new()
+        } else {
+            trimmed.to_string()
+        }
+    }
 }
 
 impl MistralConfig {
@@ -455,7 +490,235 @@ pub struct TranscriberConfig {
     #[serde(default)]
     pub mistral_realtime: MistralRealtimeConfig,
     #[serde(default)]
+    pub openai: cloud::CloudSttConfig,
+    #[serde(default)]
+    pub groq: cloud::CloudSttConfig,
+    #[serde(default)]
+    pub deepgram: cloud::CloudSttConfig,
+    #[serde(default)]
+    pub assemblyai: cloud::CloudSttConfig,
+    #[serde(default)]
+    pub elevenlabs: cloud::CloudSttConfig,
+    #[serde(default)]
+    pub openai_compatible: cloud::CloudSttConfig,
+    #[serde(default)]
     pub parakeet: ParakeetConfig,
+}
+
+impl TranscriberProvider {
+    pub fn cloud(self) -> Option<&'static cloud::CloudProvider> {
+        cloud::cloud_provider(self)
+    }
+
+    pub fn is_streaming(self) -> bool {
+        self.cloud().is_some_and(|cloud| cloud.streaming)
+    }
+
+    pub fn api_key_service(self) -> Option<&'static str> {
+        self.cloud().map(|cloud| cloud.keyring_service)
+    }
+}
+
+impl TranscriberConfig {
+    pub fn cloud(&self) -> Option<&'static cloud::CloudProvider> {
+        self.provider.cloud()
+    }
+
+    pub fn runs_on_device(&self) -> bool {
+        match self.provider {
+            TranscriberProvider::WhisperCpp => true,
+            TranscriberProvider::Parakeet => self.parakeet.backend != ParakeetBackend::Http,
+            _ => false,
+        }
+    }
+
+    pub fn cloud_model(&self) -> Option<&str> {
+        Some(self.cloud_fields()?.0)
+    }
+
+    pub fn cloud_endpoint(&self) -> Option<&str> {
+        Some(self.cloud_fields()?.1)
+    }
+
+    pub fn cloud_fields(&self) -> Option<(&str, &str, &str, bool)> {
+        Some(match self.provider {
+            TranscriberProvider::Mistral => (
+                self.mistral.model.as_str(),
+                self.mistral.endpoint.as_str(),
+                self.mistral.api_key.as_str(),
+                false,
+            ),
+            TranscriberProvider::MistralRealtime => (
+                self.mistral_realtime.model.as_str(),
+                self.mistral_realtime.endpoint.as_str(),
+                self.mistral_realtime.api_key.as_str(),
+                false,
+            ),
+            TranscriberProvider::OpenAi => (
+                self.openai.model.as_str(),
+                self.openai.endpoint.as_str(),
+                self.openai.api_key.as_str(),
+                false,
+            ),
+            TranscriberProvider::Groq => (
+                self.groq.model.as_str(),
+                self.groq.endpoint.as_str(),
+                self.groq.api_key.as_str(),
+                false,
+            ),
+            TranscriberProvider::Deepgram => (
+                self.deepgram.model.as_str(),
+                self.deepgram.endpoint.as_str(),
+                self.deepgram.api_key.as_str(),
+                false,
+            ),
+            TranscriberProvider::AssemblyAi => (
+                self.assemblyai.model.as_str(),
+                self.assemblyai.endpoint.as_str(),
+                self.assemblyai.api_key.as_str(),
+                false,
+            ),
+            TranscriberProvider::ElevenLabs => (
+                self.elevenlabs.model.as_str(),
+                self.elevenlabs.endpoint.as_str(),
+                self.elevenlabs.api_key.as_str(),
+                false,
+            ),
+            TranscriberProvider::OpenAiCompatible => (
+                self.openai_compatible.model.as_str(),
+                self.openai_compatible.endpoint.as_str(),
+                self.openai_compatible.api_key.as_str(),
+                self.openai_compatible.allow_insecure_http,
+            ),
+            TranscriberProvider::Parakeet if self.parakeet.backend == ParakeetBackend::Http => (
+                self.parakeet.server_model.as_str(),
+                self.parakeet.endpoint.as_str(),
+                self.parakeet.api_key.as_str(),
+                self.parakeet.allow_insecure_http,
+            ),
+            TranscriberProvider::WhisperCpp | TranscriberProvider::Parakeet => return None,
+        })
+    }
+
+    pub fn set_cloud_model(&mut self, model: String) {
+        match self.provider {
+            TranscriberProvider::Mistral => self.mistral.model = model,
+            TranscriberProvider::MistralRealtime => self.mistral_realtime.model = model,
+            TranscriberProvider::OpenAi => self.openai.model = model,
+            TranscriberProvider::Groq => self.groq.model = model,
+            TranscriberProvider::Deepgram => self.deepgram.model = model,
+            TranscriberProvider::AssemblyAi => self.assemblyai.model = model,
+            TranscriberProvider::ElevenLabs => self.elevenlabs.model = model,
+            TranscriberProvider::OpenAiCompatible => self.openai_compatible.model = model,
+            TranscriberProvider::Parakeet if self.parakeet.backend == ParakeetBackend::Http => {
+                self.parakeet.server_model = model;
+            }
+            TranscriberProvider::WhisperCpp | TranscriberProvider::Parakeet => {}
+        }
+    }
+
+    pub fn set_cloud_endpoint(&mut self, endpoint: String) {
+        match self.provider {
+            TranscriberProvider::Mistral => self.mistral.endpoint = endpoint,
+            TranscriberProvider::MistralRealtime => self.mistral_realtime.endpoint = endpoint,
+            TranscriberProvider::OpenAi => self.openai.endpoint = endpoint,
+            TranscriberProvider::Groq => self.groq.endpoint = endpoint,
+            TranscriberProvider::Deepgram => self.deepgram.endpoint = endpoint,
+            TranscriberProvider::AssemblyAi => self.assemblyai.endpoint = endpoint,
+            TranscriberProvider::ElevenLabs => self.elevenlabs.endpoint = endpoint,
+            TranscriberProvider::OpenAiCompatible => self.openai_compatible.endpoint = endpoint,
+            TranscriberProvider::Parakeet if self.parakeet.backend == ParakeetBackend::Http => {
+                self.parakeet.endpoint = endpoint;
+            }
+            TranscriberProvider::WhisperCpp | TranscriberProvider::Parakeet => {}
+        }
+    }
+
+    pub fn set_cloud_api_key(&mut self, key: String) {
+        match self.provider {
+            TranscriberProvider::Mistral => self.mistral.api_key = key,
+            TranscriberProvider::MistralRealtime => self.mistral_realtime.api_key = key,
+            TranscriberProvider::OpenAi => self.openai.api_key = key,
+            TranscriberProvider::Groq => self.groq.api_key = key,
+            TranscriberProvider::Deepgram => self.deepgram.api_key = key,
+            TranscriberProvider::AssemblyAi => self.assemblyai.api_key = key,
+            TranscriberProvider::ElevenLabs => self.elevenlabs.api_key = key,
+            TranscriberProvider::OpenAiCompatible => self.openai_compatible.api_key = key,
+            TranscriberProvider::Parakeet if self.parakeet.backend == ParakeetBackend::Http => {
+                self.parakeet.api_key = key;
+            }
+            TranscriberProvider::WhisperCpp | TranscriberProvider::Parakeet => {}
+        }
+    }
+
+    pub fn clear_all_plaintext_api_keys(&mut self) {
+        self.mistral.api_key.clear();
+        self.mistral_realtime.api_key.clear();
+        self.openai.api_key.clear();
+        self.groq.api_key.clear();
+        self.deepgram.api_key.clear();
+        self.assemblyai.api_key.clear();
+        self.elevenlabs.api_key.clear();
+        self.openai_compatible.api_key.clear();
+        self.parakeet.api_key.clear();
+    }
+
+    pub fn plaintext_api_key_mut(&mut self, service: &str) -> Option<&mut String> {
+        Some(match service {
+            API_KEY_SERVICE_MISTRAL => &mut self.mistral.api_key,
+            API_KEY_SERVICE_MISTRAL_REALTIME => &mut self.mistral_realtime.api_key,
+            API_KEY_SERVICE_OPENAI => &mut self.openai.api_key,
+            API_KEY_SERVICE_GROQ => &mut self.groq.api_key,
+            API_KEY_SERVICE_DEEPGRAM => &mut self.deepgram.api_key,
+            API_KEY_SERVICE_ASSEMBLYAI => &mut self.assemblyai.api_key,
+            API_KEY_SERVICE_ELEVENLABS => &mut self.elevenlabs.api_key,
+            API_KEY_SERVICE_MODEL_SERVER => {
+                if self.provider == TranscriberProvider::OpenAiCompatible {
+                    &mut self.openai_compatible.api_key
+                } else {
+                    &mut self.parakeet.api_key
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    pub fn allow_insecure_http(&self) -> bool {
+        self.cloud_fields()
+            .is_some_and(|(_, _, _, allowed)| allowed)
+    }
+
+    pub fn set_allow_insecure_http(&mut self, allowed: bool) {
+        match self.provider {
+            TranscriberProvider::OpenAiCompatible => {
+                self.openai_compatible.allow_insecure_http = allowed;
+            }
+            TranscriberProvider::Parakeet if self.parakeet.backend == ParakeetBackend::Http => {
+                self.parakeet.allow_insecure_http = allowed;
+            }
+            _ => {}
+        }
+    }
+
+    /// Move a local-model row that pointed at an HTTP server onto the
+    /// dedicated OpenAI-compatible provider so catalog models only run locally.
+    pub fn migrate_nested_http_server(&mut self) -> bool {
+        if self.provider != TranscriberProvider::Parakeet
+            || self.parakeet.backend != ParakeetBackend::Http
+        {
+            return false;
+        }
+        self.provider = TranscriberProvider::OpenAiCompatible;
+        self.openai_compatible.endpoint = std::mem::take(&mut self.parakeet.endpoint);
+        self.openai_compatible.model =
+            ParakeetConfig::normalized_server_model(&self.parakeet.server_model);
+        self.openai_compatible.api_key = std::mem::take(&mut self.parakeet.api_key);
+        self.openai_compatible.allow_insecure_http = self.parakeet.allow_insecure_http;
+        self.parakeet.backend = ParakeetBackend::Local;
+        self.parakeet.server_model.clear();
+        self.parakeet.allow_insecure_http = false;
+        true
+    }
 }
 
 /// Result of checking a custom transcription endpoint without sending audio
@@ -1153,6 +1416,7 @@ mod tests {
             },
             mistral_realtime: MistralRealtimeConfig::default(),
             parakeet: ParakeetConfig::default(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: TranscriberConfig = serde_json::from_str(&json).unwrap();
@@ -1182,6 +1446,7 @@ mod tests {
             mistral: MistralConfig::default(),
             mistral_realtime: MistralRealtimeConfig::default(),
             parakeet: ParakeetConfig::default(),
+            ..Default::default()
         };
         let toml_str = toml::to_string(&config).unwrap();
         let parsed: TranscriberConfig = toml::from_str(&toml_str).unwrap();
@@ -1364,6 +1629,10 @@ endpoint = "http://parakeet.example.test/v1"
         assert_eq!(json, "\"mistral\"");
         let json = serde_json::to_string(&TranscriberProvider::MistralRealtime).unwrap();
         assert_eq!(json, "\"mistral-realtime\"");
+        let json = serde_json::to_string(&TranscriberProvider::OpenAi).unwrap();
+        assert_eq!(json, "\"openai\"");
+        let json = serde_json::to_string(&TranscriberProvider::OpenAiCompatible).unwrap();
+        assert_eq!(json, "\"openai-compatible\"");
     }
 
     #[test]
@@ -1384,7 +1653,7 @@ endpoint = "http://parakeet.example.test/v1"
                 model: "voxtral-mini-transcribe-realtime-2602".to_string(),
                 endpoint: String::new(),
             },
-            parakeet: ParakeetConfig::default(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: TranscriberConfig = serde_json::from_str(&json).unwrap();
@@ -1402,7 +1671,7 @@ endpoint = "http://parakeet.example.test/v1"
                 model: "voxtral-mini-transcribe-realtime-2602".to_string(),
                 endpoint: String::new(),
             },
-            parakeet: ParakeetConfig::default(),
+            ..Default::default()
         };
         let toml_str = toml::to_string(&config).unwrap();
         let parsed: TranscriberConfig = toml::from_str(&toml_str).unwrap();
@@ -1446,8 +1715,19 @@ endpoint = "http://parakeet.example.test/v1"
         assert_eq!(config.model, "parakeet-tdt-0.6b-v3");
         assert_eq!(config.backend, ParakeetBackend::Local);
         assert!(config.endpoint.is_empty());
+        assert!(config.server_model.is_empty());
         assert!(!config.allow_insecure_http);
         assert_eq!(config.execution_provider, ExecutionProviderChoice::Auto);
+    }
+
+    #[test]
+    fn openai_server_model_default_is_omitted() {
+        assert!(ParakeetConfig::normalized_server_model("").is_empty());
+        assert!(ParakeetConfig::normalized_server_model(" whisper-1 ").is_empty());
+        assert_eq!(
+            ParakeetConfig::normalized_server_model("whisper-large-v3"),
+            "whisper-large-v3"
+        );
     }
 
     #[test]
@@ -1456,6 +1736,7 @@ endpoint = "http://parakeet.example.test/v1"
         let parsed: ParakeetConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.backend, ParakeetBackend::Local);
         assert!(parsed.endpoint.is_empty());
+        assert!(parsed.server_model.is_empty());
         assert!(!parsed.allow_insecure_http);
         assert_eq!(parsed.execution_provider, ExecutionProviderChoice::Cuda);
     }
@@ -1483,6 +1764,38 @@ endpoint = "http://parakeet.example.test/v1"
     }
 
     #[test]
+    fn nested_http_server_moves_onto_the_openai_compatible_provider() {
+        let mut config = TranscriberConfig {
+            provider: TranscriberProvider::Parakeet,
+            parakeet: ParakeetConfig {
+                backend: ParakeetBackend::Http,
+                endpoint: "https://speech.example.test/v1/audio/transcriptions".to_string(),
+                server_model: "whisper-large-v3".to_string(),
+                api_key: "server-secret".to_string(),
+                allow_insecure_http: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(config.migrate_nested_http_server());
+        assert_eq!(config.provider, TranscriberProvider::OpenAiCompatible);
+        assert_eq!(
+            config.openai_compatible.endpoint,
+            "https://speech.example.test/v1/audio/transcriptions"
+        );
+        assert_eq!(config.openai_compatible.model, "whisper-large-v3");
+        assert_eq!(config.openai_compatible.api_key, "server-secret");
+        assert!(config.openai_compatible.allow_insecure_http);
+        assert_eq!(config.parakeet.backend, ParakeetBackend::Local);
+        assert!(config.parakeet.endpoint.is_empty());
+        assert!(config.parakeet.server_model.is_empty());
+        assert!(config.parakeet.api_key.is_empty());
+        assert!(!config.parakeet.allow_insecure_http);
+        assert!(!config.migrate_nested_http_server());
+    }
+
+    #[test]
     fn transcriber_config_json_round_trip_parakeet() {
         let config = TranscriberConfig {
             provider: TranscriberProvider::Parakeet,
@@ -1493,11 +1806,13 @@ endpoint = "http://parakeet.example.test/v1"
                 model: "parakeet-tdt-0.6b-v2".to_string(),
                 backend: ParakeetBackend::Http,
                 endpoint: "http://192.168.1.132:8000/v1/audio/transcriptions".to_string(),
+                server_model: "whisper-1".to_string(),
                 api_key: "server-secret".to_string(),
                 allow_insecure_http: true,
                 execution_provider: ExecutionProviderChoice::Cuda,
                 preload_model: true,
             },
+            ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: TranscriberConfig = serde_json::from_str(&json).unwrap();
@@ -1524,6 +1839,7 @@ endpoint = "http://parakeet.example.test/v1"
             mistral: MistralConfig::default(),
             mistral_realtime: MistralRealtimeConfig::default(),
             parakeet: ParakeetConfig::default(),
+            ..Default::default()
         };
         config.parakeet.backend = ParakeetBackend::Http;
         config.parakeet.endpoint = "http://192.168.1.132:8000/v1/audio/transcriptions".to_string();

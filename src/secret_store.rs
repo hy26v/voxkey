@@ -8,8 +8,10 @@ use secret_service::{EncryptionType, SecretService};
 const APP_ATTR: &str = "voxkey";
 
 /// Service name attribute for the Mistral batch API key.
+#[cfg(test)]
 pub const SERVICE_MISTRAL: &str = voxkey_ipc::API_KEY_SERVICE_MISTRAL;
 /// Service name attribute for the Mistral Realtime API key.
+#[cfg(test)]
 pub const SERVICE_MISTRAL_REALTIME: &str = voxkey_ipc::API_KEY_SERVICE_MISTRAL_REALTIME;
 /// Service name attribute for an optional self-hosted transcription token.
 pub const SERVICE_MODEL_SERVER: &str = voxkey_ipc::API_KEY_SERVICE_MODEL_SERVER;

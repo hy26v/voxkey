@@ -1045,6 +1045,10 @@ mod tests {
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
             assert!(error.to_string().contains("Add a Mistral Realtime API key"));
         }
+        assert_eq!(
+            realtime_authorization_value("sk-rt").unwrap(),
+            "Bearer sk-rt"
+        );
     }
 
     #[test]

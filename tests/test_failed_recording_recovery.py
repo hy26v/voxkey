@@ -21,7 +21,7 @@ DAEMON_OBJECT_PATH = "/io/github/hy26v/Voxkey/Daemon"
 DAEMON_INTERFACE = "io.github.hy26v.Voxkey.Daemon1"
 
 
-class _BoundedParakeetHandler(BaseHTTPRequestHandler):
+class _OpenAiTranscriptionHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers["Content-Length"])
         body = self.rfile.read(length)
@@ -31,17 +31,10 @@ class _BoundedParakeetHandler(BaseHTTPRequestHandler):
 
         with self.server.result_lock:
             self.server.durations.append(duration)
+            self.server.bodies.append(body)
 
-        if duration > 120:
-            status = 422
-            response = {
-                "error": {"message": "The WAV duration exceeds the configured limit."},
-            }
-        else:
-            status = 200
-            response = {"text": self.server.transcript_for_duration(duration)}
-        payload = json.dumps(response).encode()
-        self.send_response(status)
+        payload = json.dumps({"text": "one request"}).encode()
+        self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Connection", "close")
@@ -185,7 +178,7 @@ async def test_saved_recording_can_be_retried_with_the_current_batch_provider(
 
 
 @pytest.mark.asyncio
-async def test_long_saved_recording_is_chunked_without_losing_its_ends(
+async def test_long_saved_recording_is_sent_as_one_openai_request(
     daemon_process,
     dbus_session,
 ):
@@ -194,36 +187,30 @@ async def test_long_saved_recording_is_chunked_without_losing_its_ends(
     failed = await _create_failed_recording(daemon)
     audio_path = Path(failed["audio_path"])
 
-    # This is a real 121-second WAV but only a few KiB, so the regression
-    # reaches the duration boundary without making the integration suite wait.
+    # A real 121-second WAV that stays tiny so the suite does not wait on
+    # sample rate. The OpenAI-compatible path must upload it once.
     with wave.open(str(audio_path), "wb") as recording:
         recording.setnchannels(1)
         recording.setsampwidth(2)
         recording.setframerate(10)
         recording.writeframes(bytes(1_210 * 2))
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _BoundedParakeetHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAiTranscriptionHandler)
     server.durations = []
+    server.bodies = []
     server.result_lock = threading.Lock()
-    server.transcript_for_duration = lambda duration: (
-        "the opening paragraph boundary words"
-        if duration > 100
-        else "boundary words the closing paragraph"
-    )
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 
     try:
         transcriber = json.loads(await daemon.get_transcriber_config())
-        transcriber["provider"] = "parakeet"
-        transcriber["parakeet"] = {
-            "model": "parakeet-tdt-0.6b-v3",
-            "backend": "http",
+        transcriber["provider"] = "openai-compatible"
+        transcriber["openai_compatible"] = {
             "endpoint": (
                 f"http://127.0.0.1:{server.server_port}/v1/audio/transcriptions"
             ),
+            "model": "whisper-1",
             "allow_insecure_http": False,
-            "execution_provider": "cpu",
         }
         await daemon.call_set_transcriber_config(json.dumps(transcriber))
         await asyncio.sleep(0.5)
@@ -240,11 +227,9 @@ async def test_long_saved_recording_is_chunked_without_losing_its_ends(
         await daemon.call_retry_history_entry(failed["id"])
         transcript = await _wait_until(
             daemon.get_last_transcript,
-            lambda value: value.endswith("the closing paragraph"),
+            lambda value: value == "one request",
         )
-        assert transcript == (
-            "the opening paragraph boundary words the closing paragraph"
-        )
+        assert transcript == "one request"
         assert await _wait_until(
             daemon.get_state,
             lambda value: value == "Idle",
@@ -252,9 +237,11 @@ async def test_long_saved_recording_is_chunked_without_losing_its_ends(
 
         with server.result_lock:
             durations = list(server.durations)
-        assert len(durations) == 2, durations
-        assert all(duration <= 120 for duration in durations), durations
-        assert sum(durations) > 121, "adjacent chunks did not overlap"
+            bodies = list(server.bodies)
+        assert len(durations) == 1, durations
+        assert durations[0] == pytest.approx(121.0)
+        assert b'name="response_format"' in bodies[0]
+        assert b"whisper-1" in bodies[0]
 
         history = json.loads(await daemon.get_transcription_history())
         assert history[0]["outcome"] == "completed"

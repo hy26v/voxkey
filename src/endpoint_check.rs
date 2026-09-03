@@ -11,19 +11,28 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub async fn check(config: &TranscriberConfig) -> EndpointCheckResult {
     let started = Instant::now();
-    let result = match config.provider {
-        TranscriberProvider::Mistral => {
-            let endpoint = crate::transcriber::resolved_mistral_endpoint(&config.mistral.endpoint);
-            check_http(endpoint, HttpEndpointKind::Mistral, false).await
+    let result = match config.provider.cloud() {
+        Some(cloud) if cloud.streaming => {
+            let model = cloud.resolved_model(config.cloud_model().unwrap_or(""));
+            let endpoint = cloud.resolved_endpoint(config.cloud_endpoint().unwrap_or(""));
+            check_websocket(&endpoint, &model).await
         }
-        TranscriberProvider::MistralRealtime => {
-            check_websocket(
-                &config.mistral_realtime.endpoint,
-                &config.mistral_realtime.model,
-            )
-            .await
+        Some(cloud) => {
+            let endpoint = cloud.resolved_endpoint(config.cloud_endpoint().unwrap_or(""));
+            if cloud.endpoint_required && endpoint.trim().is_empty() {
+                Err("Enter the transcription server address before checking it.".to_string())
+            } else {
+                let kind = if cloud.allows_insecure_http {
+                    HttpEndpointKind::Parakeet
+                } else {
+                    HttpEndpointKind::Mistral
+                };
+                check_http(&endpoint, kind, config.allow_insecure_http()).await
+            }
         }
-        TranscriberProvider::Parakeet if config.parakeet.backend == ParakeetBackend::Http => {
+        None if config.provider == TranscriberProvider::Parakeet
+            && config.parakeet.backend == ParakeetBackend::Http =>
+        {
             let endpoint = config.parakeet.endpoint.trim();
             if endpoint.is_empty() {
                 Err("Enter the transcription server address before checking it.".to_string())
@@ -36,15 +45,13 @@ pub async fn check(config: &TranscriberConfig) -> EndpointCheckResult {
                 .await
             }
         }
-        TranscriberProvider::WhisperCpp | TranscriberProvider::Parakeet => {
-            Err("The selected model does not use a network server.".to_string())
-        }
+        None => Err("The selected model does not use a network server.".to_string()),
     };
 
-    let uses_unencrypted_lan = config.provider == TranscriberProvider::Parakeet
-        && config.parakeet.backend == ParakeetBackend::Http
-        && config.parakeet.allow_insecure_http
-        && crate::transcriber::endpoint_uses_unencrypted_private_network(&config.parakeet.endpoint);
+    let uses_unencrypted_lan = config.allow_insecure_http()
+        && crate::transcriber::endpoint_uses_unencrypted_private_network(
+            config.cloud_endpoint().unwrap_or(&config.parakeet.endpoint),
+        );
 
     match result {
         Ok(ProbeOutcome::Connected) if uses_unencrypted_lan => {

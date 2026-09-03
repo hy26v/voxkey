@@ -164,6 +164,24 @@ pub(crate) fn normalize_transcriber_config(config: &mut TranscriberConfig) {
         &mut config.parakeet.model,
         voxkey_ipc::ParakeetConfig::DEFAULT_MODEL,
     );
+    config.parakeet.server_model =
+        voxkey_ipc::ParakeetConfig::normalized_server_model(&config.parakeet.server_model);
+    for cloud in voxkey_ipc::cloud::CLOUD_PROVIDERS {
+        let settings = match cloud.provider {
+            voxkey_ipc::TranscriberProvider::OpenAi => &mut config.openai,
+            voxkey_ipc::TranscriberProvider::Groq => &mut config.groq,
+            voxkey_ipc::TranscriberProvider::Deepgram => &mut config.deepgram,
+            voxkey_ipc::TranscriberProvider::AssemblyAi => &mut config.assemblyai,
+            voxkey_ipc::TranscriberProvider::ElevenLabs => &mut config.elevenlabs,
+            voxkey_ipc::TranscriberProvider::OpenAiCompatible => &mut config.openai_compatible,
+            voxkey_ipc::TranscriberProvider::Mistral
+            | voxkey_ipc::TranscriberProvider::MistralRealtime
+            | voxkey_ipc::TranscriberProvider::WhisperCpp
+            | voxkey_ipc::TranscriberProvider::Parakeet => continue,
+        };
+        settings.model = cloud.stored_model(&settings.model);
+        settings.endpoint = cloud.stored_endpoint(&settings.endpoint);
+    }
 }
 
 pub(crate) fn normalize_injection_config(config: &mut InjectionConfig) {
@@ -315,19 +333,22 @@ impl Config {
 
         // Older releases represented every OpenAI-compatible batch server as
         // "mistral", even when that server actually hosted a Parakeet model.
-        // Preserve those installations while separating model family from
-        // transport in the current schema.
         if config.transcriber.provider == voxkey_ipc::TranscriberProvider::Mistral
             && config.transcriber.mistral.model.starts_with("parakeet-")
             && !config.transcriber.mistral.endpoint.trim().is_empty()
         {
-            config.transcriber.provider = voxkey_ipc::TranscriberProvider::Parakeet;
-            config.transcriber.parakeet.model = config.transcriber.mistral.model.clone();
-            config.transcriber.parakeet.backend = voxkey_ipc::ParakeetBackend::Http;
-            config.transcriber.parakeet.endpoint = config.transcriber.mistral.endpoint.clone();
+            config.transcriber.provider = voxkey_ipc::TranscriberProvider::OpenAiCompatible;
+            config.transcriber.openai_compatible.endpoint =
+                std::mem::take(&mut config.transcriber.mistral.endpoint);
+            config.transcriber.openai_compatible.model =
+                voxkey_ipc::ParakeetConfig::normalized_server_model(
+                    &config.transcriber.mistral.model,
+                );
             config.transcriber.mistral.model = voxkey_ipc::MistralConfig::DEFAULT_MODEL.to_string();
-            config.transcriber.mistral.endpoint.clear();
-            tracing::info!("Migrated legacy Parakeet HTTP server configuration");
+            tracing::info!("Migrated legacy HTTP server configuration");
+        }
+        if config.transcriber.migrate_nested_http_server() {
+            tracing::info!("Migrated nested HTTP server onto the OpenAI-compatible provider");
         }
 
         // Voxkey previously defaulted to Super+Space, which GNOME reserves
@@ -639,6 +660,15 @@ model = "\t"
     }
 
     #[test]
+    fn openai_server_model_default_is_not_persisted() {
+        let config =
+            Config::load_from_str("[transcriber.parakeet]\nserver_model = \"  whisper-1  \"\n")
+                .unwrap();
+
+        assert!(config.transcriber.parakeet.server_model.is_empty());
+    }
+
+    #[test]
     fn migrates_legacy_parakeet_http_server_out_of_mistral_config() {
         let toml = r#"
 [transcriber]
@@ -650,22 +680,61 @@ endpoint = "http://192.168.1.132:8000/v1/audio/transcriptions"
 "#;
         let config = Config::load_from_str(toml).unwrap();
 
-        assert_eq!(config.transcriber.provider, TranscriberProvider::Parakeet);
         assert_eq!(
-            config.transcriber.parakeet.backend,
-            voxkey_ipc::ParakeetBackend::Http
+            config.transcriber.provider,
+            TranscriberProvider::OpenAiCompatible
         );
-        assert_eq!(config.transcriber.parakeet.model, "parakeet-tdt-0.6b-v3");
         assert_eq!(
-            config.transcriber.parakeet.endpoint,
+            config.transcriber.openai_compatible.endpoint,
             "http://192.168.1.132:8000/v1/audio/transcriptions"
         );
-        assert!(!config.transcriber.parakeet.allow_insecure_http);
+        assert_eq!(
+            config.transcriber.openai_compatible.model,
+            "parakeet-tdt-0.6b-v3"
+        );
+        assert_eq!(
+            config.transcriber.parakeet.backend,
+            voxkey_ipc::ParakeetBackend::Local
+        );
         assert_eq!(
             config.transcriber.mistral.model,
             voxkey_ipc::MistralConfig::DEFAULT_MODEL
         );
         assert!(config.transcriber.mistral.endpoint.is_empty());
+    }
+
+    #[test]
+    fn migrates_nested_parakeet_http_onto_the_openai_compatible_provider() {
+        let toml = r#"
+[transcriber]
+provider = "parakeet"
+
+[transcriber.parakeet]
+backend = "http"
+endpoint = "https://speech.example.com/v1/audio/transcriptions"
+server_model = "whisper-large-v3"
+allow_insecure_http = true
+"#;
+        let config = Config::load_from_str(toml).unwrap();
+
+        assert_eq!(
+            config.transcriber.provider,
+            TranscriberProvider::OpenAiCompatible
+        );
+        assert_eq!(
+            config.transcriber.openai_compatible.endpoint,
+            "https://speech.example.com/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            config.transcriber.openai_compatible.model,
+            "whisper-large-v3"
+        );
+        assert!(config.transcriber.openai_compatible.allow_insecure_http);
+        assert_eq!(
+            config.transcriber.parakeet.backend,
+            voxkey_ipc::ParakeetBackend::Local
+        );
+        assert!(config.transcriber.parakeet.endpoint.is_empty());
     }
 
     #[test]
